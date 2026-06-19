@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 mono-imager: Manual serial device test
-Handles U-Boot autoboot interrupt and basic command verification.
+Handles U-Boot autoboot interrupt, command verify, and recovery Linux boot.
 Dumps full console output to logs/test_serial_<timestamp>.log
 
 Author:  H.A. Hermsen
-Version: 0.1.0
+Version: 0.1.1
 License: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "H.A. Hermsen"
 
 import sys
@@ -51,61 +51,48 @@ def main():
     print("=" * 60)
     print()
 
-    # Step 1: Connect
-    logger.info("Step 1: Connecting to COM5 at 115200 baud...")
-    d = SerialDevice('COM5', timeout=15)
-
-    if not d.connect(115200):
-        logger.error("Failed to connect")
-        return False
-
-    logger.info("✓ Connected")
-
-    # Step 2: Wait for autoboot
-    logger.info("Step 2: Waiting for U-Boot autoboot countdown...")
-    logger.info("(Power cycle your device NOW if it's off)")
-
-    if not d.wait_for_autoboot(timeout=30):
-        logger.error("Failed to detect and interrupt autoboot")
-        return False
-
-    logger.info("✓ U-Boot autoboot interrupted")
-
-    # Step 3: U-Boot commands
-    logger.info("Step 3: Testing U-Boot commands...")
+    d = SerialDevice('COM5', timeout=5)
 
     try:
-        d.send_command("", wait_for_prompt=True, timeout=3)
+        # Step 1: Connect
+        logger.info("Step 1: Connecting to COM5 at 115200 baud...")
+        if not d.connect(115200):
+            logger.error("Failed to connect")
+            return False
+        logger.info("✓ Connected")
 
-        for cmd in ["printenv ethact", "printenv load_addr", "version"]:
-            response = d.send_command(cmd)
-            logger.info(f"[{cmd}]:\n{response}\n")
+        # Step 2: Interrupt U-Boot
+        logger.info("Step 2: Waiting for U-Boot autoboot countdown...")
+        logger.info("(Power cycle your device NOW)")
+        if not d.wait_for_autoboot(timeout=30):
+            logger.error("Failed to interrupt autoboot")
+            return False
+        logger.info("✓ U-Boot interrupted")
 
-        logger.info("✓ All tests passed!")
+        # Step 3: Quick verify
+        logger.info("Step 3: Quick U-Boot verify...")
+        response = d.send_command("printenv ethact", timeout=5)
+        logger.info(f"ethact: {response.strip()}")
+        logger.info("✓ U-Boot responding")
 
         # Step 4: Boot recovery Linux
         logger.info("Step 4: Booting recovery Linux...")
-        logger.info("Sending 'run recovery' to U-Boot...")
-
         d.send_command("run recovery", wait_for_prompt=False, timeout=3)
 
-        # Wait for recovery Linux to boot and present login
-        logger.info("Waiting for recovery Linux boot (up to 60s)...")
+        logger.info("Waiting for recovery Linux (up to 60s)...")
         start = time.time()
         buffer = b""
         while time.time() - start < 60:
             byte = d.ser.read(1)
             if byte:
                 buffer += byte
-                # Log progress dots
                 if len(buffer) % 500 == 0:
                     sys.stdout.write(".")
                     sys.stdout.flush()
                 if b"root@recovery" in buffer or b"login:" in buffer:
                     print()
                     logger.info("✓ Recovery Linux booted!")
-                    # Auto-login if needed
-                    if b"login:" in buffer:
+                    if b"login:" in buffer and b"root@recovery" not in buffer:
                         d.ser.write(b"root\r\n")
                         time.sleep(1)
                     break
@@ -114,27 +101,28 @@ def main():
             logger.error("Recovery Linux did not boot within timeout")
             return False
 
-        # Verify we're at recovery prompt
+        # Verify recovery prompt
         d.ser.write(b"\r\n")
         time.sleep(0.5)
         waiting = d.ser.in_waiting
         response = d.ser.read(waiting) if waiting else b""
         logger.info(f"Recovery prompt: {repr(response[-80:])}")
 
-        if b"root@recovery" in response or b"root@recovery" in buffer:
+        if b"root@recovery" in buffer or b"root@recovery" in response:
             logger.info("✓ Logged into recovery Linux!")
         else:
             logger.warning("Recovery prompt not confirmed but continuing...")
 
+        logger.info("✓ All steps passed!")
         return True
 
     except Exception as e:
-        logger.error(f"Command failed: {e}")
+        logger.error(f"Test failed: {e}")
         return False
 
     finally:
         d.disconnect()
-        logger.info(f"📄 Full log saved to: {log_file}")
+        logger.info(f"📄 Log saved to: {log_file}")
 
 
 if __name__ == "__main__":

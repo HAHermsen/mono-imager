@@ -3,11 +3,11 @@ mono-imager: Serial communication module
 Handles U-Boot interaction, recovery boot, and firmware flashing.
 
 Author:  H.A. Hermsen
-Version: 0.1.0
+Version: 0.1.1
 License: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "H.A. Hermsen"
 
 import serial
@@ -118,7 +118,7 @@ class SerialDevice:
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Serial connection not open")
         
-        timeout = timeout or self.timeout
+        timeout = timeout or 5.0  # Reduced from 15s default
         
         # Clear input buffer
         self.ser.reset_input_buffer()
@@ -146,8 +146,12 @@ class SerialDevice:
             time.sleep(0.05)
         
         response_str = response.decode('utf-8', errors='replace').strip()
-        logger.debug(f"<< {response_str[:200]}")  # Log first 200 chars
         
+        # Strip command echo (device echoes back what we sent)
+        if response_str.startswith(command):
+            response_str = response_str[len(command):].strip()
+        
+        logger.debug(f"<< {response_str[:200]}")
         return response_str
     
     def wait_for_autoboot(self, timeout: float = 30) -> bool:
