@@ -3,18 +3,23 @@ mono-imager: Firmware download and flashing module
 Handles firmware acquisition and eMMC/NOR flash operations.
 
 Author:  H.A. Hermsen
-Version: 0.1.0
+Version: 0.3.0
 License: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __author__ = "H.A. Hermsen"
 
-import os
+import hashlib
 import logging
 import requests
+import urllib3
 from typing import Optional, Callable
 from pathlib import Path
+
+# Domains known to have self-signed or invalid certificates.
+# SSL verification is disabled only for these hosts, with an explicit warning.
+SSL_UNVERIFIED_HOSTS = {"firmware.mono.si"}
 
 logger = logging.getLogger(__name__)
 
@@ -49,61 +54,70 @@ class FirmwareDownloader:
         """
         self.timeout = timeout
         self.chunk_size = chunk_size
-        
-        # Disable SSL verification for firmware.mono.si (known issue)
         self.session = requests.Session()
-        self.session.verify = False
     
-    def download(self, url: str, destination: Path, 
+    def download(self, url: str, destination: Path,
                  progress_callback: Optional[Callable[[int, int], None]] = None) -> bool:
         """
-        Download firmware with resume support
-        
+        Download firmware with resume support.
+
+        SSL verification is disabled only for known hosts with self-signed
+        certificates (SSL_UNVERIFIED_HOSTS), with an explicit warning logged.
+
         Args:
             url: Firmware URL
             destination: Where to save the file
             progress_callback: Optional callback(downloaded_bytes, total_bytes)
-        
+
         Returns:
             True if successful, False otherwise
         """
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        verify_ssl = host not in SSL_UNVERIFIED_HOSTS
+
+        if not verify_ssl:
+            logger.warning(
+                f"SSL verification disabled for {host} (known self-signed cert) — "
+                "ensure you trust this host and are on a secure network"
+            )
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         destination.parent.mkdir(parents=True, exist_ok=True)
-        
+
         try:
-            # Check if partial download exists
             resume_header = {}
             if destination.exists():
                 resume_header = {'Range': f'bytes={destination.stat().st_size}-'}
                 logger.info(f"Resuming download from {destination.stat().st_size} bytes")
-            
+
             logger.info(f"Downloading {url}")
-            
+
             response = self.session.get(
                 url,
                 headers=resume_header,
                 stream=True,
                 timeout=self.timeout,
-                allow_redirects=True
+                allow_redirects=True,
+                verify=verify_ssl
             )
             response.raise_for_status()
-            
+
             total_size = int(response.headers.get('content-length', 0))
             downloaded = destination.stat().st_size if destination.exists() else 0
-            
             mode = 'ab' if resume_header else 'wb'
-            
+
             with open(destination, mode) as f:
                 for chunk in response.iter_content(chunk_size=self.chunk_size):
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
-                        
                         if progress_callback:
                             progress_callback(downloaded, total_size)
-            
-            logger.info(f"✓ Downloaded {downloaded} bytes")
+
+            logger.info(f"✓ Downloaded {downloaded} bytes to {destination}")
             return True
-            
+
         except requests.RequestException as e:
             logger.error(f"Download failed: {e}")
             return False
@@ -132,8 +146,46 @@ class FirmwareDownloader:
         if expected_size and size != expected_size:
             logger.warning(f"Size mismatch: expected {expected_size}, got {size}")
             return False
-        
+
         return True
+
+    def verify_sha256(self, file_path: Path, expected_hash: str) -> bool:
+        """
+        Verify SHA256 checksum of a downloaded firmware file.
+
+        Args:
+            file_path: Path to firmware file
+            expected_hash: Expected SHA256 hex digest
+
+        Returns:
+            True if checksum matches, False otherwise
+        """
+        if not file_path.exists():
+            logger.error(f"File not found for checksum verification: {file_path}")
+            return False
+
+        logger.info(f"Verifying SHA256 of {file_path.name}...")
+        sha256 = hashlib.sha256()
+
+        try:
+            with open(file_path, "rb") as f:
+                for block in iter(lambda: f.read(65536), b""):
+                    sha256.update(block)
+        except IOError as e:
+            logger.error(f"Failed to read file for checksum: {e}")
+            return False
+
+        actual = sha256.hexdigest()
+        if actual.lower() == expected_hash.lower():
+            logger.info(f"✓ SHA256 verified: {actual}")
+            return True
+
+        logger.error(
+            f"SHA256 mismatch for {file_path.name}:\n"
+            f"  expected: {expected_hash.lower()}\n"
+            f"  actual:   {actual}"
+        )
+        return False
 
 
 class Flasher:
@@ -214,9 +266,12 @@ class Flasher:
             if "successfully" in response.lower() or "complete" in response.lower():
                 logger.info("✓ eMMC flash complete")
                 return True
-            
-            logger.warning(f"Flash output: {response}")
-            return True  # Assume success if command ran
+
+            logger.error(
+                f"eMMC flash did not confirm success — output was:\n{response}\n"
+                "Expected 'successfully' or 'complete' in response."
+            )
+            return False
             
         except Exception as e:
             logger.error(f"Flash failed: {e}")
@@ -249,9 +304,12 @@ class Flasher:
             if "records out" in response or "records in" in response:
                 logger.info("✓ eMMC flash complete")
                 return True
-            
-            logger.warning(f"Flash output: {response}")
-            return True
+
+            logger.error(
+                f"eMMC dd flash did not confirm success — output was:\n{response}\n"
+                "Expected 'records in/out' in dd output."
+            )
+            return False
             
         except Exception as e:
             logger.error(f"Manual flash failed: {e}")
@@ -277,11 +335,11 @@ class Flasher:
                 return True
             
             logger.warning(f"Boot source verification inconclusive: {response}")
-            return True  # Don't fail on this
-            
+            return False
+
         except Exception as e:
-            logger.debug(f"Boot verification failed: {e}")
-            return True  # Don't fail on this
+            logger.warning(f"Boot source verification failed: {e}")
+            return False
 
 
 def create_cache_dir() -> Path:

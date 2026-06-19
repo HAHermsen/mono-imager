@@ -5,11 +5,11 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.2.0
+Version: 0.3.0
 License: MIT
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "H.A. Hermsen"
 
 import serial
@@ -93,45 +93,28 @@ class SerialDevice:
         logger.error(f"Failed to connect to {self.port} at any baud rate")
         return False
 
-    def safe_read(self, size=1):
-        try:
-            return self.ser._ser.read(size)
-        except Exception as e:
-            logger.warning(f"Read failed: {e} — reconnecting...")
-            if self._attempt_reconnect():
-                return self.ser._ser.read(size)
-            return b""
-        
-    def safe_write(self, data):
-        try:
-            return self.ser._ser.write(data)
-        except Exception as e:
-            logger.warning(f"Write failed: {e} — reconnecting...")
-            if self._attempt_reconnect():
-                return self.ser._ser.write(data)
-            return False
-      
-    def safe_read_all(self):
-        try:
-            return self.ser._ser.read_all()
-        except Exception:
-            if self._attempt_reconnect():
-                return self.ser._ser.read_all()
-            return b""        
-    
     def disconnect(self):
         """Close serial connection"""
         if self.ser and self.ser.is_open:
             self.ser.close()
             logger.info("Serial connection closed")
             
-    def _attempt_reconnect(self):
+    def _attempt_reconnect(self) -> bool:
+        """
+        Wait for port to reappear and reconnect at the last known baud rate.
+        Warns explicitly if baud rate was never detected and falls back to 115200.
+        """
         logger.info("Attempting auto‑reconnect...")
 
         if not self.wait_for_port(timeout=20):
             return False
 
-        return self.connect(self.baud_rate or 115200)
+        baud = self.baud_rate
+        if baud is None:
+            logger.warning("Baud rate was never successfully detected — falling back to 115200")
+            baud = 115200
+
+        return self.connect(baud)
     
     def _has_prompt(self, response: bytes) -> bool:
         """Check if response contains a known prompt"""
@@ -140,48 +123,50 @@ class SerialDevice:
                 return True
         return False
     
-    def send_command(self, command: str, wait_for_prompt: bool = True, 
+    def send_command(self, command: str, wait_for_prompt: bool = True,
                     timeout: Optional[float] = None) -> str:
         """
-        Send command and wait for response
-        
+        Send a command and return the response.
+
+        Reads are prompt-driven — returns as soon as a known prompt is seen,
+        or when timeout expires. No fixed sleeps.
+
         Args:
             command: Command to send (without newline)
-            wait_for_prompt: Wait for command prompt before returning
-            timeout: Override default timeout
-        
+            wait_for_prompt: If True, return as soon as a known prompt appears
+            timeout: Override default timeout (seconds)
+
         Returns:
-            Response text (stripped)
+            Response text, stripped and de-echoed
+
+        Raises:
+            RuntimeError: If serial connection is not open
         """
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Serial connection not open")
-        
-        timeout = timeout or 5.0  # Reduced from 15s default
-        
-        # Clear input buffer
+
+        timeout = timeout or 5.0
+
+        # Flush stale input before sending
         self.ser.reset_input_buffer()
         
         # Send command with newline
         logger.debug(f">> {command}")
         self.ser.write((command + "\r\n").encode())
-        
-        # Read response
-        time.sleep(0.2)  # Wait for device to respond
+
+        # Prompt-driven read — exit the moment a known prompt appears,
+        # no fixed sleeps; serial.read() already blocks up to self.timeout
         response = b""
-        
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 chunk = self.ser.read(1024)
                 if chunk:
                     response += chunk
-                    
                     if wait_for_prompt and self._has_prompt(response):
                         break
             except serial.SerialException:
                 break
-            
-            time.sleep(0.05)
         
         response_str = response.decode('utf-8', errors='replace').strip()
         
@@ -225,25 +210,27 @@ class SerialDevice:
                     buffer += byte
 
                     if b"Hit any key to stop autoboot" in buffer:
-                        logger.info("✓ Detected autoboot, spamming interrupt immediately...")
+                        logger.info("✓ Detected autoboot — interrupting and polling for prompt...")
 
-                        # Spam immediately and hard for 2 seconds
-                        spam_start = time.time()
-                        while time.time() - spam_start < 2.0:
+                        # Send interrupt keypress and poll for U-Boot prompt
+                        # rather than blindly spamming for a fixed duration
+                        interrupt_start = time.time()
+                        interrupt_timeout = 5.0
+                        interrupt_buf = b""
+
+                        while time.time() - interrupt_start < interrupt_timeout:
                             self.ser.write(b" ")
-                            time.sleep(0.02)
+                            chunk = self.ser.read(64)
+                            if chunk:
+                                interrupt_buf += chunk
+                                if b"=>" in interrupt_buf:
+                                    logger.info("✓ U-Boot prompt confirmed")
+                                    return True
 
-                        # Read what came back
-                        time.sleep(0.5)
-                        waiting = self.ser.in_waiting
-                        response = self.ser.read(waiting) if waiting else b""
-                        logger.info(f"Post-interrupt tail: {repr(response[-60:])}")
-
-                        if b"=>" in response:
-                            logger.info("✓ U-Boot prompt confirmed")
-                            return True
-
-                        logger.error("Could not confirm U-Boot prompt — interrupt may have been too late")
+                        logger.error(
+                            f"U-Boot prompt not seen within {interrupt_timeout}s after interrupt — "
+                            f"last bytes: {repr(interrupt_buf[-60:])}"
+                        )
                         return False
 
             except serial.SerialException:
@@ -278,65 +265,81 @@ class SerialDevice:
     
     def boot_recovery(self) -> bool:
         """
-        Boot into recovery Linux from U-Boot
-        
+        Boot into recovery Linux from U-Boot.
+
         Returns:
-            True if recovery boot initiated, False otherwise
+            True if recovery boot confirmed, False otherwise
         """
         logger.info("Booting into recovery Linux...")
-        
+
         try:
-            response = self.send_command("run recovery", wait_for_prompt=False, timeout=15)
-            
-            # Wait for login prompt
-            time.sleep(2)
-            response = self.ser.read_all().decode('utf-8', errors='replace')
-            
-            if "login:" in response or "root@recovery" in response:
-                logger.info("✓ Recovery Linux booted")
-                return True
-            
-            logger.warning("Recovery boot may have failed")
+            self.send_command("run recovery", wait_for_prompt=False, timeout=15)
+
+            # Poll for login or recovery prompt — no blind sleep
+            poll_start = time.time()
+            poll_timeout = 60.0
+            poll_buf = b""
+
+            while time.time() - poll_start < poll_timeout:
+                chunk = self.ser.read(256)
+                if chunk:
+                    poll_buf += chunk
+                    tail = poll_buf.decode("utf-8", errors="replace")
+                    if "login:" in tail or "root@recovery" in tail:
+                        logger.info("✓ Recovery Linux booted")
+                        return True
+
+            logger.warning(
+                f"Recovery boot prompt not seen within {poll_timeout}s — "
+                f"last output: {repr(poll_buf[-120:])}"
+            )
             return False
-            
+
         except Exception as e:
             logger.error(f"Failed to boot recovery: {e}")
             return False
     
     def login_recovery(self, timeout: float = 30) -> bool:
         """
-        Login to recovery Linux (no password), with auto‑reconnect.
+        Login to recovery Linux (no password), with auto‑reconnect and exponential backoff.
         """
         logger.info("Logging into recovery Linux...")
 
         start_time = time.time()
+        attempt = 0
+        backoff = 0.5  # initial backoff in seconds
 
         while time.time() - start_time < timeout:
+            attempt += 1
             try:
                 # If serial dropped, try to reconnect
                 if not self.ser or not self.ser.is_open:
                     logger.warning("Serial disconnected — waiting for device to reappear...")
                     if not self.wait_for_port(timeout=10):
+                        time.sleep(min(backoff, 5.0))
+                        backoff = min(backoff * 2, 5.0)
                         continue
                     self.connect(self.baud_rate or 115200)
-                    time.sleep(0.5)
 
                 # Try sending a blank command
                 response = self.send_command("", wait_for_prompt=True, timeout=5)
 
                 if "root@recovery" in response:
-                    logger.info("✓ Logged into recovery Linux")
+                    logger.info(f"✓ Logged into recovery Linux (attempt {attempt})")
                     return True
 
-                # Try pressing Enter again
+                # Send Enter and back off before retrying
                 self.ser.write(b"\r\n")
-                time.sleep(0.5)
+                logger.debug(f"Login attempt {attempt} — retrying in {backoff:.1f}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
 
             except Exception as e:
-                logger.debug(f"Login attempt failed: {e}")
-                time.sleep(0.5)
+                logger.debug(f"Login attempt {attempt} failed: {e} — retrying in {backoff:.1f}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
 
-        logger.error("Failed to login to recovery Linux")
+        logger.error(f"Failed to login to recovery Linux after {attempt} attempts")
         return False
 
                
@@ -394,6 +397,24 @@ class SerialDevice:
                 return self.ser._ser.read(size)
             except Exception as e2:
                 logger.error(f"Retry read failed: {e2}")
+                return b""
+
+    def safe_read_all(self) -> bytes:
+        """
+        Read all available bytes with auto‑reconnect on failure.
+        """
+        try:
+            return self.ser._ser.read_all()
+        except Exception as e:
+            logger.warning(f"Read-all failed ({e}) — attempting reconnect...")
+
+            if not self._attempt_reconnect():
+                return b""
+
+            try:
+                return self.ser._ser.read_all()
+            except Exception as e2:
+                logger.error(f"Retry read-all failed: {e2}")
                 return b""
 
 

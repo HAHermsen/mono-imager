@@ -1,67 +1,106 @@
+#!/usr/bin/env python3
+"""
+mono-imager: Simulated hotplug stress test (3 cycles, software close)
+Dumps full console output to logs/test_serial_hotplug_simulated_<timestamp>.log
+
+Author:  H.A. Hermsen
+Version: 0.3.0
+License: MIT
+"""
+
+__version__ = "0.3.0"
+__author__  = "H.A. Hermsen"
+
 import sys
 import time
 import logging
 
 from datetime import datetime
 from pathlib import Path
-from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
 
+# --- Logging setup -----------------------------------------------------------
+
+LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file  = LOG_DIR / f"test_serial_hotplug_simulated_{timestamp}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ],
+    force=True
+)
+logger = logging.getLogger(__name__)
+
+# --- Main --------------------------------------------------------------------
+
 def main():
+    logger.info(f"mono-imager test_serial_hotplug_simulated.py v{__version__} by {__author__}")
+    logger.info(f"Log: {log_file}")
+
     print("=== Automated Hotplug Test (3 simulated cycles) ===")
+    print()
 
     d = SerialDevice("COM5", timeout=1)
 
-    print("Connecting initially...")
+    logger.info("Connecting initially...")
     if not d.connect(115200):
-        print("Initial connect failed — is the device plugged in?")
-        return
+        logger.error("Initial connect failed — is the device plugged in?")
+        return False
 
-    print("✓ Initial connection OK\n")
+    logger.info("✓ Initial connection OK")
 
-    cycles = 3
+    cycles    = 3
     successes = 0
 
     for cycle in range(1, cycles + 1):
-        print(f"=== Cycle {cycle} of {cycles} ===")
+        logger.info(f"=== Cycle {cycle} of {cycles} ===")
 
-        # Simulate unplug
-        print("→ Simulating UNPLUG (closing real serial port)")
+        # Simulate unplug by closing the real port
+        logger.info("→ Simulating UNPLUG (closing real serial port)")
         try:
-            d.ser._ser.close()   # <-- software unplug
+            d.ser._ser.close()
         except Exception:
             pass
 
-        # Wait for reconnect logic to kick in
-        print("Waiting for reconnect...")
+        logger.info("Waiting for reconnect...")
 
         reconnected = False
         start = time.time()
 
         while time.time() - start < 30:
-            b = d.ser.read(1)  # safe_read will auto-reconnect
+            b = d.safe_read(1)  # triggers auto-reconnect
             if b is not None:
                 reconnected = True
                 break
             time.sleep(0.05)
 
         if reconnected:
-            print(f"✓ Reconnected successfully (cycle {cycle})\n")
+            logger.info(f"✓ Reconnected successfully (cycle {cycle})")
             successes += 1
         else:
-            print(f"✗ Reconnect FAILED (cycle {cycle})\n")
+            logger.error(f"✗ Reconnect FAILED (cycle {cycle})")
             break
 
-    print("=== Test Summary ===")
-    print(f"Successful reconnects: {successes}/{cycles}")
+    logger.info("=== Test Summary ===")
+    logger.info(f"Successful reconnects: {successes}/{cycles}")
 
     if successes == cycles:
-        print("✓ PASS — reconnect logic is stable")
+        logger.info("✓ PASS — reconnect logic is stable")
     else:
-        print("✗ FAIL — reconnect logic is unreliable")
+        logger.error("✗ FAIL — reconnect logic is unreliable")
 
     d.disconnect()
+    logger.info(f"📄 Log saved to: {log_file}")
+    return successes == cycles
 
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)

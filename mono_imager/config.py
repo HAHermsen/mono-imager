@@ -3,16 +3,17 @@ mono-imager: Configuration manager
 Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
-Version: 0.1.0
+Version: 0.3.0
 License: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __author__ = "H.A. Hermsen"
 
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def load_config() -> dict:
             with open(config_path) as f:
                 return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        logger.debug(f"Could not load config: {e}")
+        logger.warning(f"Config file is corrupt or unreadable — resetting to defaults: {e}")
     return {}
 
 
@@ -57,8 +58,8 @@ def save_config(config: dict):
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
         logger.debug(f"Config saved to {config_path}")
-    except IOError as e:
-        logger.warning(f"Could not save config: {e}")
+    except OSError as e:
+        logger.warning(f"Could not save config to {config_path}: {e}")
 
 
 def save_last_port(port: str):
@@ -68,7 +69,7 @@ def save_last_port(port: str):
     save_config(config)
 
 
-def get_last_port() -> str:
+def get_last_port() -> Optional[str]:
     """Get last used serial port, or None"""
     return load_config().get("last_port")
 
@@ -95,6 +96,8 @@ def detect_serial_ports() -> tuple[list, list]:
         
         return known, other
         
-    except ImportError:
-        logger.error("pyserial not installed")
-        return [], []
+    except ImportError as e:
+        raise RuntimeError(
+            "pyserial is not installed — cannot detect serial ports. "
+            "Install it with: pip install pyserial"
+        ) from e

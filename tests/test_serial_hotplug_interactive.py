@@ -1,70 +1,111 @@
+#!/usr/bin/env python3
+"""
+mono-imager: Interactive hotplug stress test (3 cycles, real hardware unplug)
+Dumps full console output to logs/test_serial_hotplug_interactive_<timestamp>.log
+
+Author:  H.A. Hermsen
+Version: 0.3.0
+License: MIT
+"""
+
+__version__ = "0.3.0"
+__author__  = "H.A. Hermsen"
+
+import sys
 import time
+import logging
+
+from datetime import datetime
+from pathlib import Path
 from mono_imager.serial_device import SerialDevice
 
+# --- Logging setup -----------------------------------------------------------
+
+LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file  = LOG_DIR / f"test_serial_hotplug_interactive_{timestamp}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ],
+    force=True
+)
+logger = logging.getLogger(__name__)
+
+# --- Main --------------------------------------------------------------------
+
 def main():
+    logger.info(f"mono-imager test_serial_hotplug_interactive.py v{__version__} by {__author__}")
+    logger.info(f"Log: {log_file}")
+
     print("=== Hotplug Stress Test (3 cycles) ===")
     print("Unplug and replug the Mono Gateway when instructed.")
-    print("This test will verify reconnect logic 3 times.\n")
+    print()
 
     d = SerialDevice("COM5", timeout=1)
 
-    print("Connecting initially...")
+    logger.info("Connecting initially...")
     if not d.connect(115200):
-        print("Initial connect failed — plug in the device and try again.")
-        return
+        logger.error("Initial connect failed — plug in the device and try again.")
+        return False
 
-    print("✓ Initial connection OK\n")
+    logger.info("✓ Initial connection OK")
 
-    cycles = 3
+    cycles    = 3
     successes = 0
 
     for cycle in range(1, cycles + 1):
-        print(f"=== Cycle {cycle} of {cycles} ===")
+        logger.info(f"=== Cycle {cycle} of {cycles} ===")
         print("→ Unplug the device NOW...")
 
-        # Wait for disconnect using raw serial port (no reconnect triggered)
-        print("Waiting for disconnect...")
+        # Wait for disconnect by probing the real port directly
         while True:
             try:
                 _ = d.ser._ser.in_waiting
                 time.sleep(0.05)
             except Exception:
-                print("✓ Disconnect detected")
+                logger.info("✓ Disconnect detected")
                 break
 
         print("→ Replug the device NOW...")
-
-        # Now allow reconnect logic to run
-        print("Waiting for reconnect...")
+        logger.info("Waiting for reconnect...")
 
         reconnected = False
         start = time.time()
 
         while time.time() - start < 30:
-            # This triggers safe_read → reconnect logic
-            b = d.ser.read(1)
+            b = d.safe_read(1)
             if b is not None:
                 reconnected = True
                 break
             time.sleep(0.05)
 
         if reconnected:
-            print(f"✓ Reconnected successfully (cycle {cycle})\n")
+            logger.info(f"✓ Reconnected successfully (cycle {cycle})")
             successes += 1
         else:
-            print(f"✗ Reconnect FAILED (cycle {cycle})\n")
+            logger.error(f"✗ Reconnect FAILED (cycle {cycle})")
             break
 
-    print("=== Test Summary ===")
-    print(f"Successful reconnects: {successes}/{cycles}")
+    logger.info("=== Test Summary ===")
+    logger.info(f"Successful reconnects: {successes}/{cycles}")
 
     if successes == cycles:
-        print("✓ PASS — reconnect logic is stable")
+        logger.info("✓ PASS — reconnect logic is stable")
     else:
-        print("✗ FAIL — reconnect logic is unreliable")
+        logger.error("✗ FAIL — reconnect logic is unreliable")
 
     d.disconnect()
+    logger.info(f"📄 Log saved to: {log_file}")
+    return successes == cycles
 
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)
