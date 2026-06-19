@@ -1,6 +1,14 @@
 """
-Firmware download and flashing module for mono-imager
+mono-imager: Firmware download and flashing module
+Handles firmware acquisition and eMMC/NOR flash operations.
+
+Author:  H.A. Hermsen
+Version: 0.1.0
+License: MIT
 """
+
+__version__ = "0.1.0"
+__author__ = "H.A. Hermsen"
 
 import os
 import logging

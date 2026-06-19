@@ -1,7 +1,14 @@
 """
-Serial communication module for mono-imager
-Handles U-Boot interaction, recovery boot, and firmware flashing
+mono-imager: Serial communication module
+Handles U-Boot interaction, recovery boot, and firmware flashing.
+
+Author:  H.A. Hermsen
+Version: 0.1.0
+License: MIT
 """
+
+__version__ = "0.1.0"
+__author__ = "H.A. Hermsen"
 
 import serial
 import time
@@ -143,48 +150,54 @@ class SerialDevice:
         
         return response_str
     
-    def wait_for_autoboot(self, timeout: float = 10) -> bool:
+    def wait_for_autoboot(self, timeout: float = 30) -> bool:
         """
         Wait for U-Boot autoboot countdown and auto-interrupt
-        
+
         Args:
             timeout: Max time to wait for autoboot message
-        
+
         Returns:
             True if interrupted and U-Boot prompt reached, False otherwise
         """
         logger.info("Waiting for U-Boot autoboot countdown...")
-        
+
         start_time = time.time()
         buffer = b""
-        
+
         while time.time() - start_time < timeout:
             try:
-                chunk = self.ser.read(512)
-                if chunk:
-                    buffer += chunk
-                    
-                    # Look for autoboot message
+                # Read one byte at a time so we trigger ASAP
+                byte = self.ser.read(1)
+                if byte:
+                    buffer += byte
+
                     if b"Hit any key to stop autoboot" in buffer:
-                        logger.info("✓ Detected autoboot countdown, sending interrupt...")
-                        # Send interrupt immediately
-                        for _ in range(5):
+                        logger.info("✓ Detected autoboot, spamming interrupt immediately...")
+
+                        # Spam immediately and hard for 2 seconds
+                        spam_start = time.time()
+                        while time.time() - spam_start < 2.0:
                             self.ser.write(b" ")
-                            time.sleep(0.1)
-                        
+                            time.sleep(0.02)
+
+                        # Read what came back
                         time.sleep(0.5)
-                        # Check for prompt
-                        response = self.ser.read_all()
-                        if self._has_prompt(response):
-                            logger.info("✓ U-Boot interrupted successfully")
+                        waiting = self.ser.in_waiting
+                        response = self.ser.read(waiting) if waiting else b""
+                        logger.info(f"Post-interrupt tail: {repr(response[-60:])}")
+
+                        if b"=>" in response:
+                            logger.info("✓ U-Boot prompt confirmed")
                             return True
-                        
+
+                        logger.error("Could not confirm U-Boot prompt — interrupt may have been too late")
+                        return False
+
             except serial.SerialException:
                 break
-            
-            time.sleep(0.05)
-        
-        logger.warning("Autoboot countdown not detected or interrupt failed")
+
+        logger.warning("Autoboot countdown not detected within timeout")
         return False
     
     def interrupt_autoboot(self) -> bool:

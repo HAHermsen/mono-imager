@@ -67,8 +67,8 @@ venv.bak/
 ~/.cache/mono-imager/
 
 # Logs
-*.log
-logs/
+logs/*.log
+logs/*.txt
 
 # Local testing
 test_device.py

@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Read README for long description
 readme_file = Path(__file__).parent / "README.md"
-long_description = readme_file.read_text() if readme_file.exists() else ""
+long_description = readme_file.read_text(encoding="utf-8") if readme_file.exists() else ""
 
 setup(
     name="mono-imager",
@@ -16,7 +16,7 @@ setup(
     description="Automated firmware flashing tool for Mono Gateway Routers and Development Kit",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="Community Contributors",
+    author="H.A. Hermsen",
     author_email="",
     url="https://github.com/HAHermsen/mono-imager",
     license="MIT",

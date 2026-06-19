@@ -1,0 +1,100 @@
+"""
+mono-imager: Configuration manager
+Persists user preferences (last used port, etc.) across sessions.
+
+Author:  H.A. Hermsen
+Version: 0.1.0
+License: MIT
+"""
+
+__version__ = "0.1.0"
+__author__ = "H.A. Hermsen"
+
+import json
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Known USB-UART chip descriptions to prioritize in port listing
+KNOWN_USB_UART_DESCRIPTORS = [
+    "cp210",   # Silicon Labs CP210x (very common)
+    "ch340",   # WCH CH340 (cheap adapters)
+    "ch341",   # WCH CH341
+    "ftdi",    # FTDI FT232
+    "ft232",   # FTDI FT232
+    "prolific", # Prolific PL2303
+    "pl2303",
+    "cdc",     # Generic CDC ACM
+    "uart",
+    "serial",
+    "usb serial",
+]
+
+
+def get_config_path() -> Path:
+    """Return path to config file"""
+    return Path.home() / ".config" / "mono-imager" / "config.json"
+
+
+def load_config() -> dict:
+    """Load config from disk, return empty dict if not found"""
+    config_path = get_config_path()
+    try:
+        if config_path.exists():
+            with open(config_path) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.debug(f"Could not load config: {e}")
+    return {}
+
+
+def save_config(config: dict):
+    """Save config to disk"""
+    config_path = get_config_path()
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        logger.debug(f"Config saved to {config_path}")
+    except IOError as e:
+        logger.warning(f"Could not save config: {e}")
+
+
+def save_last_port(port: str):
+    """Remember last used serial port"""
+    config = load_config()
+    config["last_port"] = port
+    save_config(config)
+
+
+def get_last_port() -> str:
+    """Get last used serial port, or None"""
+    return load_config().get("last_port")
+
+
+def is_known_uart(description: str) -> bool:
+    """Check if port description matches a known USB-UART chip"""
+    desc_lower = description.lower()
+    return any(keyword in desc_lower for keyword in KNOWN_USB_UART_DESCRIPTORS)
+
+
+def detect_serial_ports() -> tuple[list, list]:
+    """
+    Detect available serial ports, split into known USB-UART and other ports.
+    
+    Returns:
+        (known_ports, other_ports) — both lists of serial.tools.list_ports.ListPortInfo
+    """
+    try:
+        import serial.tools.list_ports
+        all_ports = list(serial.tools.list_ports.comports())
+        
+        known = [p for p in all_ports if is_known_uart(p.description or "")]
+        other = [p for p in all_ports if not is_known_uart(p.description or "")]
+        
+        return known, other
+        
+    except ImportError:
+        logger.error("pyserial not installed")
+        return [], []

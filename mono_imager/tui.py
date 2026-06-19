@@ -2,7 +2,14 @@
 """
 mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
+
+Author:  H.A. Hermsen
+Version: 0.1.0
+License: MIT
 """
+
+__version__ = "0.1.0"
+__author__ = "H.A. Hermsen"
 
 import sys
 import os
@@ -61,6 +68,7 @@ class MonoImager:
         print("╔════════════════════════════════════════════╗")
         print("║         mono-imager v0.1.0                 ║")
         print("║  Mono Gateway Automated Firmware Flasher   ║")
+        print("║  by H.A. Hermsen                           ║")
         print("╚════════════════════════════════════════════╝")
         print()
     
@@ -132,54 +140,81 @@ class MonoImager:
             self._detect_network_devices()
     
     def _detect_serial_devices(self):
-        """Detect available serial ports"""
+        """Detect available serial ports with USB-UART filtering and last-used memory"""
+        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
+        
         print("Scanning for serial devices...")
         print()
         
-        try:
-            import serial.tools.list_ports
-            ports = list(serial.tools.list_ports.comports())
-            
-            if not ports:
-                print("❌ No serial devices found")
-                print()
-                print("Please ensure your device is connected via USB/UART cable")
-                input("Press Enter to continue...")
-                self.current_state = MenuState.CONNECTION
-                return
-            
-            print("Available serial devices:")
+        known_ports, other_ports = detect_serial_ports()
+        all_ports = known_ports + other_ports
+        
+        if not all_ports:
+            print("❌ No serial devices found")
             print()
-            for i, port in enumerate(ports, 1):
-                print(f"  {i}) {port.device} - {port.description}")
-            print(f"  {len(ports) + 1}) Back")
-            print()
-            
-            choice = input(f"Select [1-{len(ports) + 1}]: ").strip()
-            
-            try:
-                idx = int(choice) - 1
-                if idx == len(ports):
-                    self.current_state = MenuState.CONNECTION
-                    return
-                if 0 <= idx < len(ports):
-                    self.serial_port = ports[idx].device
-                    logger.info(f"Selected serial port: {self.serial_port}")
-                    self.current_state = MenuState.FLASH_MODE
-                else:
-                    logger.warning("Invalid selection")
-                    input("Press Enter to continue...")
-                    self.current_state = MenuState.DEVICE_SELECT
-            except ValueError:
-                logger.warning("Invalid input")
-                input("Press Enter to continue...")
-                self.current_state = MenuState.DEVICE_SELECT
-                
-        except ImportError:
-            print("❌ pyserial not installed")
-            print("Install with: pip install pyserial")
+            print("Please ensure your USB/UART cable is connected")
             input("Press Enter to continue...")
             self.current_state = MenuState.CONNECTION
+            return
+        
+        last_port = get_last_port()
+        
+        # Show known USB-UART ports first
+        if known_ports:
+            print("  USB-UART adapters (recommended):")
+            for i, port in enumerate(known_ports, 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"  {i}) {port.device} — {port.description}{marker}")
+        
+        # Show other ports below
+        if other_ports:
+            print()
+            print("  Other ports:")
+            offset = len(known_ports)
+            for i, port in enumerate(other_ports, offset + 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"  {i}) {port.device} — {port.description}{marker}")
+        
+        print()
+        print(f"  {len(all_ports) + 1}) Back")
+        print()
+        
+        # Pre-select last used port if available
+        if last_port:
+            devices = [p.device for p in all_ports]
+            if last_port in devices:
+                print(f"  [Enter] Use last port ({last_port})")
+                print()
+        
+        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
+        
+        # Handle Enter = use last port
+        if choice == "" and last_port:
+            devices = [p.device for p in all_ports]
+            if last_port in devices:
+                self.serial_port = last_port
+                logger.info(f"Using last port: {self.serial_port}")
+                self.current_state = MenuState.FLASH_MODE
+                return
+        
+        try:
+            idx = int(choice) - 1
+            if idx == len(all_ports):
+                self.current_state = MenuState.CONNECTION
+                return
+            if 0 <= idx < len(all_ports):
+                self.serial_port = all_ports[idx].device
+                save_last_port(self.serial_port)
+                logger.info(f"Selected serial port: {self.serial_port}")
+                self.current_state = MenuState.FLASH_MODE
+            else:
+                logger.warning("Invalid selection")
+                input("Press Enter to continue...")
+                self.current_state = MenuState.DEVICE_SELECT
+        except ValueError:
+            logger.warning("Invalid input")
+            input("Press Enter to continue...")
+            self.current_state = MenuState.DEVICE_SELECT
     
     def _detect_network_devices(self):
         """Detect devices on network"""
