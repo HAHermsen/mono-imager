@@ -13,6 +13,7 @@ __version__ = "0.1.0"
 __author__ = "H.A. Hermsen"
 
 import sys
+import time
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,50 @@ def main():
             logger.info(f"[{cmd}]:\n{response}\n")
 
         logger.info("✓ All tests passed!")
+
+        # Step 4: Boot recovery Linux
+        logger.info("Step 4: Booting recovery Linux...")
+        logger.info("Sending 'run recovery' to U-Boot...")
+
+        d.send_command("run recovery", wait_for_prompt=False, timeout=3)
+
+        # Wait for recovery Linux to boot and present login
+        logger.info("Waiting for recovery Linux boot (up to 60s)...")
+        start = time.time()
+        buffer = b""
+        while time.time() - start < 60:
+            byte = d.ser.read(1)
+            if byte:
+                buffer += byte
+                # Log progress dots
+                if len(buffer) % 500 == 0:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+                if b"root@recovery" in buffer or b"login:" in buffer:
+                    print()
+                    logger.info("✓ Recovery Linux booted!")
+                    # Auto-login if needed
+                    if b"login:" in buffer:
+                        d.ser.write(b"root\r\n")
+                        time.sleep(1)
+                    break
+        else:
+            print()
+            logger.error("Recovery Linux did not boot within timeout")
+            return False
+
+        # Verify we're at recovery prompt
+        d.ser.write(b"\r\n")
+        time.sleep(0.5)
+        waiting = d.ser.in_waiting
+        response = d.ser.read(waiting) if waiting else b""
+        logger.info(f"Recovery prompt: {repr(response[-80:])}")
+
+        if b"root@recovery" in response or b"root@recovery" in buffer:
+            logger.info("✓ Logged into recovery Linux!")
+        else:
+            logger.warning("Recovery prompt not confirmed but continuing...")
+
         return True
 
     except Exception as e:
