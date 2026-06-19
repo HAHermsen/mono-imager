@@ -66,9 +66,9 @@ class MonoImager:
     def print_header(self):
         """Print application header"""
         print("╔════════════════════════════════════════════╗")
-        print("║         mono-imager v0.1.0                 ║")
+        print(f"║         mono-imager {__version__:<20}║")
         print("║  Mono Gateway Automated Firmware Flasher   ║")
-        print("║  by H.A. Hermsen                           ║")
+        print(f"║  by {__author__:<33}║")
         print("╚════════════════════════════════════════════╝")
         print()
     

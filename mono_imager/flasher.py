@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class FirmwareSource:
     """Firmware source configurations"""
     
-    ARMBIAN = {
+    ARMBIAN_MONO = {
         "name": "Armbian",
         "eMMC": "https://armbian.com/download/gateway-dk/Armbian_latest_Gateway-dk_noble_current_minimal.img.gz",
         "description": "Armbian official build for Mono Gateway DK"

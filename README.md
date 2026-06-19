@@ -1,21 +1,41 @@
 # mono-imager
 
-Automated firmware flashing tool for Mono Gateway Routers and Development Kit. Supports serial and networked connections. Handles U-Boot recovery boot, network setup retry logic, dual-flash orchestration (NOR ↔ eMMC), and safe rollback.
+Automated firmware flashing tool for Mono Gateway Routers and the Mono Development Kit.  
+Provides a guided, reliable flashing experience with serial and network support, U‑Boot recovery handling, dual‑flash orchestration (NOR ↔ eMMC), and safe rollback.
 
-## Features
+# Features Overview
 
-- 🔌 **Serial Detection** — Auto-detect USB-to-UART connections
-- ⚡ **Automatic Baud Rate Detection** — No manual configuration needed
-- 🚀 **One-Command Flashing** — No TFTP, firewall rules, or manual U-Boot commands
-- 🔄 **Dual-Flash Support** — NOR → eMMC → NOR safe orchestration
-- 🛡️ **Retry Logic** — Handles network flakes and NO-CARRIER ghosts
-- 📥 **Firmware Download** — Direct from Armbian/Mono official sources
-- ✅ **Verify Boot** — Confirms successful flashing
+## Serial Features
+- ⚡ **[Serial USB Port Detection](ca://s?q=Explain_serial_usb_port_detection)** — Autodetects the MONO Gateway and selects the correct COM port and baudrate automatically.  
+- ♻️ **[Auto Serial USB Reconnect Engine](ca://s?q=Explain_auto_serial_usb_reconnect_engine)** — Survives USB disconnects, FTDI resets, device reboots, and COM‑port re‑enumeration without user intervention.  
+- 🧩 **[Fault Tolerant](ca://s?q=Explain_fault_tolerant_serial_io)** — All serial I/O is wrapped into fault‑tolerant logic that prevents crashes and auto‑triggers reconnects.  
+- 🔄 **[Hotplug Support](ca://s?q=Explain_hotplug_support)** — Fully supports unplug/replug cycles during flashing, bootloader transitions, and recovery mode.  
+- 🏭 **[Reliability](ca://s?q=Explain_serial_reliability)** — Designed for reliable firmware flashing and embedded development workflows.
+- 🧪 **[Interactive & Simulated Hotplug Tests](ca://s?q=Explain_interactive_and_simulated_hotplug_tests)** — Validated with both real hardware unplugging and automated software‑simulated disconnects.  
+
+## Network Features
+- 🌐 **[DHCP Auto‑Discovery](ca://s?q=Explain_DHCP_auto_discovery)** — Automatically detects the MONO Gateway’s IP address on the local network.  
+- 🔎 **[ARP & Link Detection](ca://s?q=Explain_ARP_link_detection)** — Identifies devices even when DHCP is slow or unavailable.  
+- 📡 **[Network Reachability Checks](ca://s?q=Explain_network_reachability_checks)** — Verifies connectivity before flashing to avoid half‑written images.  
+- 🔁 **[Retry‑Safe Networking](ca://s?q=Explain_retry_safe_networking)** — Handles NO‑CARRIER, flaky Wi‑Fi, and transient Ethernet drops gracefully.  
+- 🔐 **[Secure Transfer Support](ca://s?q=Explain_secure_transfer_support)** — Uses safe, checksum‑verified transfer methods for firmware delivery.  
+- 🚦 **[Boot‑Phase Network Detection](ca://s?q=Explain_boot_phase_network_detection)** — Detects when the device switches between U‑Boot, initramfs, and Linux networking.  
+- 🧭 **[Gateway Identity Verification](ca://s?q=Explain_gateway_identity_verification)** — Confirms the device is the correct MONO Gateway before flashing.
+
+## Flashing Features
+- 🧭 **[Menu Driven](ca://s?q=Explain_menu_driven_interface)** — Simple, intuitive menu‑driven CLI.  
+- 🚀 **[One‑Command Flashing](ca://s?q=Explain_one_command_flashing)** — No TFTP, firewall rules, or manual U‑Boot commands.  
+- 🔄 **[Dual‑Flash Support](ca://s?q=Explain_dual_flash_support)** — NOR → eMMC → NOR safe flashing sequence.  
+- 🛡️ **[Retry Logic](ca://s?q=Explain_retry_logic)** — Handles network flakes and NO‑CARRIER issues.  
+- 📥 **[Pre‑Built Firmware Download](ca://s?q=Explain_prebuilt_firmware_download)** — Fetches images directly from Mono/Armbian official sources.  
+- 🧩 **[Custom Image Support](ca://s?q=Explain_custom_image_support)** — Flash any local `.img` or `.bin` file.  
+- ✅ **[Boot Verification](ca://s?q=Explain_boot_verification)** — Confirms successful flashing before proceeding.
+
 
 ## Requirements
 
-- **Python 3.8+**
-- **USB-to-UART serial cable** (for serial connection)
+- **Python 3.8+**  
+- **USB‑C cable** (for initial device onboarding)  
 - **Ethernet connection** (for device network setup)
 
 ## Installation

@@ -5,20 +5,22 @@ Handles U-Boot autoboot interrupt, command verify, and recovery Linux boot.
 Dumps full console output to logs/test_serial_<timestamp>.log
 
 Author:  H.A. Hermsen
-Version: 0.1.1
+Version: 0.1.3
 License: MIT
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.3"
 __author__ = "H.A. Hermsen"
 
 import sys
 import time
 import logging
+
 from datetime import datetime
 from pathlib import Path
-
+from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
+
 
 # --- Logging setup -----------------------------------------------------------
 
@@ -51,7 +53,22 @@ def main():
     print("=" * 60)
     print()
 
-    d = SerialDevice('COM5', timeout=5)
+    known, other = detect_serial_ports()
+    all_ports = known + other
+
+    mono_port = None
+    for p in all_ports:
+        if p.vid == 0x0403 and p.pid == 0x6015:
+            mono_port = p
+            break
+
+    if mono_port is None:
+        logger.error("Mono Gateway UART not found — expected FTDI FT230X (VID=0x0403, PID=0x6015)")
+        sys.exit(1)
+
+    logger.info(f"Mono Gateway UART found: {mono_port.device}")
+
+    d = SerialDevice(mono_port.device, timeout=5)
 
     try:
         # Step 1: Connect
@@ -63,7 +80,11 @@ def main():
 
         # Step 2: Interrupt U-Boot
         logger.info("Step 2: Waiting for U-Boot autoboot countdown...")
-        logger.info("(Power cycle your device NOW)")
+        print()
+        print("=" * 60)
+        print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
+        print("=" * 60)
+        print()
         if not d.wait_for_autoboot(timeout=30):
             logger.error("Failed to interrupt autoboot")
             return False
