@@ -1,6 +1,6 @@
 """mono-imager: Automated firmware flashing for Mono Gateway"""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "H.A. Hermsen"
 __license__ = "MIT"
 

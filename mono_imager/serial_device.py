@@ -5,11 +5,11 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.3.0
+Version: 0.5.0
 License: MIT
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "H.A. Hermsen"
 
 import serial
@@ -707,7 +707,50 @@ class SerialDevice:
 
         logger.warning("Autoboot countdown not detected within timeout")
         return False
-    
+
+    def capture_boot_diagnostics(self, timeout: float = 30) -> Optional[str]:
+        """
+        Capture U-Boot's boot-time diagnostic output (SoC/board identity,
+        clock configuration, and the power-on self-test block with
+        voltages/temperatures/fan speed) WITHOUT interrupting autoboot.
+
+        Everything this is after prints before "Hit any key to stop
+        autoboot" on this hardware (confirmed from a real boot capture
+        — SoC/Model/DRAM/Clock Configuration lines, then a self-test
+        block of "Label : PASS (value)" lines including "CPU
+        temperature" and "Board temperature"). So this just reads
+        until that marker appears, then returns everything captured
+        before it — no interrupt, no recovery boot needed.
+
+        Args:
+            timeout: Max time to wait for the autoboot marker
+
+        Returns:
+            The captured boot text (str) if the autoboot marker was
+            seen, or None if the timeout was hit first.
+        """
+        logger.info("Capturing U-Boot diagnostic output (waiting for boot)...")
+
+        start_time = time.time()
+        buffer = b""
+
+        while time.time() - start_time < timeout:
+            try:
+                byte = self.ser.read(1)
+                if byte:
+                    buffer += byte
+                    if b"Hit any key to stop autoboot" in buffer:
+                        logger.info("✓ Captured boot diagnostics output")
+                        return buffer.decode("utf-8", errors="replace")
+            except serial.SerialException:
+                break
+
+        logger.warning(
+            f"Boot diagnostics capture timed out after {timeout}s — "
+            f"never saw autoboot marker. Captured {len(buffer)} bytes so far."
+        )
+        return None
+
     def interrupt_autoboot(self) -> bool:
         """
         Interrupt U-Boot autoboot countdown (manual)

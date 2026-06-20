@@ -18,11 +18,11 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: 0.3.0
+Version: 0.5.0
 License: MIT
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__  = "H.A. Hermsen"
 
 import sys
@@ -86,6 +86,29 @@ console_logger.addHandler(_console_handler)
 # --- Result tracker ----------------------------------------------------------
 
 results: list[tuple[int, str, bool, str]] = []  # (step, description, passed, reason)
+
+def reset_results():
+    """
+    Clear accumulated step results before starting a new flash attempt.
+
+    BUG THIS FIXES: results is module-level state, not per-attempt. The
+    one-shot test scripts (test_verify_flash_auto.py etc.) never needed
+    this — each is a fresh process, so results always started empty.
+    But tui.py is a long-running, looping application: without this
+    reset, a single failed/cancelled step anywhere earlier in the same
+    session (a previous attempt, a validation failure, anything that
+    called step()) stays in the list forever. A LATER, fully successful
+    flash would then still report failure, because print_report()
+    checks ALL accumulated results, including stale ones from earlier
+    in the process — not just the current attempt's. Confirmed
+    reproducible: a failed step() call followed by 12 successful ones
+    still yields print_report() -> False.
+
+    Call this at the start of every flash attempt — phase1_bootstrap()
+    calls it automatically since that's the true entry point shared by
+    every caller (auto, manual, and any future one).
+    """
+    results.clear()
 
 def step(num: int, description: str, passed: bool, reason: str = ""):
     mark = "✓" if passed else "✗"
@@ -336,7 +359,7 @@ def detect_host_ip() -> str:
         return "192.168.1.1"
 
 
-def pick_device_ip(host_ip: str) -> str:
+def pick_device_ip(host_ip: str) -> Optional[str]:
     """
     Derive a device IP on the SAME /24 subnet as the host, instead of
     a hardcoded default that may sit on a different subnet (the bug
@@ -345,15 +368,25 @@ def pick_device_ip(host_ip: str) -> str:
 
     Uses .222 on the host's subnet — high, rarely DHCP-assigned.
 
+    Returns None if host_ip can't be parsed as a normal dotted-quad
+    IPv4 address — callers MUST handle this explicitly and should fail
+    loudly rather than guess. A previous version of this function
+    fell back to a hardcoded "192.168.1.10" here, which is exactly the
+    same class of bug this function exists to fix: a fixed IP that may
+    not be anywhere near the actual host's subnet. Silently returning
+    a guess in the error path just relocates the original bug rather
+    than fixing it. If host_ip can't be parsed, the right move is to
+    tell the user to switch to Manual mode and supply IPs themselves
+    — not to guess on their behalf.
+
     Shared here (rather than duplicated per test script) since any
     caller bringing up device networking needs this same derivation —
     test_verify_flash_auto.py, test_diagnose_run_script.py, and
-    eventually tui.py once network flash is wired into the main
-    application all rely on this.
+    tui.py all rely on this.
     """
     try:
         octets = host_ip.split(".")
-        if len(octets) != 4:
+        if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
             raise ValueError(f"unexpected host IP format: {host_ip}")
         subnet = ".".join(octets[:3])
         candidate = f"{subnet}.222"
@@ -361,8 +394,8 @@ def pick_device_ip(host_ip: str) -> str:
             candidate = f"{subnet}.223"
         return candidate
     except Exception as e:
-        logger.warning(f"Could not derive device IP from host IP ({e}) — falling back to 192.168.1.10")
-        return "192.168.1.10"
+        logger.warning(f"Could not derive device IP from host IP ({e}) — no safe fallback exists, caller must handle")
+        return None
 
 
 def ping(ip: str, count: int = 3) -> bool:
@@ -388,6 +421,8 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     Phase 1: Serial bootstrap — detect, connect, interrupt U-Boot, boot recovery, login.
     Returns connected SerialDevice on full success, None on any failure.
     """
+    reset_results()  # clear any stale results from a prior attempt in
+                      # this same process — see reset_results() docstring
     logger.info("=" * 60)
     logger.info("Phase 1 — Bootstrap (serial)")
     logger.info("=" * 60)

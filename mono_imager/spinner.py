@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: 0.4.0
+Version: 0.5.0
 License: MIT
 """
 
@@ -30,6 +30,8 @@ import os
 import time
 import threading
 from typing import Any, Callable, Tuple, Optional
+
+__version__ = "0.5.0"
 
 
 def _try_enable_windows_vt_processing() -> bool:

@@ -3,11 +3,11 @@ mono-imager: Firmware download and flashing module
 Handles firmware acquisition and eMMC/NOR flash operations.
 
 Author:  H.A. Hermsen
-Version: 0.3.0
+Version: 0.5.0
 License: MIT
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "H.A. Hermsen"
 
 import hashlib

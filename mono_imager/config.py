@@ -3,11 +3,11 @@ mono-imager: Configuration manager
 Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
-Version: 0.3.0
+Version: 0.5.0
 License: MIT
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "H.A. Hermsen"
 
 import json
