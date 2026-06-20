@@ -8,7 +8,7 @@ Version: 0.3.0
 License: MIT
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "H.A. Hermsen"
 
 import sys
@@ -51,6 +51,8 @@ class MenuState(Enum):
     CONFIRM         = "confirm"
     FLASHING        = "flashing"
     DONE            = "done"
+    CLI_CONSOLE     = "cli_console"
+    DEVICE_STATS    = "device_stats"
 
 
 class MonoImager:
@@ -67,6 +69,7 @@ class MonoImager:
         self.network_host    = None
         self.flash_success   = False
         self.log_file        = log_file
+        self.cli_port        = None
 
     def clear_screen(self):
         """Clear terminal"""
@@ -92,10 +95,12 @@ class MonoImager:
         print()
         print("  1) Flash firmware")
         print("  2) Recover bricked device")
-        print("  3) Exit")
+        print("  3) CLI only (console)")
+        print("  4) Show Device Stats")
+        print("  5) Exit")
         print()
 
-        choice = input("Select [1-3]: ").strip()
+        choice = input("Select [1-5]: ").strip()
 
         if choice == "1":
             self.current_state = MenuState.CONNECTION
@@ -105,6 +110,10 @@ class MonoImager:
             input("  Press Enter to continue...")
             self.current_state = MenuState.MAIN
         elif choice == "3":
+            self.current_state = MenuState.CLI_CONSOLE
+        elif choice == "4":
+            self.current_state = MenuState.DEVICE_STATS
+        elif choice == "5":
             sys.exit(0)
         else:
             print("  Invalid selection.")
@@ -354,7 +363,7 @@ class MonoImager:
         print("  This operation cannot be undone. Ensure you have:")
         print("    ✓ Backed up any important data")
         print("    ✓ Device is connected to stable power")
-        print("    ✓ Stable cable or Ethernet connection")
+        print("    ✓ Stable serial or Ethernet connection")
         print()
 
         choice = input("Proceed? [y/N]: ").strip().lower()
@@ -393,12 +402,128 @@ class MonoImager:
 
     def _flash_serial(self) -> bool:
         """Execute flashing via serial connection. Returns True on success."""
+        from mono_imager.serial_device import SerialDevice
+        from mono_imager.flasher import (
+            Flasher, FirmwareDownloader, FirmwareSource, create_cache_dir
+        )
+        
         logger.info(f"Flashing via serial: {self.serial_port}")
         logger.info(f"Target: {self.flash_mode.value}  Firmware: {self.firmware_choice.value}")
-        # TODO: Implement serial flashing logic
-        print("  Serial flashing logic not yet implemented.")
-        input("  Press Enter to continue...")
-        return False
+        
+        device = None
+        try:
+            # Phase 1: Connect and boot recovery
+            print("\n  Connecting to device...")
+            device = SerialDevice(self.serial_port, timeout=10)
+            if not device.connect():
+                print("  ❌ Failed to connect to device")
+                logger.error("SerialDevice.connect() failed")
+                return False
+            
+            print("  ⚡ POWER CYCLE YOUR DEVICE NOW (waiting for U-Boot autoboot)...")
+            if not device.wait_for_autoboot(timeout=60):
+                print("  ❌ Failed to interrupt U-Boot autoboot")
+                logger.error("wait_for_autoboot() timed out or failed")
+                device.disconnect()
+                return False
+            
+            print("  Booting recovery Linux...")
+            if not device.boot_recovery():
+                print("  ❌ Failed to boot recovery Linux")
+                logger.error("boot_recovery() failed")
+                device.disconnect()
+                return False
+            
+            print("  Logging into recovery...")
+            if not device.login_recovery(timeout=30):
+                print("  ❌ Failed to login to recovery Linux")
+                logger.error("login_recovery() failed")
+                device.disconnect()
+                return False
+            
+            print("  ✓ Device ready (recovery Linux booted and logged in)")
+            
+            # Phase 2: Acquire firmware
+            print("\n  Preparing firmware...")
+            cache_dir = create_cache_dir()
+            fw_path = None
+            
+            if self.firmware_choice == FirmwareChoice.CUSTOM:
+                fw_path = Path(self.custom_fw_path)
+                if not fw_path.exists():
+                    print(f"  ❌ Custom firmware file not found: {fw_path}")
+                    logger.error(f"Custom firmware path does not exist: {fw_path}")
+                    device.disconnect()
+                    return False
+                print(f"  Using custom firmware: {fw_path.name}")
+            else:
+                # Download from official source
+                fw_source = (
+                    FirmwareSource.MONO_OFFICIAL
+                    if self.firmware_choice == FirmwareChoice.MONO_OFFICIAL
+                    else FirmwareSource.ARMBIAN
+                )
+                url = fw_source["eMMC"]
+                fw_path = cache_dir / Path(url).name
+                
+                if not fw_path.exists():
+                    print(f"  Downloading {fw_source['name']} firmware...")
+                    print(f"    ({url})")
+                    downloader = FirmwareDownloader(timeout=60)
+                    if not downloader.download(url, fw_path):
+                        print("  ❌ Firmware download failed")
+                        logger.error(f"Download failed for {url}")
+                        device.disconnect()
+                        return False
+                    print(f"  ✓ Downloaded {fw_path.stat().st_size / (1024*1024):.1f} MB")
+                else:
+                    print(f"  Using cached firmware: {fw_path.name}")
+            
+            # Phase 3: Flash
+            print(f"\n  Flashing {self.flash_mode.value}...")
+            print("  (This may take several minutes. Do not power off device.)")
+            
+            flasher = Flasher(device)
+            
+            # Detect firmware tool or use manual method
+            tool = flasher.detect_firmware_tool()
+            if tool == "firmware":
+                # Modern 'firmware update' tool
+                success = flasher.flash_emmc_modern()
+            else:
+                # Manual curl | dd method
+                mac = flasher.get_device_mac()
+                if not mac:
+                    mac = "00:00:00:00:00:00"
+                    logger.warning(f"Could not detect device MAC; using fallback {mac}")
+                success = flasher.flash_emmc_manual(mac)
+            
+            if not success:
+                print("  ❌ Flash operation failed")
+                logger.error("Flash operation did not complete successfully")
+                device.disconnect()
+                return False
+            
+            print("  ✓ Flash complete")
+            
+            # Phase 4: Verify boot source
+            print("\n  Verifying boot source...")
+            if not flasher.verify_boot_source("eMMC"):
+                logger.warning("Boot source verification inconclusive")
+                # Don't fail here — device may not have booted yet
+            
+            device.disconnect()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Serial flash error: {type(e).__name__}: {e}", exc_info=True)
+            print(f"  ❌ Error: {e}")
+            if device:
+                try:
+                    device.disconnect()
+                except Exception:
+                    pass
+            return False
 
     def _flash_network(self) -> bool:
         """Execute flashing via network connection. Returns True on success."""
@@ -441,6 +566,257 @@ class MonoImager:
         self.current_state = MenuState.MAIN
 
     # ------------------------------------------------------------------ #
+    #  CLI CONSOLE                                                         #
+    # ------------------------------------------------------------------ #
+    def menu_cli_console(self):
+        """Serial console session — raw pass-through"""
+        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
+        from mono_imager.serial_device import SerialDevice
+        import threading
+
+        self.clear_screen()
+        self.print_header()
+        print("  CLI Console — Serial")
+        print()
+
+        try:
+            known_ports, other_ports = detect_serial_ports()
+        except RuntimeError as e:
+            print(f"  ❌ {e}")
+            print()
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        all_ports = known_ports + other_ports
+
+        if not all_ports:
+            print("  ❌ No serial devices found.")
+            print()
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        last_port = get_last_port()
+
+        if known_ports:
+            print("  USB-UART adapters (recommended):")
+            for i, port in enumerate(known_ports, 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"    {i}) {port.device} — {port.description}{marker}")
+        if other_ports:
+            print()
+            print("  Other ports:")
+            offset = len(known_ports)
+            for i, port in enumerate(other_ports, offset + 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"    {i}) {port.device} — {port.description}{marker}")
+
+        print()
+        print(f"  {len(all_ports) + 1}) Back")
+        print()
+
+        if last_port and last_port in [p.device for p in all_ports]:
+            print(f"  [Enter] Use last port ({last_port})")
+            print()
+
+        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
+
+        if choice == "" and last_port and last_port in [p.device for p in all_ports]:
+            port = last_port
+        else:
+            try:
+                idx = int(choice) - 1
+                if idx == len(all_ports):
+                    self.current_state = MenuState.MAIN
+                    return
+                if 0 <= idx < len(all_ports):
+                    port = all_ports[idx].device
+                    save_last_port(port)
+                else:
+                    print("  Invalid selection.")
+                    input("  Press Enter to continue...")
+                    self.current_state = MenuState.CLI_CONSOLE
+                    return
+            except ValueError:
+                print("  Invalid input.")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.CLI_CONSOLE
+                return
+
+        self.clear_screen()
+        self.print_header()
+        print(f"  Connecting to {port} at 115200 baud...")
+        print()
+
+        d = SerialDevice(port, timeout=0.1)
+        if not d.connect(115200):
+            print(f"  ❌ Failed to connect to {port}")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        print("  ✓ Connected — you are now in raw serial console.")
+        print("  Type Ctrl+] to exit.")
+        print()
+
+        stop_event = threading.Event()
+
+        def reader():
+            """Read from device, print to stdout"""
+            while not stop_event.is_set():
+                try:
+                    data = d.safe_read_all()
+                    if data:
+                        sys.stdout.write(data.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+                except Exception:
+                    break
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
+
+        try:
+            import tty, termios
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            try:
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch == "\x1d":  # Ctrl+]
+                        break
+                    d.safe_write(ch.encode())
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except ImportError:
+            # Windows — use msvcrt
+            import msvcrt
+            while True:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ord(ch) == 29:  # Ctrl+]
+                        break
+                    d.safe_write(ch.encode("utf-8", errors="replace"))
+
+        stop_event.set()
+        d.disconnect()
+        print()
+        print("  Console session ended.")
+        input("  Press Enter to continue...")
+        self.current_state = MenuState.MAIN
+        
+
+    def device_stats(self):
+        """Query and display Mono Gateway hardware statistics"""
+        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
+        from mono_imager.serial_device import SerialDevice
+        
+        self.clear_screen()
+        self.print_header()
+        
+        # Port selection
+        try:
+            known_ports, other_ports = detect_serial_ports()
+        except RuntimeError as e:
+            print(f"  ❌ {e}")
+            print()
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        all_ports = known_ports + other_ports
+
+        if not all_ports:
+            print("  ❌ No serial devices found.")
+            print()
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        last_port = get_last_port()
+
+        print("  Select device to query:")
+        print()
+        if known_ports:
+            print("  USB-UART adapters (recommended):")
+            for i, port in enumerate(known_ports, 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"    {i}) {port.device} — {port.description}{marker}")
+        if other_ports:
+            print()
+            print("  Other ports:")
+            offset = len(known_ports)
+            for i, port in enumerate(other_ports, offset + 1):
+                marker = " ◄ last used" if port.device == last_port else ""
+                print(f"    {i}) {port.device} — {port.description}{marker}")
+
+        print()
+        print(f"  {len(all_ports) + 1}) Back")
+        print()
+
+        if last_port and last_port in [p.device for p in all_ports]:
+            print(f"  [Enter] Use last port ({last_port})")
+            print()
+
+        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
+
+        if choice == "" and last_port and last_port in [p.device for p in all_ports]:
+            port = last_port
+        else:
+            try:
+                idx = int(choice) - 1
+                if idx == len(all_ports):
+                    self.current_state = MenuState.MAIN
+                    return
+                if 0 <= idx < len(all_ports):
+                    port = all_ports[idx].device
+                    save_last_port(port)
+                else:
+                    print("  Invalid selection.")
+                    input("  Press Enter to continue...")
+                    self.current_state = MenuState.DEVICE_STATS
+                    return
+            except ValueError:
+                print("  Invalid input.")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.DEVICE_STATS
+                return
+
+        # Query device
+        self.clear_screen()
+        self.print_header()
+        print(f"  Querying {port}...")
+        print()
+        
+        try:
+            device = SerialDevice(port, timeout=10)
+            if not device.connect():
+                print("  ❌ Failed to connect")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.MAIN
+                return
+            
+            self._display_device_stats(device)
+            device.disconnect()
+            
+        except Exception as e:
+            logger.error(f"Device stats query failed: {e}")
+            print(f"  ❌ Error: {e}")
+        
+        print()
+        input("  Press Enter to return to main menu...")
+        self.current_state = MenuState.MAIN
+    
+    def _display_device_stats(self, device):
+        """Display device stats - feature parked for redesign"""
+        logger.warning("Device stats feature is parked for redesign")
+        print("  Device stats feature not yet implemented.")
+        print()
+
+
+
+    # ------------------------------------------------------------------ #
     #  MAIN LOOP                                                           #
     # ------------------------------------------------------------------ #
     def run(self):
@@ -463,6 +839,10 @@ class MonoImager:
                     self.menu_flashing()
                 elif self.current_state == MenuState.DONE:
                     self.menu_done()
+                elif self.current_state == MenuState.CLI_CONSOLE:
+                    self.menu_cli_console()
+                elif self.current_state == MenuState.DEVICE_STATS:
+                    self.device_stats()
         except KeyboardInterrupt:
             print("\n\nInterrupted by user")
             sys.exit(0)

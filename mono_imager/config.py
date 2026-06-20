@@ -7,7 +7,7 @@ Version: 0.3.0
 License: MIT
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "H.A. Hermsen"
 
 import json
