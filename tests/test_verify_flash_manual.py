@@ -40,6 +40,7 @@ def ask_int(prompt: str, default: int) -> int:
     try:
         return int(val)
     except ValueError:
+        core.console_logger.warning(f"'{val}' is not a number, using default {default}")
         core.logger.warning(f"'{val}' is not a number, using default {default}")
         return default
 
@@ -51,8 +52,8 @@ def ask_yes_no(prompt: str) -> bool:
 
 def main():
     print("=" * 60)
-    print("  mono-imager flash verifier — FULLY MANUAL MODE")
-    print("  Every value below is typed by you. Nothing auto-detected.")
+    print("  mono-imager — Manual Setup")
+    print("  You'll be asked for each connection and flash setting.")
     print("=" * 60)
     print()
 
@@ -66,7 +67,7 @@ def main():
         known, other = detect_serial_ports()
         all_ports = known + other
         if all_ports:
-            print("Detected ports (for reference only — you still type the one to use):")
+            print("Detected ports (for reference — enter the one you'd like to use):")
             for p in all_ports:
                 print(f"    {p.device}  —  {p.description}")
         else:
@@ -77,6 +78,7 @@ def main():
 
     port = ask("Serial port (e.g. COM5)")
     if not port:
+        core.console_logger.error("Port is required.")
         core.logger.error("Port is required.")
         sys.exit(1)
 
@@ -84,6 +86,7 @@ def main():
 
     transport = ask("Transport ('serial' or 'tcp')", "tcp").lower()
     if transport not in ("serial", "tcp"):
+        core.console_logger.error(f"Invalid transport '{transport}' — must be 'serial' or 'tcp'")
         core.logger.error(f"Invalid transport '{transport}' — must be 'serial' or 'tcp'")
         sys.exit(1)
 
@@ -103,27 +106,36 @@ def main():
     server = None
     try:
         print()
-        print("Network configuration — type your actual values:")
+        print("Network configuration:")
         host_ip = ask("Host IP (this machine's IP on the device's network)")
         if not host_ip:
+            core.console_logger.error("Host IP is required for TCP transport.")
             core.logger.error("Host IP is required for TCP transport.")
             sys.exit(1)
 
         device_ip = ask("Device IP to assign (must be on host's subnet)")
         if not device_ip:
+            core.console_logger.error("Device IP is required for TCP transport.")
             core.logger.error("Device IP is required for TCP transport.")
             sys.exit(1)
 
         http_port = ask_int("HTTP server port", 8080)
 
         firmware = ask("Path to local firmware file")
+        firmware = firmware.strip('"').strip("'")  # strip quotes - Windows users naturally
+                                                     # type "C:\path with spaces\file.img"
+                                                     # and input() passes the quotes through
+                                                     # literally, which then fails .exists()
+                                                     # with no visible error (see below)
         firmware_path = Path(firmware).expanduser() if firmware else None
         if not firmware_path or not firmware_path.exists():
+            core.console_logger.error(f"Firmware file not found: {firmware}")
             core.logger.error(f"Firmware file not found: {firmware}")
             sys.exit(1)
 
         flash_target = ask("Flash target device (e.g. /dev/mmcblk0)")
         if not flash_target:
+            core.console_logger.error("Flash target is required.")
             core.logger.error("Flash target is required.")
             sys.exit(1)
 
