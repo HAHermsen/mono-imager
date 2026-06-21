@@ -4,22 +4,36 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.6.0
 License: MIT
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __author__ = "H.A. Hermsen"
 
 import sys
 import os
 import re
+import time
 import logging
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+def verbose(msg: str, level: str = "info"):
+    """Print to console immediately AND log it"""
+    print(msg, flush=True)
+    if level == "error":
+        logger.error(msg)
+    elif level == "warning":
+        logger.warning(msg)
+    elif level == "debug":
+        logger.debug(msg)
+    else:
+        logger.info(msg)
+
 
 
 def parse_uboot_identity(raw_output: str) -> dict:
@@ -79,57 +93,48 @@ def parse_uboot_identity(raw_output: str) -> dict:
 def parse_uboot_self_test(raw_output: str) -> list:
     """
     Parse the power-on self-test block from raw U-Boot boot output.
-    Pattern validated against a real capture on this hardware — lines
-    of the form "Label (padded) : PASS (optional parenthetical
-    value)", e.g.:
+    Matches lines of the form "[ OK ] Label            value",
+    e.g.:
 
-        CPU temperature     : PASS (47°C)
-        Board temperature   : PASS (44°C)
-        USB PD controller   : PASS
+        [ OK ] DDR4 Memory          Bank0: 1982 MB, Bank1: 6144 MB
+        [ OK ] USB PD controller    ID 0x25
+        [ OK ] Temperatures         CPU 51 °C, Board 46 °C
 
-    Only matches PASS lines — by design, this is a read-only stats
-    display, not a pass/fail diagnostic tool. A failing self-test line
-    would print differently (not "PASS") and won't be captured here;
-    extending this to surface failures would be a deliberate future
-    change, not an accidental omission.
+    Only matches [ OK ] lines — failures are not captured.
 
     Returns a list of (label, value) tuples in the order they appeared.
-    value is "" for lines with no parenthetical (e.g. "Retimer : PASS").
+    value is "" if only the label is present with no value/detail.
     """
-    pattern = re.compile(r'^([A-Za-z0-9.\s/\-]+?)\s*:\s*PASS(?:\s*\((.*?)\))?\s*$', re.MULTILINE)
-    matches = pattern.findall(raw_output)
+    results = []
+    
+    for line in raw_output.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Match [ OK ] Label    value
+        if line.startswith('[ OK ]'):
+            rest = line[6:].strip()  # Skip "[ OK ] "
+            
+            # Split on first run of whitespace
+            parts = rest.split(None, 1)
+            if parts:
+                label = parts[0]
+                value = parts[1] if len(parts) > 1 else ""
+                
+                # Skip summary line
+                if label.lower() != "self-test":
+                    results.append((label, value))
+    
+    return results
 
-    # "On-board devices self test: PASS" is a SUMMARY line (confirmed
-    # from a real capture: it appears after a blank line, following
-    # all the individual component lines) — it matches the same
-    # pattern by coincidence but isn't itself a component result.
-    # Excluded by exact name rather than a cleverer regex tweak, so a
-    # real future component test isn't accidentally excluded too.
-    return [
-        (label.strip(), value.strip())
-        for label, value in matches
-        if label.strip().lower() != "on-board devices self test"
-    ]
 
-
-class FlashMode(Enum):
-    """Flash target selection"""
-    EMMC = "eMMC only"
-    NOR  = "NOR only"
-    DUAL = "Dual (NOR → eMMC → NOR)"
 
 
 class ConnectionMode(Enum):
     """Connection type to device"""
     SERIAL  = "Serial (USB/UART)"
     NETWORK = "Network (Ethernet)"
-
-
-class FirmwareChoice(Enum):
-    """Firmware source selection"""
-    MONO_OFFICIAL = "Mono Official"
-    ARMBIAN       = "Armbian"
-    CUSTOM        = "Custom (local file)"
 
 
 class MenuState(Enum):
@@ -142,10 +147,7 @@ class MenuState(Enum):
     NETWORK_AUTO_CONFIG    = "network_auto_config"
     NETWORK_FLASH_CONFIG  = "network_flash_config"
     NETWORK_FLASHING      = "network_flashing"
-    FLASH_MODE            = "flash_mode"
-    FIRMWARE_SOURCE       = "firmware_source"
-    CONFIRM               = "confirm"
-    FLASHING              = "flashing"
+    RECOVERY_FLOW         = "recovery_flow"
     DONE                  = "done"
     CLI_CONSOLE           = "cli_console"
     DEVICE_STATS          = "device_stats"
@@ -158,8 +160,6 @@ class MonoImager:
         self.current_state   = MenuState.MAIN
         self.connection_mode = None
         self.device          = None
-        self.flash_mode      = None
-        self.firmware_choice = None
         self.custom_fw_path  = None
         self.serial_port     = None
         self.network_host    = None
@@ -274,27 +274,36 @@ class MonoImager:
         self.print_header()
         print("What would you like to do?")
         print()
-        print("  1) Flash firmware")
-        print("  2) Recover bricked device")
-        print("  3) CLI only (console)")
-        print("  4) Show Device Stats")
-        print("  5) Exit")
+        print("  1) Flash OS")
+        print("  2) Update / Recover Firmware")
+        print("  3) CLI only (serial)")
+        print("  4) Test Serial connection")
+        print("  5) Test LAN connection")
+        print("  6) Show Device Stats")
+        print("  7) Exit")
         print()
 
-        choice = input("Select [1-5]: ").strip()
+        choice = input("Select [1-7]: ").strip()
 
         if choice == "1":
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
         elif choice == "2":
-            print()
-            print("  Recovery mode not yet implemented.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
+            self.current_state = MenuState.RECOVERY_FLOW
         elif choice == "3":
             self.current_state = MenuState.CLI_CONSOLE
         elif choice == "4":
-            self.current_state = MenuState.DEVICE_STATS
+            print()
+            print("  Test Serial connection not yet implemented.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
         elif choice == "5":
+            print()
+            print("  Test LAN connection not yet implemented.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+        elif choice == "6":
+            self.current_state = MenuState.DEVICE_STATS
+        elif choice == "7":
             sys.exit(0)
         else:
             print("  Invalid selection.")
@@ -394,7 +403,7 @@ class MonoImager:
             if 0 <= idx < len(all_ports):
                 self.serial_port = all_ports[idx].device
                 save_last_port(self.serial_port)
-                logger.info(f"Selected serial port: {self.serial_port}")
+                verbose(f"Selected serial port: {self.serial_port}")
                 self.current_state = MenuState.TRANSFER_METHOD
             else:
                 print("  Invalid selection.")
@@ -424,19 +433,16 @@ class MonoImager:
         Ask how to transfer the firmware after serial bootstrap.
 
         Only Network is currently offered. A Serial-only transfer
-        option existed here but was DELIBERATELY DISABLED: it routes
-        to _flash_serial() / flasher.py's Flasher class, which predates
-        all of this session's reliability hardening — it still uses
-        raw send_command() calls instead of the proven
-        run_script()/launch_script() heredoc-write-then-verify pattern
-        that exists specifically because naive serial command execution
-        was found to be unreliable (see flash_orchestrator.py history).
-        It has not been tested on real hardware this session at all.
-
-        Re-enable only after porting flash_emmc_manual()/
-        flash_emmc_modern() to the same hardened pattern used
-        throughout flash_orchestrator.py, and verifying on real
-        hardware — same bar as the Network path was held to.
+        option (_flash_serial() / flasher.py's Flasher class) existed
+        here but was removed: it predated this session's reliability
+        hardening — it still used raw send_command() calls instead of
+        the proven run_script()/launch_script() heredoc-write-then-
+        verify pattern that exists specifically because naive serial
+        command execution was found to be unreliable (see
+        flash_orchestrator.py history) — and had never been tested on
+        real hardware. The whole menu chain it routed through
+        (FLASH_MODE/FIRMWARE_SOURCE/CONFIRM/FLASHING) was unreachable
+        anyway, so it was deleted outright rather than left disabled.
         """
         self.clear_screen()
         self.print_header()
@@ -470,6 +476,8 @@ class MonoImager:
     def menu_flash_auto_or_manual(self):
         self.clear_screen()
         self.print_header()
+        print("  ⚠️  ETHERNET: Plug into RIGHTMOST 1 Gig RJ-45 jack (not SFP+ cages)")
+        print()
         print("  1) Fully Auto — just point it at a firmware file")
         print("  2) Manual     — choose port, network settings yourself")
         print("  3) Back")
@@ -503,6 +511,8 @@ class MonoImager:
         self.print_header()
         print("  Fully Auto")
         print()
+        print("  ⚠️  ETHERNET: Plug into RIGHTMOST 1 Gig RJ-45 jack (not SFP+ cages)")
+        print()
 
         try:
             known, other = detect_serial_ports()
@@ -522,8 +532,50 @@ class MonoImager:
 
         port = all_ports[0].device
         print(f"  Auto-detected port: {port} ({all_ports[0].description})")
+        print()
+        print("  ℹ️  Images over ~3GB auto-switch to streaming flash mode (slower, no local copy).")
+        print()
 
-        firmware_raw = input("  Type or paste the full path of the image file: ")
+        # OS selection to determine flash target
+        print("  Select the OS you're flashing:")
+        print("    1) Armbian (Debian/Ubuntu)")
+        print("    2) OPNsense")
+        print("    3) OpenWRT")
+        print("    4) VyOS")
+        print("    5) Other (manual target)")
+        print("    6) Back")
+        print()
+        os_choice = input("  Select [1-6]: ").strip()
+
+        flash_target = "/dev/mmcblk0"  # Default for most OSes
+        if os_choice == "1":
+            os_name = "Armbian"
+        elif os_choice == "2":
+            os_name = "OPNsense"
+        elif os_choice == "3":
+            os_name = "OpenWRT"
+            flash_target = "/dev/mmcblk0p1"  # OpenWRT uses partition 1
+        elif os_choice == "4":
+            os_name = "VyOS"
+        elif os_choice == "5":
+            os_name = "Other"
+            flash_target = input("  Enter flash target (e.g., /dev/mmcblk0 or /dev/mmcblk0p1): ").strip()
+            if not flash_target:
+                print("  ❌ Flash target is required.")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
+                return
+        elif os_choice == "6":
+            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
+            return
+        else:
+            print("  ❌ Invalid selection.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.NETWORK_AUTO_CONFIG
+            return
+
+        print()
+        firmware_raw = input("  Type the full path (or paste or drag-n-drop) of the image file: ")
         firmware_path, error = self._validate_firmware_path(firmware_raw)
         if error:
             print(f"  ❌ {error}")
@@ -549,11 +601,31 @@ class MonoImager:
 
         print()
         print("  About to flash:")
+        print(f"    OS:          {os_name}")
         print(f"    Port:        {port}")
         print(f"    Firmware:    {firmware_path}")
-        print(f"    Target:      /dev/mmcblk0")
+        print(f"    Target:      {flash_target}")
         print(f"    Host IP:     {host_ip}:8080  (auto-detected)")
         print(f"    Device IP:   {device_ip}  (auto-derived)")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  This writes to eMMC, the device's main storage  │")
+        print("  │  (32 GB). It does NOT touch NOR flash (64 MB —   │")
+        print("  │  the bootloader + recovery tool).                │")
+        print("  │                                                   │")
+        print("  │     NOR (64 MB)          eMMC (32 GB)            │")
+        print("  │   ┌─────────────┐      ┌─────────────────┐      │")
+        print("  │   │ Bootloader  │      │  Your OS goes    │      │")
+        print("  │   │ + Recovery  │      │  here — this is  │      │")
+        print("  │   │ (untouched) │      │  what gets       │      │")
+        print("  │   └─────────────┘      │  flashed now ✓   │      │")
+        print("  │                        └─────────────────┘      │")
+        print("  │                                                   │")
+        print("  │  After flashing, the DIP switch picks which one  │")
+        print("  │  the board actually boots:                       │")
+        print("  │    LEFT  = eMMC  (your new OS boots)             │")
+        print("  │    RIGHT = NOR   (boots recovery instead)        │")
+        print("  └─────────────────────────────────────────────────┘")
         print()
         print("  This tool is well tested, but writing firmware is never")
         print("  without risk. Do not unplug power or disconnect the cable")
@@ -572,17 +644,16 @@ class MonoImager:
         self.net_device_ip    = device_ip
         self.net_http_port    = 8080
         self.custom_fw_path   = firmware_path
-        self.net_flash_target = "/dev/mmcblk0"
+        self.net_flash_target = flash_target
         self.current_state    = MenuState.NETWORK_FLASHING
 
     # ------------------------------------------------------------------ #
     #  NETWORK FLASH CONFIG — collects the values flash_orchestrator.py  #
-    #  actually needs. Deliberately separate from FLASH_MODE/            #
-    #  FIRMWARE_SOURCE below: those menus (eMMC/NOR/Dual, Mono Official/ #
-    #  Armbian/Custom) map onto _flash_serial()'s Flasher-class API,     #
-    #  which flash_orchestrator.py does not use at all — it just takes a#
-    #  firmware file path and a flash target string directly. Reusing   #
-    #  those menus here would ask questions that don't actually apply.  #
+    #  actually needs: just a firmware file path and a flash target      #
+    #  string directly. (The eMMC/NOR/Dual + Mono Official/Armbian/      #
+    #  Custom menus that used to feed the old Flasher-class API have     #
+    #  been removed — they were unreachable and flash_orchestrator.py    #
+    #  never used them anyway.)                                         #
     # ------------------------------------------------------------------ #
     def menu_network_flash_config(self):
         """
@@ -667,43 +738,82 @@ class MonoImager:
         tests/test_verify_flash_manual.py, confirmed working on real
         hardware (12/12 steps, both auto and manual paths).
         """
-        self.clear_screen()
-        self.print_header()
+        # DON'T clear screen here — keep all output visible for debugging
 
         from mono_imager import flash_orchestrator as core
 
         server = None
         d = None
         try:
+            print()
+            print("=" * 60)
+            print("PHASE 1: Bootstrap (Serial)")
+            print("=" * 60)
+            print(f"Port: {self.serial_port}")
+            print(f"Baud: 115200")
+            print()
             d = core.phase1_bootstrap(self.serial_port, 115200)
             if d is None:
+                print("❌ Phase 1 FAILED")
+                print()
                 self.flash_success = core.print_report()
                 self.current_state = MenuState.DONE
                 return
 
+            print("✓ Phase 1 PASSED")
+            print()
+            
+            print("=" * 60)
+            print("PHASE 2: Network Setup")
+            print("=" * 60)
+            print(f"Host IP: {self.net_host_ip}")
+            print(f"Device IP: {self.net_device_ip}")
+            print(f"HTTP Port: {self.net_http_port}")
+            print(f"Firmware: {self.custom_fw_path}")
+            print()
             server = core.phase2_network(
                 d, self.net_host_ip, self.net_device_ip,
                 self.net_http_port, self.custom_fw_path
             )
             if server is None:
+                print("❌ Phase 2 FAILED")
+                print()
                 self.flash_success = core.print_report()
                 self.current_state = MenuState.DONE
                 return
 
+            print("✓ Phase 2 PASSED")
+            print()
+            print("=" * 60)
+            print("PHASE 3: Flash (curl | dd)")
+            print("=" * 60)
+            print(f"Target: {self.net_flash_target}")
+            print()
             ok = core.phase3_flash(
-                d, self.net_host_ip, self.net_http_port, self.net_flash_target
+                d, self.net_host_ip, self.net_http_port, self.net_flash_target,
+                firmware_size=os.path.getsize(self.custom_fw_path)
             )
             if not ok:
+                print("❌ Phase 3 FAILED")
+                print()
                 self.flash_success = core.print_report()
                 self.current_state = MenuState.DONE
                 return
 
+            print("✓ Phase 3 PASSED")
+            print()
+            print("=" * 60)
+            print("PHASE 4: Post-Flash (Reboot)")
+            print("=" * 60)
+            print()
             core.phase4_postflash(d)
+            print("✓ Phase 4 PASSED")
+            print()
 
         finally:
             if server:
                 server.shutdown()
-                core.logger.info("HTTP server stopped")
+                core.verbose("HTTP server stopped")
             if d:
                 d.disconnect()
 
@@ -711,324 +821,397 @@ class MonoImager:
         self.current_state = MenuState.DONE
 
     # ------------------------------------------------------------------ #
-    #  4. FLASH TARGET                                                     #
+    #  RECOVERY — Update / Recover Firmware. Guided (guardrailed)         #
+    #  semi-automated: device/firmware-type detection is automatic, but #
+    #  the physical DIP-switch flips pause for an explicit Enter rather #
+    #  than blindly polling immediately — the user stays in control of  #
+    #  timing while not needing to know modern-vs-legacy device details.#
     # ------------------------------------------------------------------ #
-    def menu_flash_mode(self):
-        """Flash target selection"""
-        self.clear_screen()
-        self.print_header()
-        print("What would you like to flash?")
+    def _setup_recovery_network(self, d) -> bool:
+        """
+        Prompt for and configure networking on the device's current
+        recovery shell session, then VERIFY it actually works.
+
+        BUG THIS FIXES (part 1): both the modern 'firmware update'
+        command and the legacy curl-based path require real internet
+        access on the device (documented hard prerequisite) — but
+        recovery Linux has no DHCP and nothing was ever configuring
+        an IP before attempting either. Confirmed on real hardware:
+        without it, 'firmware update' prints its confirmation prompt
+        then aborts itself within seconds (no internet to reach) —
+        faster than recovery_orchestrator's auto-confirm could land,
+        so the late-arriving 'yes' got typed into the now-idle shell
+        as a literal command instead.
+
+        BUG THIS FIXES (part 2): local 'ip addr'/'ip route' commands
+        reporting RC=0 only proves the LOCAL config was accepted, not
+        that the device can actually reach anything — confirmed on
+        real hardware: a run reported network setup success, then
+        'firmware update' still failed within seconds, because the
+        physical port in use had no real path to the internet. This
+        now calls recovery_orchestrator.check_internet_reachable()
+        afterward to catch that before ever touching 'firmware update'.
+
+        Recovery Linux also doesn't persist config across a reboot,
+        so this must be called again after every fresh boot into a
+        recovery shell, not just once at the start.
+        """
+        from mono_imager import recovery_orchestrator as rec
+
         print()
-        print("  1) eMMC only          (safe, single step)")
-        print("  2) NOR only           (advanced)")
-        print("  3) Dual               (NOR → eMMC → NOR, recommended)")
-        print("  4) Back")
+        print("  Network setup — REQUIRED before 'firmware update' will work.")
+        print("  'firmware update' needs the device to reach the internet directly.")
         print()
-
-        choice = input("Select [1-4]: ").strip()
-
-        if choice == "1":
-            self.flash_mode    = FlashMode.EMMC
-            self.current_state = MenuState.FIRMWARE_SOURCE
-        elif choice == "2":
-            self.flash_mode    = FlashMode.NOR
-            self.current_state = MenuState.FIRMWARE_SOURCE
-        elif choice == "3":
-            self.flash_mode    = FlashMode.DUAL
-            self.current_state = MenuState.FIRMWARE_SOURCE
-        elif choice == "4":
-            self.current_state = MenuState.DEVICE_SELECT
-        else:
-            print("  Invalid selection.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FLASH_MODE
-
-    # ------------------------------------------------------------------ #
-    #  5. FIRMWARE SOURCE                                                  #
-    # ------------------------------------------------------------------ #
-    def menu_firmware_source(self):
-        """Firmware source selection"""
-        self.clear_screen()
-        self.print_header()
-        print("Which firmware would you like to flash?")
-        print()
-        print("  1) Mono Official      (recommended)")
-        print("  2) Armbian")
-        print("  3) Custom             (local file)")
-        print("  4) Back")
-        print()
-
-        choice = input("Select [1-4]: ").strip()
-
-        if choice == "1":
-            self.firmware_choice = FirmwareChoice.MONO_OFFICIAL
-            self.custom_fw_path  = None
-            self.current_state   = MenuState.CONFIRM
-        elif choice == "2":
-            self.firmware_choice = FirmwareChoice.ARMBIAN
-            self.custom_fw_path  = None
-            self.current_state   = MenuState.CONFIRM
-        elif choice == "3":
-            self._select_custom_firmware()
-        elif choice == "4":
-            self.current_state = MenuState.FLASH_MODE
-        else:
-            print("  Invalid selection.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FIRMWARE_SOURCE
-
-    def _select_custom_firmware(self):
-        """Prompt user for local firmware file path"""
-        print()
-        path = input("  Enter path to firmware file: ").strip()
-
-        if not path:
-            print("  No path entered.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FIRMWARE_SOURCE
-            return
-
-        from pathlib import Path
-        fw_path = Path(path).expanduser()
-
-        if not fw_path.exists():
-            print(f"  ❌ File not found: {fw_path}")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FIRMWARE_SOURCE
-            return
-
-        if not fw_path.is_file():
-            print(f"  ❌ Path is not a file: {fw_path}")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FIRMWARE_SOURCE
-            return
-
-        self.firmware_choice = FirmwareChoice.CUSTOM
-        self.custom_fw_path  = fw_path
-        self.current_state   = MenuState.CONFIRM
-
-    # ------------------------------------------------------------------ #
-    #  6. CONFIRM                                                          #
-    # ------------------------------------------------------------------ #
-    def menu_confirm(self):
-        """Confirmation before flashing"""
-        self.clear_screen()
-        self.print_header()
-        print("⚠️  FLASHING WILL ERASE DATA")
-        print()
-        print(f"  Device:     {self.serial_port or self.network_host}")
-        print(f"  Connection: {self.connection_mode.value}")
-        print(f"  Target:     {self.flash_mode.value}")
-        print(f"  Firmware:   {self.firmware_choice.value}", end="")
-        if self.custom_fw_path:
-            print(f" ({self.custom_fw_path})")
-        else:
-            print()
-        print()
-        print("  This operation cannot be undone. Ensure you have:")
-        print("    ✓ Backed up any important data")
-        print("    ✓ Device is connected to stable power")
-        print("    ✓ Stable serial or Ethernet connection")
-        print()
-        print("  This tool is well tested, but writing firmware is never")
-        print("  without risk. Do not unplug power or disconnect the cable")
-        print("  while a flash is in progress — an interrupted write can")
-        print("  leave the device unbootable.")
-        print()
-
-        choice = input("Proceed? [y/N]: ").strip().lower()
-
-        if choice == 'y':
-            self.current_state = MenuState.FLASHING
-        else:
-            logger.info("Cancelled by user")
-            self.current_state = MenuState.MAIN
-
-    # ------------------------------------------------------------------ #
-    #  7. FLASHING                                                         #
-    # ------------------------------------------------------------------ #
-    def menu_flashing(self):
-        """Flashing in progress"""
-        self.clear_screen()
-        self.print_header()
-        print("Starting flashing sequence...")
-        print()
-
+        
+        # Bring up all eth ports first, THEN check for LOWER_UP.
+        # BUG FIXED: this previously checked for LOWER_UP without ever
+        # bringing any interface up first — recovery Linux boots with
+        # all eth ports administratively DOWN, so LOWER_UP was never
+        # set regardless of whether a cable was plugged in. Confirmed
+        # on real hardware: 'No active Ethernet port detected' even
+        # with a cable connected, both before and after the retry
+        # prompt. Same root cause and same fix already applied to
+        # flash_orchestrator.py's phase2_network() earlier — this is
+        # the matching fix for this separate code path.
+        #
+        # SPEEDUP: previously 5 separate 'eth up' calls + 1 'ip link
+        # show' call = 6 run_script() round trips. Each round trip on
+        # this device/link costs ~15s (write+verify+exec, each step
+        # waiting for the line to settle) — confirmed via real log
+        # timestamps (clean 5s jumps between each sub-step). Combining
+        # all six commands into ONE script body cuts that to a single
+        # round trip. Same commands, same write-verify-exec safety
+        # checks, same idle-wait logic — just one trip instead of six.
         try:
-            if self.connection_mode == ConnectionMode.SERIAL:
-                self.flash_success = self._flash_serial()
-            elif self.connection_mode == ConnectionMode.NETWORK:
-                self.flash_success = self._flash_network()
-            else:
-                self.flash_success = False
-
-            self.current_state = MenuState.DONE
-
+            # BUG FIXED: checking 'ip link show' immediately after
+            # 'ip link set up' can miss interfaces whose link partner
+            # hasn't finished autonegotiating yet. Confirmed on real
+            # Force eth0 only — it is the only working port
+            d.run_script("ip link set eth0 up 2>/dev/null", marker="recovery_eth0_up", exec_timeout=10)
         except Exception as e:
-            logger.error(f"Flashing failed: {e}")
-            self.flash_success = False
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-
-    def _flash_serial(self) -> bool:
-        """Execute flashing via serial connection. Returns True on success."""
-        from mono_imager.serial_device import SerialDevice
-        from mono_imager.flasher import (
-            Flasher, FirmwareDownloader, FirmwareSource, create_cache_dir
-        )
+            print(f"  ❌ Failed to bring up eth0: {e}")
+            return False
         
-        logger.info(f"Flashing via serial: {self.serial_port}")
-        logger.info(f"Target: {self.flash_mode.value}  Firmware: {self.firmware_choice.value}")
-        
-        device = None
         try:
-            # Phase 1: Connect and boot recovery
-            print("\n  Connecting to device...")
-            device = SerialDevice(self.serial_port, timeout=10)
-            if not device.connect():
-                print("  ❌ Failed to connect to device")
-                logger.error("SerialDevice.connect() failed")
-                return False
-            
-            print("  ⚡ POWER CYCLE YOUR DEVICE NOW (waiting for U-Boot autoboot)...")
-            if not device.wait_for_autoboot(timeout=60):
-                print("  ❌ Failed to interrupt U-Boot autoboot")
-                logger.error("wait_for_autoboot() timed out or failed")
-                device.disconnect()
-                return False
-            
-            print("  Booting recovery Linux...")
-            if not device.boot_recovery():
-                print("  ❌ Failed to boot recovery Linux")
-                logger.error("boot_recovery() failed")
-                device.disconnect()
-                return False
-            
-            print("  Logging into recovery...")
-            if not device.login_recovery(timeout=30):
-                print("  ❌ Failed to login to recovery Linux")
-                logger.error("login_recovery() failed")
-                device.disconnect()
-                return False
-            
-            print("  ✓ Device ready (recovery Linux booted and logged in)")
-            
-            # Phase 2: Acquire firmware
-            print("\n  Preparing firmware...")
-            cache_dir = create_cache_dir()
-            fw_path = None
-            
-            if self.firmware_choice == FirmwareChoice.CUSTOM:
-                fw_path = Path(self.custom_fw_path)
-                if not fw_path.exists():
-                    print(f"  ❌ Custom firmware file not found: {fw_path}")
-                    logger.error(f"Custom firmware path does not exist: {fw_path}")
-                    device.disconnect()
+            ip_output = d.run_script("sleep 2; ip link show eth0", marker="recovery_eth0_check", exec_timeout=10)
+            if 'LOWER_UP' not in ip_output:
+                print("  ❌ eth0 has no carrier.")
+                print("     Plug an Ethernet cable into the RIGHTMOST 1 Gig RJ-45 jack (not the SFP+ cages).")
+                print()
+                input("  Press Enter once the cable is plugged in...")
+                ip_output = d.run_script("ip link show eth0", marker="recovery_eth0_check_retry", exec_timeout=5)
+                if 'LOWER_UP' not in ip_output:
+                    print("  ❌ eth0 still has no carrier.")
+                    print("     Verify the cable is in the RIGHTMOST 1 Gig RJ-45 jack.")
                     return False
-                print(f"  Using custom firmware: {fw_path.name}")
-            else:
-                # Download from official source
-                fw_source = (
-                    FirmwareSource.MONO_OFFICIAL
-                    if self.firmware_choice == FirmwareChoice.MONO_OFFICIAL
-                    else FirmwareSource.ARMBIAN
-                )
-                url = fw_source["eMMC"]
-                fw_path = cache_dir / Path(url).name
-                
-                if not fw_path.exists():
-                    print(f"  Downloading {fw_source['name']} firmware...")
-                    print(f"    ({url})")
-                    downloader = FirmwareDownloader(timeout=60)
-                    if not downloader.download(url, fw_path):
-                        print("  ❌ Firmware download failed")
-                        logger.error(f"Download failed for {url}")
-                        device.disconnect()
-                        return False
-                    print(f"  ✓ Downloaded {fw_path.stat().st_size / (1024*1024):.1f} MB")
-                else:
-                    print(f"  Using cached firmware: {fw_path.name}")
-            
-            # Phase 3: Flash
-            print(f"\n  Flashing {self.flash_mode.value}...")
-            print("  (This may take several minutes. Do not power off device.)")
-            
-            flasher = Flasher(device)
-            
-            # Detect firmware tool or use manual method
-            tool = flasher.detect_firmware_tool()
-            if tool == "firmware":
-                # Modern 'firmware update' tool
-                success = flasher.flash_emmc_modern()
-            else:
-                # Manual curl | dd method
-                mac = flasher.get_device_mac()
-                if not mac:
-                    mac = "00:00:00:00:00:00"
-                    logger.warning(f"Could not detect device MAC; using fallback {mac}")
-                success = flasher.flash_emmc_manual(mac)
-            
-            if not success:
-                print("  ❌ Flash operation failed")
-                logger.error("Flash operation did not complete successfully")
-                device.disconnect()
-                return False
-            
-            print("  ✓ Flash complete")
-            
-            # Phase 4: Verify boot source
-            print("\n  Verifying boot source...")
-            if not flasher.verify_boot_source("eMMC"):
-                logger.warning("Boot source verification inconclusive")
-                # Don't fail here — device may not have booted yet
-            
-            device.disconnect()
-            return True
-            
+            print("  ✓ eth0 is ready.")
         except Exception as e:
-            logger.error(f"Serial flash error: {type(e).__name__}: {e}", exc_info=True)
-            print(f"  ❌ Error: {e}")
-            if device:
-                try:
-                    device.disconnect()
-                except Exception:
-                    pass
+            print(f"  ❌ Failed to check eth0 carrier: {e}")
+            return False
+        
+        device_ip = input(
+            "  Pick an unused IP address for the device on that same network "
+            "(e.g. 192.168.1.50). Check your own machine's network adapter "
+            "settings first if you're unsure of the IP/subnet/gateway on that "
+            "network.\n  Device IP to assign: "
+        ).strip()
+        if not device_ip:
+            print("  ❌ Device IP is required.")
+            return False
+        prefix = input("  Prefix [24]: ").strip() or "24"
+        gateway = input("  Gateway (your router's IP on that network, e.g. 192.168.1.1): ").strip()
+        if not gateway:
+            print("  ❌ Gateway is required.")
             return False
 
-    def _flash_network(self) -> bool:
-        """Execute flashing via network connection. Returns True on success."""
-        logger.info(f"Flashing via network: {self.network_host}")
-        logger.info(f"Target: {self.flash_mode.value}  Firmware: {self.firmware_choice.value}")
-        # TODO: Implement network flashing logic
-        print("  Network flashing logic not yet implemented.")
-        input("  Press Enter to continue...")
+        from mono_imager.spinner import with_spinner
+
+        iface = "eth0"
+        print(f"  Configuring {iface} = {device_ip}/{prefix}, gateway {gateway}...")
+        net_cmd = (
+            f"ip link set {iface} up && "
+            f"ip addr add {device_ip}/{prefix} dev {iface} && "
+            f"ip route add default via {gateway} dev {iface}; "
+            f"echo RC=$?"
+        )
+        try:
+            output = d.run_script(net_cmd, marker="recovery_net_setup_eth0", exec_timeout=20)
+        except RuntimeError as e:
+            print(f"  ❌ Network setup failed on eth0: {e}")
+            return False
+
+        if "RC=0" not in output:
+            print(f"  ❌ Network setup did not report success on eth0.")
+            return False
+
+        print("  ✓ Local network config applied.", end=" ", flush=True)
+
+        result, error = with_spinner(
+            rec.check_internet_reachable, d, gateway=gateway,
+            message="Verifying real connectivity..."
+        )
+
+        if error is not None:
+            raise error
+
+        if result:
+            print(f"  ✓ Internet reachable via eth0 — network is ready.")
+            return True
+
+        print(f"  ❌ eth0 has link but could not reach the internet.")
+        print("     Check the gateway IP, cable, and network configuration.")
         return False
+
+    def menu_recovery_flow(self):
+        """
+        Run the documented modern recovery sequence (NOR -> flash eMMC
+        -> [DIP flip] -> eMMC -> flash NOR -> [DIP flip back]), or the
+        legacy curl-based sequence on older devices — detected live,
+        per device, via recovery_orchestrator.detect_modern_firmware_tool().
+
+        Reuses flash_orchestrator.phase1_bootstrap() for the initial
+        connect/interrupt/boot-recovery/login sequence (same proven
+        bootstrap used by the Flash OS path), then hands off to
+        recovery_orchestrator.py's phase_* functions, which already
+        do the actual device-talking and result tracking.
+        """
+        from mono_imager import flash_orchestrator as core
+        from mono_imager import recovery_orchestrator as rec
+        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
+
+        self.clear_screen()
+        self.print_header()
+        print("Update / Recover Firmware")
+        print()
+        print("This walks you through recovering or refreshing your device's")
+        print("firmware, using the device's own 'firmware update' tool (or the")
+        print("legacy curl-based method on older devices, detected automatically).")
+        print("You'll be asked to flip the DIP switch and power-cycle the device")
+        print("at the right moments — nothing happens without your confirmation.")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  START HERE: DIP switch → RIGHT (NOR)            │")
+        print("  │                                                   │")
+        print("  │  This makes the board boot straight into         │")
+        print("  │  recovery on its own — you don't have to catch   │")
+        print("  │  the countdown or type anything.                 │")
+        print("  │                                                   │")
+        print("  │  If your DIP is on LEFT (eMMC) right now, flip   │")
+        print("  │  it to RIGHT and power-cycle before continuing.  │")
+        print("  └─────────────────────────────────────────────────┘")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  ETHERNET CABLE REQUIREMENT                      │")
+        print("  │                                                   │")
+        print("  │  Plug an Ethernet cable into the RIGHTMOST       │")
+        print("  │  1 Gig RJ-45 jack (not the SFP+ cages).          │")
+        print("  │                                                   │")
+        print("  │  The device needs internet access to download    │")
+        print("  │  firmware during the update process.             │")
+        print("  └─────────────────────────────────────────────────┘")
+        print()
+
+        # --- Port selection ---
+        try:
+            known, other = detect_serial_ports()
+            all_ports = known + other
+        except Exception as e:
+            print(f"  ❌ Port detection failed: {e}")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        if not all_ports:
+            print("  ❌ No serial device found. Connect the device and try again.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        last_port = get_last_port()
+        for i, p in enumerate(all_ports, 1):
+            marker = " ◄ last used" if p.device == last_port else ""
+            print(f"  {i}) {p.device} — {p.description}{marker}")
+        print(f"  {len(all_ports) + 1}) Back")
+        print()
+
+        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
+        try:
+            idx = int(choice) - 1
+            if idx == len(all_ports):
+                self.current_state = MenuState.MAIN
+                return
+            if not (0 <= idx < len(all_ports)):
+                raise ValueError("out of range")
+            port = all_ports[idx].device
+        except ValueError:
+            print("  Invalid selection.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        save_last_port(port)
+
+        print()
+        print("⚠️  This can write firmware to your device's NOR and/or eMMC.")
+        confirm = input("Proceed? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("  Cancelled.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        def show_progress(chunk):
+            print(chunk, end="", flush=True)
+            # BUG THIS FIXES: live 'firmware update' output only ever
+            # went to print() — if the process gets killed (e.g. a
+            # runaway prompt requiring Ctrl+C) before _stream_command()
+            # returns and logs the full buffer, none of what was on
+            # screen ever made it into the log file. Logging each
+            # chunk as it arrives means a forced kill still leaves a
+            # real trail to diagnose from.
+            verbose(f"[firmware update output] {chunk!r}", "debug")
+
+        def finish(success: bool):
+            self.flash_success = success
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+
+        d = None
+        try:
+            d = core.phase1_bootstrap(port, 115200)
+            if d is None:
+                print()
+                print("  ❌ Could not bootstrap into the recovery shell.")
+                finish(core.print_report())
+                return
+
+            rec.reset_results()
+            is_modern = rec.detect_modern_firmware_tool(d)
+
+            if is_modern is None:
+                print()
+                print("  ❌ Could not determine the device's firmware tool type.")
+                finish(rec.print_report())
+                return
+
+            if not self._setup_recovery_network(d):
+                finish(rec.print_report())
+                return
+
+            if is_modern:
+                print()
+                print("  Modern firmware tool detected.")
+                print()
+                emmc_ok = rec.phase_modern_flash_emmc(d, on_output=show_progress)
+                if not emmc_ok:
+                    print()
+                    print("  ⚠ Modern 'firmware update' failed for eMMC — falling back")
+                    print("    to the legacy curl+dd method (same session, no reboot needed)...")
+                    emmc_ok = rec.phase_legacy_flash_emmc(d)
+                    if not emmc_ok:
+                        print("  ❌ Legacy fallback also failed for eMMC. Nothing more to try automatically.")
+                        finish(rec.print_report())
+                        return
+                    print("  ✓ Legacy fallback succeeded for eMMC.")
+                    print("  Backend that serves the modern tool looks broken for this device —")
+                    print("  continuing with the legacy method for NOR too (no DIP flip needed).")
+                    rec.phase_legacy_flash_nor(d)
+                    finish(rec.print_report())
+                    return
+
+                print()
+                print("=" * 60)
+                print("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
+                print("=" * 60)
+                input("  Press Enter once you've done that...")
+
+                if not rec.phase_modern_verify_emmc_boot(d):
+                    print("  ❌ Could not confirm the device booted from eMMC.")
+                    finish(rec.print_report())
+                    return
+
+                print("  Re-entering the recovery shell on eMMC...")
+                reentered = (
+                    d.wait_for_autoboot(timeout=60)
+                    and d.boot_recovery()
+                    and d.login_recovery(timeout=60)
+                )
+                if not reentered:
+                    print("  ❌ Could not re-enter the recovery shell after the eMMC boot.")
+                    finish(rec.print_report())
+                    return
+
+                if not self._setup_recovery_network(d):
+                    finish(rec.print_report())
+                    return
+
+                nor_ok = rec.phase_modern_flash_nor(d, on_output=show_progress)
+                if not nor_ok:
+                    print()
+                    print("  ⚠ Modern 'firmware update' failed for NOR — falling back")
+                    print("    to the legacy curl+flashcp method...")
+                    nor_ok = rec.phase_legacy_flash_nor(d)
+                    if not nor_ok:
+                        print("  ❌ Legacy fallback also failed for NOR. Nothing more to try automatically.")
+                        finish(rec.print_report())
+                        return
+                    print("  ✓ Legacy fallback succeeded for NOR.")
+
+                print()
+                print("=" * 60)
+                print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR, THEN POWER-CYCLE ⚡")
+                print("=" * 60)
+                input("  Press Enter once you've done that...")
+
+                rec.phase_modern_verify_nor_boot(d)
+
+            else:
+                print()
+                print("  Legacy firmware tool detected — using curl/dd/flashcp directly.")
+                print("  (No DIP-switch flips needed for this path.)")
+                print()
+                if not rec.phase_legacy_flash_emmc(d):
+                    finish(rec.print_report())
+                    return
+                rec.phase_legacy_flash_nor(d)
+
+        finally:
+            if d:
+                d.disconnect()
+
+        finish(rec.print_report())
 
     # ------------------------------------------------------------------ #
     #  8. DONE                                                             #
     # ------------------------------------------------------------------ #
     def menu_done(self):
         """Flash result screen"""
-        self.clear_screen()
-        self.print_header()
-
+        # DON'T clear screen — keep all debug output visible
+        
+        print()
+        print("=" * 60)
         if self.flash_success:
             print("✅ Flashing complete!")
             print()
-            print("  Next steps:")
-            print("    1) Device will reboot automatically")
-            print("    2) Wait 30-60 seconds for boot")
-            print("    3) Access device via serial console or SSH")
+            print("  ⚡ NEXT STEP: Set DIP Switch ⚡")
+            print("  Move the DIP switch to: LEFT (eMMC)")
+            print()
+            print("  Then power-cycle the device.")
+            print("  It will boot with the new firmware.")
+            print()
+            print("  💡 Tip: You can watch it boot live via")
+            print("     option 3 (CLI / raw serial console) from the main menu.")
         else:
             print("❌ Flashing did not complete successfully.")
             print()
             print("  Check the log output above for details.")
             print("  You can retry from the main menu.")
 
+        print("=" * 60)
         print()
         if self.log_file:
-            logger.info(f"Result: {'OK' if self.flash_success else 'NOK'}")
-            logger.info(f"📄 Report saved to: {self.log_file}")
+            verbose(f"Result: {'OK' if self.flash_success else 'NOK'}")
+            verbose(f"📄 Report saved to: {self.log_file}")
             print(f"  📄 Report: {self.log_file}")
             print()
         input("Press Enter to return to main menu...")
@@ -1129,6 +1312,16 @@ class MonoImager:
         print("  ✓ Connected — you are now in raw serial console.")
         print("  Type Ctrl+] to exit.")
         print()
+
+        # Drain any leftover bytes from connect()'s own internal probe,
+        # then request a fresh prompt so the screen isn't blank.
+        try:
+            time.sleep(0.2)
+            d.safe_read_all()
+            time.sleep(0.1)
+            d.safe_write(b"\r")
+        except Exception:
+            pass
 
         stop_event = threading.Event()
 
@@ -1287,7 +1480,7 @@ class MonoImager:
             self._display_device_stats(raw_output)
 
         except Exception as e:
-            logger.error(f"Device stats query failed: {e}")
+            verbose(f"Device stats query failed: {e}", "error")
             print(f"  ❌ Error: {e}")
 
         print()
@@ -1296,26 +1489,15 @@ class MonoImager:
 
     def _display_device_stats(self, raw_output: str):
         """
-        Parse and display U-Boot's boot-time diagnostics: SoC/board
-        identity, clock configuration, and the power-on self-test
-        block (voltages, temperatures, fan speed, etc).
+        Parse and display U-Boot's boot-time diagnostics: SoC/board identity.
 
-        Parses ONLY what U-Boot itself prints before autoboot — no OS,
-        no /proc, nothing booted. Confirmed against a real capture on
-        this hardware (LS1046A / Mono Gateway Development Kit).
-
-        Fields not present in the captured output are simply omitted
-        — this does not guess or fill in values that weren't seen.
+        Parses identity fields from U-Boot output.
         """
         identity = parse_uboot_identity(raw_output)
-        self_test = parse_uboot_self_test(raw_output)
 
-        if not identity and not self_test:
+        if not identity:
             print()
             print("  ⚠️  No recognizable U-Boot diagnostic output found.")
-            print("  This can happen if the device didn't fully reach the")
-            print("  self-test stage, or U-Boot's output format differs")
-            print("  on this board/firmware version.")
             return
 
         print()
@@ -1325,19 +1507,6 @@ class MonoImager:
         if identity:
             for label, value in identity.items():
                 print(f"    {label:<22} {value}")
-        else:
-            print("    (none captured)")
-
-        print()
-        print("  " + "─" * 56)
-        print("  POWER-ON SELF TEST")
-        print("  " + "─" * 56)
-        if self_test:
-            for label, value in self_test:
-                line = f"    {label:<22} PASS"
-                if value:
-                    line += f"  ({value})"
-                print(line)
         else:
             print("    (none captured)")
         print()
@@ -1367,14 +1536,8 @@ class MonoImager:
                     self.menu_network_flash_config()
                 elif self.current_state == MenuState.NETWORK_FLASHING:
                     self.menu_network_flashing()
-                elif self.current_state == MenuState.FLASH_MODE:
-                    self.menu_flash_mode()
-                elif self.current_state == MenuState.FIRMWARE_SOURCE:
-                    self.menu_firmware_source()
-                elif self.current_state == MenuState.CONFIRM:
-                    self.menu_confirm()
-                elif self.current_state == MenuState.FLASHING:
-                    self.menu_flashing()
+                elif self.current_state == MenuState.RECOVERY_FLOW:
+                    self.menu_recovery_flow()
                 elif self.current_state == MenuState.DONE:
                     self.menu_done()
                 elif self.current_state == MenuState.CLI_CONSOLE:
@@ -1402,8 +1565,8 @@ def main():
         ],
         force=True
     )
-    logger.info(f"mono-imager v{__version__} by {__author__}")
-    logger.info(f"Log: {log_file}")
+    verbose(f"mono-imager v{__version__} by {__author__}")
+    verbose(f"Log: {log_file}")
 
     app = MonoImager(log_file)
     app.run()

@@ -5,19 +5,33 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.6.0
 License: MIT
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __author__ = "H.A. Hermsen"
 
 import serial
 import time
 import logging
+import sys
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
+
+
+def verbose(msg: str, level: str = "info"):
+    """Print to console immediately AND log it"""
+    print(msg, flush=True)
+    if level == "error":
+        logger.error(msg)
+    elif level == "warning":
+        logger.warning(msg)
+    elif level == "debug":
+        logger.debug(msg)
+    else:
+        logger.info(msg)
 
 
 class SerialDevice:
@@ -50,14 +64,14 @@ class SerialDevice:
         Connect to device with automatic baud rate detection
         """
         if not self.wait_for_port(timeout=30):
-            logger.error(f"Device on {self.port} did not appear — cannot connect")
+            verbose(f"Device on {self.port} did not appear — cannot connect", "error")
             return False
 
         rates_to_try = [baud_rate] if baud_rate else self.BAUD_RATES
 
         for rate in rates_to_try:
             try:
-                logger.info(f"Attempting connection at {rate} baud...")
+                verbose(f"Attempting connection at {rate} baud...")
 
                 # Create the REAL serial port
                 real = serial.Serial(
@@ -76,42 +90,42 @@ class SerialDevice:
                 response = self.ser.read_all()
 
                 if response:
-                    logger.debug(f"Response at {rate} baud: {response[:100]}")
+                    verbose(f"Response at {rate} baud: {response[:100]}", "debug")
 
                 if self._has_prompt(response) or len(response) > 0:
                     self.baud_rate = rate
-                    logger.info(f"✓ Connected at {rate} baud")
+                    verbose(f"✓ Connected at {rate} baud")
                     return True
 
                 # Close real port if no response
                 real.close()
 
             except serial.SerialException as e:
-                logger.debug(f"Failed to connect at {rate} baud: {e}")
+                verbose(f"Failed to connect at {rate} baud: {e}", "debug")
                 continue
 
-        logger.error(f"Failed to connect to {self.port} at any baud rate")
+        verbose(f"Failed to connect to {self.port} at any baud rate", "error")
         return False
 
     def disconnect(self):
         """Close serial connection"""
         if self.ser and self.ser.is_open:
             self.ser.close()
-            logger.info("Serial connection closed")
+            verbose("Serial connection closed")
             
     def _attempt_reconnect(self) -> bool:
         """
         Wait for port to reappear and reconnect at the last known baud rate.
         Warns explicitly if baud rate was never detected and falls back to 115200.
         """
-        logger.info("Attempting auto‑reconnect...")
+        verbose("Attempting auto‑reconnect...")
 
         if not self.wait_for_port(timeout=20):
             return False
 
         baud = self.baud_rate
         if baud is None:
-            logger.warning("Baud rate was never successfully detected — falling back to 115200")
+            verbose("Baud rate was never successfully detected — falling back to 115200", "warning")
             baud = 115200
 
         return self.connect(baud)
@@ -264,7 +278,7 @@ class SerialDevice:
         self.ser.reset_input_buffer()
         
         # Send command with newline
-        logger.debug(f">> {command}")
+        verbose(f">> {command}", "debug")
         self.ser.write((command + "\r\n").encode())
 
         # Prompt-driven read — exit the moment a known prompt appears,
@@ -320,7 +334,7 @@ class SerialDevice:
                 seen.append(line)
         response_str = "\n".join(seen).strip()
         
-        logger.debug(f"<< {response_str[:200]}")
+        verbose(f"<< {response_str[:200]}", "debug")
         return response_str
 
     def run_script(self, script_body: str, marker: str = None,
@@ -375,7 +389,7 @@ class SerialDevice:
         # not expanded by the shell doing the writing.
         write_cmd = f"cat > {remote_path} <<'{heredoc_tag}'\n{script_body}\n{heredoc_tag}"
 
-        logger.debug(f">> [run_script:write] {len(write_cmd)} bytes to {remote_path}")
+        verbose(f">> [run_script:write] {len(write_cmd)} bytes to {remote_path}", "debug")
         self.ser.reset_input_buffer()
         self.ser.write((write_cmd + "\r\n").encode())
 
@@ -397,7 +411,7 @@ class SerialDevice:
                         break
             except serial.SerialException:
                 break
-        logger.debug(f"<< [run_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}")
+        verbose(f"<< [run_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}", "debug")
 
         # Real hardware showed this shell actively redrawing the heredoc
         # echo with ANSI escape sequences (cursor-up, clear-line) — i.e.
@@ -414,7 +428,7 @@ class SerialDevice:
         size_check = self.send_command(
             f"wc -c < {remote_path}", wait_for_prompt=True, timeout=5
         )
-        logger.debug(f"<< [run_script:wc-c parsed] {size_check!r}")
+        verbose(f"<< [run_script:wc-c parsed] {size_check!r}", "debug")
         try:
             actual_size = int(size_check.strip().splitlines()[0].strip())
         except (ValueError, IndexError):
@@ -432,7 +446,7 @@ class SerialDevice:
                 f"Refusing to execute unverified script."
             )
 
-        logger.debug(f"✓ run_script: verified {remote_path} = {actual_size} bytes")
+        verbose(f"✓ run_script: verified {remote_path} = {actual_size} bytes", "debug")
 
         # ROOT CAUSE FIX: real hardware showed a 5-second gap between
         # sending "sh <script>" and even its OWN ECHO arriving — despite
@@ -461,7 +475,7 @@ class SerialDevice:
         # Raw bytes (not just the parsed result) are logged here so any
         # future regression is visible as ground truth, not inferred.
         exec_cmd = f"sh {remote_path}"
-        logger.debug(f">> [run_script:exec] {exec_cmd}")
+        verbose(f">> [run_script:exec] {exec_cmd}", "debug")
 
         # Bypass send_command's own reset_input_buffer() + opaque
         # parsing for this one call — read raw here first so we see
@@ -477,12 +491,12 @@ class SerialDevice:
                 chunk = self.ser.read(1024)
                 if chunk:
                     exec_response += chunk
-                    logger.debug(f"<< [run_script:exec raw chunk] {chunk!r}")
+                    verbose(f"<< [run_script:exec raw chunk] {chunk!r}", "debug")
                     if self._has_prompt(exec_response):
                         break
             except serial.SerialException:
                 break
-        logger.debug(f"<< [run_script:exec raw total] {len(exec_response)} bytes: {exec_response!r}")
+        verbose(f"<< [run_script:exec raw total] {len(exec_response)} bytes: {exec_response!r}", "debug")
 
         exec_response_str = exec_response.decode('utf-8', errors='replace').strip()
         if exec_cmd and exec_response_str.startswith(exec_cmd):
@@ -495,14 +509,14 @@ class SerialDevice:
             if line not in seen:
                 seen.append(line)
         result = "\n".join(seen).strip()
-        logger.debug(f"<< [run_script:exec parsed] {result!r}")
+        verbose(f"<< [run_script:exec parsed] {result!r}", "debug")
 
         # Best-effort cleanup; failure to remove the temp file is not
         # fatal to the caller and is not worth raising over.
         try:
             self.send_command(f"rm -f {remote_path}", wait_for_prompt=True, timeout=5)
         except Exception as e:
-            logger.debug(f"run_script: cleanup of {remote_path} failed (non-fatal): {e}")
+            verbose(f"run_script: cleanup of {remote_path} failed (non-fatal): {e}", "debug")
 
         return result
 
@@ -562,7 +576,7 @@ class SerialDevice:
 
         write_cmd = f"cat > {remote_path} <<'{heredoc_tag}'\n{script_body}\n{heredoc_tag}"
 
-        logger.debug(f">> [launch_script:write] {len(write_cmd)} bytes to {remote_path}")
+        verbose(f">> [launch_script:write] {len(write_cmd)} bytes to {remote_path}", "debug")
         self.ser.reset_input_buffer()
         self.ser.write((write_cmd + "\r\n").encode())
 
@@ -577,7 +591,7 @@ class SerialDevice:
                         break
             except serial.SerialException:
                 break
-        logger.debug(f"<< [launch_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}")
+        verbose(f"<< [launch_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}", "debug")
 
         self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
 
@@ -588,7 +602,7 @@ class SerialDevice:
         size_check = self.send_command(
             f"wc -c < {remote_path}", wait_for_prompt=True, timeout=5
         )
-        logger.debug(f"<< [launch_script:wc-c parsed] {size_check!r}")
+        verbose(f"<< [launch_script:wc-c parsed] {size_check!r}", "debug")
         try:
             actual_size = int(size_check.strip().splitlines()[0].strip())
         except (ValueError, IndexError):
@@ -606,7 +620,7 @@ class SerialDevice:
                 f"Refusing to launch unverified script."
             )
 
-        logger.debug(f"✓ launch_script: verified {remote_path} = {actual_size} bytes")
+        verbose(f"✓ launch_script: verified {remote_path} = {actual_size} bytes", "debug")
 
         self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
 
@@ -616,7 +630,7 @@ class SerialDevice:
         # TCP/IP channel (e.g. wait_for_report()), not from this
         # method's return value.
         exec_cmd = f"sh {remote_path}"
-        logger.debug(f">> [launch_script:exec, fire-and-forget] {exec_cmd}")
+        verbose(f">> [launch_script:exec, fire-and-forget] {exec_cmd}", "debug")
         self.ser.reset_input_buffer()
         self.ser.write((exec_cmd + "\r\n").encode())
 
@@ -652,7 +666,7 @@ class SerialDevice:
                     drained += len(chunk)
             except serial.SerialException:
                 break
-        logger.debug(f"<< [launch_script:post-exec drain] {drained} bytes discarded")
+        verbose(f"<< [launch_script:post-exec drain] {drained} bytes discarded", "debug")
 
         return remote_path
     
@@ -666,7 +680,7 @@ class SerialDevice:
         Returns:
             True if interrupted and U-Boot prompt reached, False otherwise
         """
-        logger.info("Waiting for U-Boot autoboot countdown...")
+        verbose("Waiting for U-Boot autoboot countdown...")
 
         start_time = time.time()
         buffer = b""
@@ -679,7 +693,7 @@ class SerialDevice:
                     buffer += byte
 
                     if b"Hit any key to stop autoboot" in buffer:
-                        logger.info("✓ Detected autoboot — interrupting and polling for prompt...")
+                        verbose("✓ Detected autoboot — interrupting and polling for prompt...")
 
                         # Send interrupt keypress and poll for U-Boot prompt
                         # rather than blindly spamming for a fixed duration
@@ -693,7 +707,7 @@ class SerialDevice:
                             if chunk:
                                 interrupt_buf += chunk
                                 if b"=>" in interrupt_buf:
-                                    logger.info("✓ U-Boot prompt confirmed")
+                                    verbose("✓ U-Boot prompt confirmed")
                                     return True
 
                         logger.error(
@@ -705,7 +719,7 @@ class SerialDevice:
             except serial.SerialException:
                 break
 
-        logger.warning("Autoboot countdown not detected within timeout")
+        verbose("Autoboot countdown not detected within timeout", "warning")
         return False
 
     def capture_boot_diagnostics(self, timeout: float = 30) -> Optional[str]:
@@ -714,13 +728,11 @@ class SerialDevice:
         clock configuration, and the power-on self-test block with
         voltages/temperatures/fan speed) WITHOUT interrupting autoboot.
 
-        Everything this is after prints before "Hit any key to stop
-        autoboot" on this hardware (confirmed from a real boot capture
-        — SoC/Model/DRAM/Clock Configuration lines, then a self-test
-        block of "Label : PASS (value)" lines including "CPU
-        temperature" and "Board temperature"). So this just reads
-        until that marker appears, then returns everything captured
-        before it — no interrupt, no recovery boot needed.
+        Everything printed before "Hit any key to stop autoboot" on this
+        hardware (confirmed from a real boot capture — SoC/Model/DRAM/Clock
+        Configuration lines, then a self-test block of "[ OK ]" and "[FAIL]"
+        lines). This just reads until that marker appears, then returns
+        everything captured before it — no interrupt, no recovery boot needed.
 
         Args:
             timeout: Max time to wait for the autoboot marker
@@ -729,18 +741,18 @@ class SerialDevice:
             The captured boot text (str) if the autoboot marker was
             seen, or None if the timeout was hit first.
         """
-        logger.info("Capturing U-Boot diagnostic output (waiting for boot)...")
+        verbose("Capturing U-Boot diagnostic output (waiting for boot)...")
 
         start_time = time.time()
         buffer = b""
 
         while time.time() - start_time < timeout:
             try:
-                byte = self.ser.read(1)
-                if byte:
-                    buffer += byte
+                chunk = self.ser.read(4096)
+                if chunk:
+                    buffer += chunk
                     if b"Hit any key to stop autoboot" in buffer:
-                        logger.info("✓ Captured boot diagnostics output")
+                        verbose("✓ Captured boot diagnostics output")
                         return buffer.decode("utf-8", errors="replace")
             except serial.SerialException:
                 break
@@ -758,7 +770,7 @@ class SerialDevice:
         Returns:
             True if successfully interrupted, False otherwise
         """
-        logger.info("Interrupting U-Boot autoboot...")
+        verbose("Interrupting U-Boot autoboot...")
         
         # Send multiple spaces/enters to interrupt
         for _ in range(5):
@@ -769,10 +781,10 @@ class SerialDevice:
         response = self.ser.read_all().decode('utf-8', errors='replace')
         
         if self._has_prompt(response.encode()):
-            logger.info("✓ U-Boot interrupted")
+            verbose("✓ U-Boot interrupted")
             return True
         
-        logger.warning("Failed to interrupt autoboot")
+        verbose("Failed to interrupt autoboot", "warning")
         return False
     
     def boot_recovery(self) -> bool:
@@ -782,11 +794,11 @@ class SerialDevice:
         Returns:
             True if recovery prompt reached and logged in, False otherwise
         """
-        logger.info("Booting into recovery Linux...")
+        verbose("Booting into recovery Linux...")
 
         try:
             # Send boot command raw — don't use send_command which has its own timeout
-            logger.debug("Sending 'run recovery' command...")
+            verbose("Sending 'run recovery' command...", "debug")
             self.ser.write(b"run recovery\r\n")
 
             # Poll for recovery login prompt or root@recovery
@@ -801,7 +813,7 @@ class SerialDevice:
                     tail = poll_buf.decode("utf-8", errors="replace")
                     
                     if "recovery login:" in tail:
-                        logger.info("✓ Recovery login prompt detected — auto-logging in as root...")
+                        verbose("✓ Recovery login prompt detected — auto-logging in as root...")
                         # Send username and blank password
                         self.ser.write(b"root\r\n")
                         time.sleep(0.5)
@@ -810,13 +822,13 @@ class SerialDevice:
                         # Verify we got the prompt
                         response = self.ser.read_all().decode("utf-8", errors="replace")
                         if "root@recovery" in response:
-                            logger.info("✓ Recovery Linux booted and logged in")
+                            verbose("✓ Recovery Linux booted and logged in")
                             return True
                         else:
-                            logger.warning("Login attempt did not reach root@recovery prompt")
+                            verbose("Login attempt did not reach root@recovery prompt", "warning")
                             return False
                     elif "root@recovery" in tail:
-                        logger.info("✓ Recovery Linux booted (auto-logged in)")
+                        verbose("✓ Recovery Linux booted (auto-logged in)")
                         return True
 
             logger.warning(
@@ -826,7 +838,7 @@ class SerialDevice:
             return False
 
         except Exception as e:
-            logger.error(f"Failed to boot recovery: {e}")
+            verbose(f"Failed to boot recovery: {e}", "error")
             return False
     
     def login_recovery(self, timeout: float = 30) -> bool:
@@ -837,7 +849,7 @@ class SerialDevice:
         Returns:
             True if root@recovery prompt confirmed, False otherwise
         """
-        logger.info("Verifying recovery Linux login...")
+        verbose("Verifying recovery Linux login...")
 
         start_time = time.time()
         attempt = 0
@@ -848,7 +860,7 @@ class SerialDevice:
             try:
                 # If serial dropped, try to reconnect
                 if not self.ser or not self.ser.is_open:
-                    logger.warning("Serial disconnected — waiting for device to reappear...")
+                    verbose("Serial disconnected — waiting for device to reappear...", "warning")
                     if not self.wait_for_port(timeout=10):
                         time.sleep(min(backoff, 5.0))
                         backoff = min(backoff * 2, 5.0)
@@ -861,19 +873,19 @@ class SerialDevice:
                 response = self.ser.read_all().decode("utf-8", errors="replace")
 
                 if "root@recovery" in response:
-                    logger.info(f"✓ Logged into recovery Linux (attempt {attempt})")
+                    verbose(f"✓ Logged into recovery Linux (attempt {attempt})")
                     return True
 
-                logger.debug(f"Login attempt {attempt} — retrying in {backoff:.1f}s")
+                verbose(f"Login attempt {attempt} — retrying in {backoff:.1f}s", "debug")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
 
             except Exception as e:
-                logger.debug(f"Login attempt {attempt} failed: {e} — retrying in {backoff:.1f}s")
+                verbose(f"Login attempt {attempt} failed: {e} — retrying in {backoff:.1f}s", "debug")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
 
-        logger.error(f"Failed to verify recovery Linux login after {attempt} attempts")
+        verbose(f"Failed to verify recovery Linux login after {attempt} attempts", "error")
         return False
 
                
@@ -881,7 +893,7 @@ class SerialDevice:
         """
         Wait until the serial port appears (device plugged in or rebooted).
         """
-        logger.info(f"Waiting for device on {self.port}...")
+        verbose(f"Waiting for device on {self.port}...")
 
         start = time.time()
         while time.time() - start < timeout:
@@ -889,12 +901,12 @@ class SerialDevice:
                 # Try opening the port non‑blocking
                 test = serial.Serial(self.port)
                 test.close()
-                logger.info("✓ Device detected")
+                verbose("✓ Device detected")
                 return True
             except serial.SerialException:
                 time.sleep(0.5)
 
-        logger.error(f"Device on {self.port} did not appear within {timeout}s")
+        verbose(f"Device on {self.port} did not appear within {timeout}s", "error")
         return False
 
     def wait_for_any_output(self, timeout: float = 60.0) -> bool:
@@ -924,19 +936,19 @@ class SerialDevice:
         if not self.ser or not self.ser.is_open:
             return False
 
-        logger.info("Waiting for device to send any output after reboot...")
+        verbose("Waiting for device to send any output after reboot...")
         start = time.time()
         while time.time() - start < timeout:
             try:
                 chunk = self.ser.read(256)
                 if chunk:
-                    logger.info(f"✓ Device responsive — received {len(chunk)} bytes")
+                    verbose(f"✓ Device responsive — received {len(chunk)} bytes")
                     return True
             except serial.SerialException:
                 pass
             time.sleep(0.2)
 
-        logger.error(f"No serial output received within {timeout}s")
+        verbose(f"No serial output received within {timeout}s", "error")
         return False
 
     def safe_write(self, data: bytes) -> bool:
@@ -946,7 +958,7 @@ class SerialDevice:
         try:
             return self.ser._ser.write(data)   # <-- REAL serial port
         except Exception as e:
-            logger.warning(f"Write failed ({e}) — attempting reconnect...")
+            verbose(f"Write failed ({e}) — attempting reconnect...", "warning")
 
             if not self._attempt_reconnect():
                 return False
@@ -954,7 +966,7 @@ class SerialDevice:
             try:
                 return self.ser._ser.write(data)
             except Exception as e2:
-                logger.error(f"Retry write failed: {e2}")
+                verbose(f"Retry write failed: {e2}", "error")
                 return False
             
     def safe_read(self, size: int = 1) -> bytes:
@@ -964,7 +976,7 @@ class SerialDevice:
         try:
             return self.ser._ser.read(size)   # <-- REAL serial port
         except Exception as e:
-            logger.warning(f"Read failed ({e}) — attempting reconnect...")
+            verbose(f"Read failed ({e}) — attempting reconnect...", "warning")
 
             if not self._attempt_reconnect():
                 return b""
@@ -972,7 +984,7 @@ class SerialDevice:
             try:
                 return self.ser._ser.read(size)
             except Exception as e2:
-                logger.error(f"Retry read failed: {e2}")
+                verbose(f"Retry read failed: {e2}", "error")
                 return b""
 
     def safe_read_all(self) -> bytes:
@@ -982,7 +994,7 @@ class SerialDevice:
         try:
             return self.ser._ser.read_all()
         except Exception as e:
-            logger.warning(f"Read-all failed ({e}) — attempting reconnect...")
+            verbose(f"Read-all failed ({e}) — attempting reconnect...", "warning")
 
             if not self._attempt_reconnect():
                 return b""
@@ -990,7 +1002,7 @@ class SerialDevice:
             try:
                 return self.ser._ser.read_all()
             except Exception as e2:
-                logger.error(f"Retry read-all failed: {e2}")
+                verbose(f"Retry read-all failed: {e2}", "error")
                 return b""
 
 

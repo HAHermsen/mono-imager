@@ -18,11 +18,11 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.6.0
 License: MIT
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __author__  = "H.A. Hermsen"
 
 import sys
@@ -74,6 +74,19 @@ logging.basicConfig(
     force=True
 )
 logger = logging.getLogger(__name__)  # full detail, file only — used by serial_device.py etc.
+
+def verbose(msg: str, level: str = "info"):
+    """Print to console immediately AND log it"""
+    print(msg, flush=True)
+    if level == "error":
+        logger.error(msg)
+    elif level == "warning":
+        logger.warning(msg)
+    elif level == "debug":
+        logger.debug(msg)
+    else:
+        logger.info(msg)
+
 file_logger = logger  # alias for clarity at call sites that explicitly want file-only detail
 
 console_logger = logging.getLogger("mono_imager.console")
@@ -234,11 +247,11 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         if step_id is not None:
             with self._reports_lock:
                 self._reports[step_id] = body
-            logger.debug(f"✓ POST /report received: step={step_id} ({len(body)} bytes)")
+            verbose(f"✓ POST /report received: step={step_id} ({len(body)} bytes)", "debug")
             self.send_response(200)
             self.end_headers()
         else:
-            logger.debug(f"POST /report received but missing step param: {parsed.query!r}")
+            verbose(f"POST /report received but missing step param: {parsed.query!r}", "debug")
             self.send_response(400)
             self.end_headers()
 
@@ -256,11 +269,11 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         if step_id is not None and result is not None:
             with self._reports_lock:
                 self._reports[step_id] = result
-            logger.debug(f"✓ /report received: step={step_id} result={result!r}")
+            verbose(f"✓ /report received: step={step_id} result={result!r}", "debug")
             self.send_response(200)
             self.end_headers()
         else:
-            logger.debug(f"/report received but missing step/result params: {parsed.query!r}")
+            verbose(f"/report received but missing step/result params: {parsed.query!r}", "debug")
             self.send_response(400)
             self.end_headers()
 
@@ -307,7 +320,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             return cls._reports.get(step_id)
 
     def log_message(self, fmt, *args):
-        logger.debug(f"HTTP: {fmt % args}")
+        verbose(f"HTTP: {fmt % args}", "debug")
 
 
 def wait_for_report(step_id: str, timeout: float = 15.0) -> Optional[str]:
@@ -339,10 +352,10 @@ def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[
         server  = HTTPServer((host_ip, port), handler)
         thread  = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        logger.info(f"✓ HTTP server listening on http://{host_ip}:{port}/")
+        verbose(f"✓ HTTP server listening on http://{host_ip}:{port}/")
         return server
     except OSError as e:
-        logger.error(f"Failed to start HTTP server: {e}")
+        verbose(f"Failed to start HTTP server: {e}", "error")
         return None
 
 # --- Network helpers ---------------------------------------------------------
@@ -394,7 +407,7 @@ def pick_device_ip(host_ip: str) -> Optional[str]:
             candidate = f"{subnet}.223"
         return candidate
     except Exception as e:
-        logger.warning(f"Could not derive device IP from host IP ({e}) — no safe fallback exists, caller must handle")
+        verbose(f"Could not derive device IP from host IP ({e}) — no safe fallback exists, caller must handle", "warning")
         return None
 
 
@@ -423,9 +436,9 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     """
     reset_results()  # clear any stale results from a prior attempt in
                       # this same process — see reset_results() docstring
-    logger.info("=" * 60)
-    logger.info("Phase 1 — Bootstrap (serial)")
-    logger.info("=" * 60)
+    verbose("=" * 60)
+    verbose("Phase 1 — Bootstrap (serial)")
+    verbose("=" * 60)
     console_logger.info("Connecting to device...")
 
     # Step 1: Device detected
@@ -473,19 +486,51 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
 
 def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, firmware_path: Path):
     """
-    Phase 2: Network prep — bring up eth0, assign IP, ping check, start HTTP server.
+    Phase 2: Network prep — bring up active Ethernet port, assign IP, ping check, start HTTP server.
+    Auto-detects which port has carrier (LOWER_UP) instead of hardcoding eth0.
     Returns HTTPServer on success, None on failure.
     """
-    logger.info("=" * 60)
-    logger.info("Phase 2 — Network prep (TCP)")
-    logger.info("=" * 60)
+    verbose("=" * 60)
+    verbose("Phase 2 — Network prep (TCP)")
+    verbose("=" * 60)
     console_logger.info("Setting up network...")
 
-    # Step 6: Bring up eth0
-    d.send_command("ip link set eth0 up", timeout=5)
-    r = d.send_command("ip addr add {}/24 dev eth0".format(device_ip), timeout=5)
+    # Step 6a: Auto-detect and bring up active Ethernet port
+    # Bring up all eth* ports to allow them to acquire carrier,
+    # then detect which one has LOWER_UP. Recovery Linux doesn't persist
+    # network config across boots, so ports start DOWN.
+    try:
+        # Try to bring up all eth ports (eth0-eth4 typically)
+        for port_num in range(5):
+            try:
+                d.send_command(f"ip link set eth{port_num} up", timeout=5)
+            except:
+                pass  # Port might not exist, that's ok
+        
+        # Now check for LOWER_UP on any eth port
+        ip_output = d.send_command("ip link show", timeout=5)
+        active_iface = None
+        for line in ip_output.split('\n'):
+            if 'LOWER_UP' in line and ': ' in line:
+                parts = line.split(': ')
+                if len(parts) >= 2:
+                    iface_name = parts[1].split()[0]
+                    if iface_name.startswith('eth'):
+                        active_iface = iface_name
+                        break
+        if not active_iface:
+            verbose("No active Ethernet port detected (no LOWER_UP on any eth port)", "error")
+            return None
+        iface = active_iface
+        verbose(f"Auto-detected active Ethernet port: {iface}")
+    except Exception as e:
+        verbose(f"Failed to detect Ethernet port: {e}", "error")
+        return None
+
+    # Step 6: Assign IP to the active interface (it's already up from Step 6a)
+    r = d.send_command(f"ip addr add {device_ip}/24 dev {iface}".format(device_ip), timeout=5)
     up = "error" not in r.lower() or "exists" in r.lower()
-    if not step(6, f"eth0 up, device IP {device_ip} assigned", up, r if not up else ""):
+    if not step(6, f"{iface} up, device IP {device_ip} assigned", up, r if not up else ""):
         return None
 
     # Step 7: Ping check
@@ -502,7 +547,8 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
     return server
 
 
-def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str) -> bool:
+def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
+                  firmware_size: int = 0) -> bool:
     """
     Phase 3: Flash — curl | dd on device, verify dd output.
 
@@ -523,9 +569,9 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str) ->
     and found inconclusive on a single run), this switches to the
     pattern with a 100% observed pass rate.
     """
-    logger.info("=" * 60)
-    logger.info("Phase 3 — Flash")
-    logger.info("=" * 60)
+    verbose("=" * 60)
+    verbose("Phase 3 — Flash")
+    verbose("=" * 60)
     console_logger.info("Preparing to flash...")
 
     url = f"http://{host_ip}:{port}/firmware.img"
@@ -588,9 +634,9 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str) ->
     # gap, matching what every passing isolated test already did.
     try:
         remote_path = d.launch_script(check_script, marker="step09_reachable")
-        logger.debug(f"✓ Step 09: launch_script() returned without raising: {remote_path}")
+        verbose(f"✓ Step 09: launch_script() returned without raising: {remote_path}", "debug")
     except Exception as e:
-        logger.error(f"✗ Step 09: launch_script() RAISED: {e}")
+        verbose(f"✗ Step 09: launch_script() RAISED: {e}", "error")
         remote_path = None
 
     check = wait_for_report("09", timeout=20.0)
@@ -607,7 +653,50 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str) ->
     if not step(9, f"Firmware source reachable ({url})", reachable, debug_detail):
         return False
 
-    # Step 10+11+12: curl | dd.
+    # Step 10+11+12: download firmware, then dd from local file —
+    # UNLESS the image is too large to fit in recovery Linux's root
+    # filesystem (confirmed on real hardware to be a 3.8GB tmpfs-
+    # backed root, NOT the full 8GB physical RAM — `df -h /tmp` shows
+    # `rootfs 3.8G`, and /tmp is not a separate, larger mount). A
+    # ~5GB OPNsense image was confirmed via manual on-device curl
+    # testing to fail at 74% (3.74GB written) with curl error 23
+    # ("Failure writing output to destination, passed 16384 returned
+    # 257") — a disk-full write failure, not a network or server
+    # issue (ruled out: Python's stock http.server delivered the same
+    # file at full transfer speed with no server-side error; the
+    # device's own curl 8.19.0 is a full build with Largefile support,
+    # not a limited busybox curl).
+    #
+    # FLASH_SIZE_CAP below is set at 80% of that confirmed 3.8GB cap
+    # (≈3.0GB) to leave headroom for the flash script itself plus
+    # curl's in-flight buffers — not a guess, a deliberate margin
+    # under the hard, confirmed ceiling.
+    #
+    # Below the cap: download-then-dd, matching Mono's own documented
+    # procedures (both the OpenWRT recovery guide and the OPNsense
+    # install guide at docs.mono.si / opnsense.mono.si never pipe
+    # curl directly into dd — both download the full image to disk
+    # first, then dd from that local file, bs=1M). This was changed
+    # from an earlier `curl | dd bs=4M` streaming-pipe version after
+    # real-hardware testing showed dd reporting 100% partial records
+    # (e.g. "0+95365 records in / 0+95365 records out", zero full
+    # records) — a known consequence of piping curl directly into dd,
+    # since a pipe never delivers clean fixed-size blocks regardless
+    # of bs. The flash still worked when piped (later verified by
+    # mounting /dev/mmcblk0p1 and confirming a complete, valid
+    # filesystem), but the all-partial-records log output is
+    # confusing and is an unverified deviation from the
+    # vendor-documented method on hardware where a bad flash means
+    # physical re-recovery.
+    #
+    # Above the cap: there is no other option — streaming curl | dd
+    # directly to the eMMC target is the only way an oversized image
+    # can be flashed at all, since it never touches the
+    # capacity-limited root filesystem. This re-enables that
+    # previously-tested, previously-reverted path, but ONLY for
+    # images that need it; small images keep using the safer,
+    # quieter, vendor-documented buffered method.
+    #
     # dd's "records in/out" summary is written to stderr, which 2>&1
     # merges into stdout — redirect that combined stream to a file,
     # then cat it back, same reasoning as Step 9 above.
@@ -619,25 +708,47 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str) ->
     # status=noxfer or status=none). A SIGUSR1-based alternative
     # (BusyBox dd does print intermediate progress on SIGUSR1) was
     # explored but the PID-tracking needed to signal the right
-    # process reliably wasn't solid by testing time. This plain
-    # version is the one PROVEN end-to-end on real hardware (all 14
-    # steps passed). Live progress remains a real opportunity for a
-    # future, more careful pass — not worth the risk of breaking a
-    # working flash step in the meantime.
-    logger.info(f"Flashing {flash_target} — this may take several minutes...")
+    # process reliably wasn't solid by testing time. Live progress
+    # remains a real opportunity for a future, more careful pass —
+    # not worth the risk of breaking a working flash step in the
+    # meantime.
+    FLASH_SIZE_CAP = int(3.8 * 1024**3 * 0.8)  # ≈3.0GB, 80% of confirmed 3.8GB root cap
+
+    use_streaming = firmware_size > 0 and firmware_size > FLASH_SIZE_CAP
+
+    verbose(f"Flashing {flash_target} — this may take several minutes...")
     console_logger.info("Flashing firmware — this may take several minutes...")
-    flash_script = (
-        f"curl -s {url} | dd of={flash_target} bs=4M "
-        f"> /tmp/mono_imager_step10_flash.log 2>&1; "
-        f"cat /tmp/mono_imager_step10_flash.log"
-    )
+
+    if use_streaming:
+        verbose(
+            f"Firmware size ({firmware_size / 1024**3:.2f} GB) exceeds the "
+            f"{FLASH_SIZE_CAP / 1024**3:.2f} GB buffered-flash cap — using "
+            "streaming mode (curl | dd direct to target).",
+            "warning"
+        )
+        flash_script = (
+            f"curl -s {url} 2>/tmp/mono_imager_step10_flash.log | "
+            f"dd of={flash_target} bs=1M "
+            f">> /tmp/mono_imager_step10_flash.log 2>&1; "
+            f"cat /tmp/mono_imager_step10_flash.log"
+        )
+    else:
+        local_fw_path = "/tmp/mono_imager_firmware.img"
+        flash_script = (
+            f"curl -s -o {local_fw_path} {url} "
+            f"> /tmp/mono_imager_step10_flash.log 2>&1; "
+            f"dd if={local_fw_path} of={flash_target} bs=1M "
+            f">> /tmp/mono_imager_step10_flash.log 2>&1; "
+            f"rm -f {local_fw_path}; "
+            f"cat /tmp/mono_imager_step10_flash.log"
+        )
     response, flash_error = with_spinner(
         d.run_script, flash_script,
         marker="step10_flash", exec_timeout=600,
         message="Flashing — this may take several minutes"
     )
     if flash_error is not None:
-        logger.error(f"✗ Step 10: run_script() RAISED: {flash_error}")
+        verbose(f"✗ Step 10: run_script() RAISED: {flash_error}", "error")
         step(10, "curl | dd executed on device", False, str(flash_error))
         step(11, "dd confirmed records in/out", False)
         step(12, "No curl errors", False)
@@ -670,14 +781,14 @@ def phase4_postflash(d: SerialDevice) -> bool:
     informationally — wasted time spent confirming something explicitly
     declared not to matter. Removed. This just sends reboot and exits.
     """
-    logger.info("=" * 60)
-    logger.info("Phase 4 — Post-flash")
-    logger.info("=" * 60)
+    verbose("=" * 60)
+    verbose("Phase 4 — Post-flash")
+    verbose("=" * 60)
 
-    logger.info("Sending reboot command...")
+    verbose("Sending reboot command...")
     d.send_command("reboot", wait_for_prompt=False, timeout=5)
 
-    logger.info("Flash complete. Reboot sent — the rest is the new firmware's job.")
+    verbose("Flash complete. Reboot sent — the rest is the new firmware's job.")
     console_logger.info("Rebooting device...")
     return True
 
@@ -686,9 +797,9 @@ def phase4_postflash(d: SerialDevice) -> bool:
 def print_report():
     # Full detail to the file, unchanged — every step, numbered, with
     # technical reasons. This is the troubleshooting record.
-    logger.info("=" * 60)
-    logger.info("Verification Report")
-    logger.info("=" * 60)
+    verbose("=" * 60)
+    verbose("Verification Report")
+    verbose("=" * 60)
     passed = sum(1 for _, _, p, _ in results if p)
     total  = len(results)
     for num, desc, p, reason in results:
@@ -696,11 +807,11 @@ def print_report():
         line = f"  Step {num:02d}: {mark} — {desc}"
         if reason:
             line += f"\n           {reason}"
-        logger.info(line)
-    logger.info("-" * 60)
+        verbose(line)
+    verbose("-" * 60)
     verdict = "OK" if passed == total else "NOK"
-    logger.info(f"Result: {verdict} ({passed}/{total} steps passed)")
-    logger.info(f"📄 Report saved to: {log_file}")
+    verbose(f"Result: {verdict} ({passed}/{total} steps passed)")
+    verbose(f"📄 Report saved to: {log_file}")
 
     # Short, plain summary to the console — what a person actually
     # wants to know: did it work, and if not, what failed (in plain

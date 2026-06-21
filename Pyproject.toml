@@ -1,11 +1,12 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "mono-imager"
 version = "0.3.0"
 description = "Automated firmware flashing for Mono Gateway Routers and Dev Kit"
+readme = "README.md"
 authors = [{name = "H.A. Hermsen"}]
 license = {text = "MIT"}
 requires-python = ">=3.10"

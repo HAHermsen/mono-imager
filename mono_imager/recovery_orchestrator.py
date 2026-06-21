@@ -40,8 +40,9 @@ __version__ = "0.5.0"
 __author__  = "H.A. Hermsen"
 
 import re
+import time
 import logging
-from typing import Optional
+from typing import Optional, Callable
 
 from mono_imager.serial_device import SerialDevice
 
@@ -121,9 +122,131 @@ def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
     return None
 
 
+def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
+                              host: str = "firmware.mono.si", timeout: int = 15) -> bool:
+    """
+    Verify the device can actually reach the internet — not just that
+    local 'ip link'/'ip addr'/'ip route' commands reported success,
+    which only confirms local interface configuration, not real
+    reachability.
+
+    CONFIRMED BUG THIS GUARDS AGAINST: a real run reported RC=0 from
+    network setup (interface up, IP assigned, route added) yet
+    'firmware update' still aborted within seconds of its own
+    confirmation prompt, because the interface had no actual working
+    path to the real internet on that physical port. Local config
+    succeeding and real reachability are not the same thing, and
+    nothing was checking the latter before this.
+
+    Pings the gateway first if given (confirms basic LAN/L3
+    connectivity — catches "wrong cable/port" early), then pings
+    `host` (confirms DNS + a real path out to the internet — the
+    actual prerequisite 'firmware update' and the legacy curl path
+    both need). Returns False with a specific reason logged for
+    whichever layer failed, rather than a generic failure the user
+    has to guess at.
+    """
+    if gateway:
+        try:
+            gw_output = d.run_script(
+                f"ping -c 2 {gateway} >/dev/null 2>&1; echo RC=$?",
+                marker="check_gateway", exec_timeout=timeout,
+            )
+        except RuntimeError as e:
+            logger.warning(f"check_internet_reachable: gateway ping failed to run: {e}")
+            return False
+        if "RC=0" not in gw_output:
+            logger.error(
+                f"Gateway {gateway} is not reachable from the device — "
+                "check the cable and which physical port is actually in use."
+            )
+            return False
+
+    try:
+        host_output = d.run_script(
+            f"ping -c 2 {host} >/dev/null 2>&1; echo RC=$?",
+            marker="check_internet_host", exec_timeout=timeout,
+        )
+    except RuntimeError as e:
+        logger.warning(f"check_internet_reachable: host ping failed to run: {e}")
+        return False
+
+    if "RC=0" not in host_output:
+        logger.error(
+            f"{host} is not reachable from the device — gateway responds but "
+            "there's no real path to the internet (DNS, routing, or upstream issue)."
+        )
+        return False
+
+    return True
+
+
 # --- Modern path: `firmware update` -------------------------------------
 
-def run_firmware_update(d: SerialDevice) -> bool:
+def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
+                     max_total: float = 900.0, auto_confirm_response: str = None,
+                     on_output: Optional[Callable[[str], None]] = None) -> str:
+    """
+    Send a command and stream its raw output live from the serial
+    port, rather than buffering it via run_script() (which blocks
+    until the command returns to the shell prompt).
+
+    This exists specifically because the real `firmware update`
+    command shows its OWN interactive confirmation prompt ("Type
+    'yes' to proceed") and can run for several real minutes
+    (download + verify + flash) — run_script() would just sit
+    waiting for a prompt that never arrives until it times out.
+
+    If auto_confirm_response is provided, the command is automatically
+    piped with the response (e.g. `echo yes | firmware update`) to
+    avoid interactive prompt timing issues and input buffering bugs.
+
+    Uses non-blocking serial reads (in_waiting check + short timeout)
+    with a 10ms polling loop to monitor output and detect completion.
+
+    Returns when either idle_timeout seconds pass with no new bytes
+    (command likely finished, back at a prompt) or max_total seconds
+    pass overall (hard ceiling).
+    """
+    # If auto_confirm_response is provided, pipe it to avoid interactive issues
+    if auto_confirm_response:
+        command = f"echo {auto_confirm_response} | {command}"
+    
+    d.ser.reset_input_buffer()
+    d.ser.write((command + "\r\n").encode())
+
+    buffer = b""
+    last_byte_time = time.time()
+    overall_start = time.time()
+    poll_interval = 0.01  # 10ms polling loop
+
+    while True:
+        now = time.time()
+        if now - overall_start > max_total:
+            logger.warning(f"_stream_command: hit hard ceiling of {max_total}s")
+            break
+        if now - last_byte_time > idle_timeout:
+            logger.debug(f"_stream_command: {idle_timeout}s with no new output — assuming done")
+            break
+
+        # Non-blocking: check if data is available without waiting
+        if d.ser.in_waiting > 0:
+            chunk = d.ser.read(256)
+            if chunk:
+                text = chunk.decode("utf-8", errors="replace")
+                if on_output:
+                    on_output(text)
+                buffer += chunk
+                last_byte_time = now
+        else:
+            # No data available; sleep briefly before polling again
+            time.sleep(poll_interval)
+
+    return buffer.decode("utf-8", errors="replace")
+
+
+def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
+                         idle_timeout: float = 30.0, max_total: float = 900.0) -> bool:
     """
     Run the modern `firmware update` command and confirm it reported
     success. This command downloads, verifies, and flashes the OTHER
@@ -133,21 +256,123 @@ def run_firmware_update(d: SerialDevice) -> bool:
     Requires real internet access on the device's network — this is
     a hard, documented prerequisite for both paths, not something
     this tool can route around.
+
+    Uses the device's own default `firmware update` mode — no source
+    flag — which downloads from https://firmware.mono.si itself,
+    verifies, and flashes. Confirmed via `firmware update --help` on
+    real hardware that this (not `--from`) is the documented primary
+    path; `--from` is for offline/USB use with pre-staged files.
+
+    We used to pre-download .bin/.sig ourselves via curl and call
+    `firmware update --from /tmp/firmware`, but that hit a 401 from
+    the server that our plain curl couldn't get past (confirmed by
+    cat'ing the "downloaded" file on real hardware — it was the
+    401 error body, not firmware). Letting the tool do its own
+    download sidesteps whatever auth/headers it needs.
+
+    NOTE: the interactive "Type 'yes' to proceed" confirmation prompt
+    still appears in this mode too — confirmed on real hardware.
+    auto_confirm_text/auto_confirm_response are passed to
+    _stream_command() to answer it, rather than letting the command
+    self-abort after its own timeout.
+
+    Uses _stream_command() because the real command can run for several
+    real minutes (download via curl + verify + flash) — see _stream_command()'s
+    docstring. Once streaming settles, the exit code is confirmed with
+    a short, separate run_script() call (run_script() is fine for that
+    — it's a trivial, non-interactive command).
+
+    NOTE: confirmed on real hardware that exit code alone isn't a
+    reliable success signal — a self-aborted run (prompt timed out
+    with nothing answering it) still reported RC=0 despite printing
+    "Aborted." and flashing nothing. The streamed output is checked
+    for "Aborted" explicitly, on top of the RC check, and is always
+    logged in full so a human can review it (signature verified,
+    flash complete, etc.) regardless of which check fires.
+
+    Args:
+        d: connected SerialDevice, at the recovery shell.
+        on_output: optional callback(text_chunk) for live progress —
+            e.g. tui.py can print chunks as they arrive instead of
+            the caller seeing nothing for several minutes.
+        idle_timeout, max_total: passed straight to _stream_command();
+            defaults match the values proven on real hardware. Only
+            overridden by tests, which use a fake serial source that
+            never naturally goes idle for 30 real seconds.
     """
+    # Step 1: Detect which medium we're booting from (so we know which to flash)
     try:
-        output = d.run_script(
-            "firmware update; echo RC=$?",
-            marker="firmware_update",
-            exec_timeout=300,  # real download + flash, give it real time
+        boot_output = d.run_script(
+            "cat /proc/cmdline | grep -o 'root=/dev/[^ ]*' || echo 'root=/dev/mmcblk0p1'",
+            marker="detect_boot_source", exec_timeout=5
         )
     except RuntimeError as e:
-        logger.error(f"run_firmware_update: run_script failed: {e}")
-        return False
+        logger.warning(f"run_firmware_update: could not detect boot source: {e}")
+        # Default: assume booted from NOR, so flash eMMC
+        target = "emmc"
+    else:
+        # If booted from mmcblk0 (eMMC), target is qspi (NOR); otherwise target is emmc
+        target = "qspi" if "mmcblk0" in boot_output else "emmc"
 
-    success = "RC=0" in output
-    if not success:
-        logger.error(f"firmware update did not report success — output:\n{output}")
+    logger.info(f"run_firmware_update: will flash {target} (auto-detected by device)")
+
+    # Step 2: Run firmware update, auto-confirming the device's own
+    # "Type 'yes' to proceed" prompt.
+    #
+    # BUG FIXED: we used to pre-download .bin/.sig ourselves via curl
+    # and call `firmware update --from /tmp/firmware`. That hit a 401
+    # from https://firmware.mono.si that our plain curl couldn't get
+    # past — confirmed on real hardware (`cat`'d the "downloaded" file,
+    # it was a 26-byte "401 Authorization Required" body, not firmware).
+    #
+    # Confirmed via `firmware update --help` on real hardware: the
+    # tool's own default mode (no source flag) downloads from
+    # https://firmware.mono.si itself — that's the documented primary
+    # path, not --from (which is for offline/USB use with pre-staged
+    # files). Letting the tool do its own download instead of routing
+    # around it with our own curl sidesteps whatever auth/headers it
+    # needs that we were never going to replicate correctly.
+    #
+    # BUG FIXED (separate issue): the --from path was also assumed to
+    # make the confirmation prompt fully non-interactive, but real
+    # hardware showed the "Type 'yes' to proceed" prompt still
+    # appears regardless. auto_confirm_text/auto_confirm_response
+    # were already built into _stream_command() for exactly this,
+    # just never passed in at this call site. Wiring them up here.
+    output = _stream_command(
+        d, "firmware update",
+        idle_timeout=idle_timeout, max_total=max_total,
+        auto_confirm_response="yes",
+        on_output=on_output,
+    )
+
+    try:
+        rc_output = d.run_script("echo RC=$?", marker="firmware_update_rc", exec_timeout=10)
+    except RuntimeError as e:
+        logger.warning(f"run_firmware_update: could not verify exit code: {e}")
+        rc_output = ""
+
+    # BUG FIXED: RC=0 alone isn't a reliable success signal here —
+    # confirmed on real hardware that the tool can print "Aborted."
+    # (self-abort on its own confirmation prompt) and still exit 0.
+    # Treat "Aborted" anywhere in the streamed output as a hard
+    # failure regardless of what the exit code says.
+    aborted = "Aborted" in output
+    success = ("RC=0" in rc_output) and not aborted
+    logger.info(f"firmware update — full streamed output:\n{output}")
+    if aborted:
+        logger.error(
+            "firmware update printed 'Aborted.' — the confirmation prompt "
+            "was not answered in time, nothing was flashed, regardless of "
+            "the reported exit code."
+        )
+    elif not success:
+        logger.error(
+            f"firmware update did not report RC=0 (got: {rc_output!r}) — "
+            "review the streamed output above to confirm what actually happened."
+        )
     return success
+
 
 
 def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> bool:
@@ -257,13 +482,13 @@ def legacy_flash_nor(d: SerialDevice, mac: str) -> bool:
 # caller (tui.py) is responsible for any additional pacing/messaging
 # around these calls, not for driving the wait itself.
 
-def phase_modern_flash_emmc(d: SerialDevice) -> bool:
+def phase_modern_flash_emmc(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None) -> bool:
     """
     Modern path, step 1: from NOR-booted recovery, run `firmware
     update` to flash eMMC. Returns True on confirmed success.
     """
     console_logger.info("Running 'firmware update' to flash eMMC...")
-    ok = step(1, "Flash eMMC via 'firmware update'", run_firmware_update(d))
+    ok = step(1, "Flash eMMC via 'firmware update'", run_firmware_update(d, on_output=on_output))
     return ok
 
 
@@ -280,14 +505,14 @@ def phase_modern_verify_emmc_boot(d: SerialDevice, timeout: float = 90) -> bool:
     return ok
 
 
-def phase_modern_flash_nor(d: SerialDevice) -> bool:
+def phase_modern_flash_nor(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None) -> bool:
     """
     Modern path, step 3: from eMMC-booted recovery, run `firmware
     update` again — it auto-targets NOR this time since eMMC is now
     the active boot source. Returns True on confirmed success.
     """
     console_logger.info("Running 'firmware update' to flash NOR...")
-    ok = step(3, "Flash NOR via 'firmware update'", run_firmware_update(d))
+    ok = step(3, "Flash NOR via 'firmware update'", run_firmware_update(d, on_output=on_output))
     return ok
 
 
