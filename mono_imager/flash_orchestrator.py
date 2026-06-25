@@ -18,11 +18,11 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: 0.6.0
+Version: 0.9.1
 License: MIT
 """
 
-__version__ = "0.6.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__  = "H.A. Hermsen"
 
 import sys
@@ -43,40 +43,27 @@ from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner
 
+# OS detection — cached at module load; OS does not change mid-process
+_IS_WINDOWS = platform.system().lower() == "windows"
+
 # --- Logging setup -----------------------------------------------------------
+# Logging is initialised exactly once by tui.py/cli.py via
+# mono_imager.logging_setup.configure_logging(). This module does NOT call
+# basicConfig — doing so at import time caused mutual destruction when tui.py
+# also called it, silently dropping handlers depending on import order.
 
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+from mono_imager.logging_setup import configure_logging, get_log_file
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file  = LOG_DIR / f"verify_flash_{timestamp}.log"
+# Ensure logging is available even when this module is used standalone
+# (e.g. test scripts that import flash_orchestrator directly without going
+# through the TUI). configure_logging() is a no-op if already called.
+configure_logging()
 
-# Two genuinely separate destinations, not just two handlers on one logger:
-#
-# 1. ROOT logger (file only, DEBUG level) — captures EVERYTHING, including
-#    serial_device.py's raw >> sent / << received byte-level tracing. This
-#    preserves full troubleshooting detail in the log file, same as before.
-#    Nothing is lost here — it just no longer also prints to the screen.
-#
-# 2. console_logger (console only, INFO level, plain format) — a SEPARATE
-#    logger used explicitly for user-facing messages: step results, phase
-#    headers, the final summary. No timestamps, no [DEBUG]/[INFO] tags, no
-#    raw serial dumps. This is what a person running the tool actually sees.
-#
-# Previously these were the same logger/handler, set to DEBUG on console
-# too — leftover from diagnosing the Step 09 root cause (fixed several
-# iterations ago, never reverted), which is why console output looked like
-# a raw debug trace dump instead of a normal app's progress messages.
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(log_file, encoding="utf-8")],
-    force=True
-)
-logger = logging.getLogger(__name__)  # full detail, file only — used by serial_device.py etc.
+logger = logging.getLogger(__name__)
+
 
 def verbose(msg: str, level: str = "info"):
-    """Print to console immediately AND log it"""
+    """Print to console immediately AND log it."""
     print(msg, flush=True)
     if level == "error":
         logger.error(msg)
@@ -87,14 +74,11 @@ def verbose(msg: str, level: str = "info"):
     else:
         logger.info(msg)
 
-file_logger = logger  # alias for clarity at call sites that explicitly want file-only detail
 
+file_logger    = logger
 console_logger = logging.getLogger("mono_imager.console")
-console_logger.setLevel(logging.INFO)
-console_logger.propagate = False  # don't also send these through the root/file handler chain
-_console_handler = logging.StreamHandler(sys.stdout)
-_console_handler.setFormatter(logging.Formatter("%(message)s"))
-console_logger.addHandler(_console_handler)
+
+
 
 # --- Result tracker ----------------------------------------------------------
 
@@ -352,7 +336,7 @@ def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[
         server  = HTTPServer((host_ip, port), handler)
         thread  = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        verbose(f"✓ HTTP server listening on http://{host_ip}:{port}/")
+        verbose(f"✓ HTTP server listening on http://{host_ip}:{port}/", "debug")
         return server
     except OSError as e:
         verbose(f"Failed to start HTTP server: {e}", "error")
@@ -413,10 +397,10 @@ def pick_device_ip(host_ip: str) -> Optional[str]:
 
 def ping(ip: str, count: int = 3) -> bool:
     """Ping an IP address. Returns True if reachable."""
-    flag = "-n" if platform.system().lower() == "windows" else "-c"
+    flag = "-n" if _IS_WINDOWS else "-c"
     try:
         result = subprocess.run(
-            ["ping", flag, str(count), "-w", "2000" if platform.system().lower() == "windows" else "2", ip],
+            ["ping", flag, str(count), "-w", "2000" if _IS_WINDOWS else "2", ip],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=10
@@ -429,9 +413,16 @@ def ping(ip: str, count: int = 3) -> bool:
 # Unchanged from the proven test_flash_verify.py run (5/5 bootstrap on
 # real hardware, network phase confirmed once device-ip matches subnet).
 
-def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
+def phase1_bootstrap(port: str, baud: int = 115200, os_name: str = None) -> Optional[SerialDevice]:
     """
-    Phase 1: Serial bootstrap — detect, connect, interrupt U-Boot, boot recovery, login.
+    Phase 1: Serial bootstrap — detect, connect, interrupt U-Boot, optionally erase eMMC (OPNsense),
+    boot recovery, login.
+    
+    Args:
+        port: Serial port (e.g., /dev/ttyUSB0, COM5)
+        baud: Baud rate (default 115200)
+        os_name: OS name to determine if erase is needed (OPNsense requires erase)
+    
     Returns connected SerialDevice on full success, None on any failure.
     """
     reset_results()  # clear any stale results from a prior attempt in
@@ -469,6 +460,23 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
         d.disconnect()
         return None
 
+    # Step 3b: Erase eMMC for OPNsense (must happen in U-Boot before recovery boots)
+    if os_name and os_name.lower() == "opnsense":
+        verbose("Erasing eMMC (OPNsense requirement)...")
+        erase_cmd = "mmc erase 0 3b48000"
+        try:
+            response = d.send_command(erase_cmd, timeout=60)
+            erase_ok = "error" not in response.lower()
+            if not step(3, "eMMC erase (mmc erase 0 3b48000)", erase_ok,
+                       response[-100:] if not erase_ok else ""):
+                d.disconnect()
+                return None
+        except Exception as e:
+            verbose(f"✗ eMMC erase failed: {e}", "error")
+            step(3, "eMMC erase (mmc erase 0 3b48000)", False, str(e))
+            d.disconnect()
+            return None
+
     # Step 4: Boot recovery Linux
     booted = d.boot_recovery()
     if not step(4, "Recovery Linux booted", booted):
@@ -504,7 +512,7 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
         for port_num in range(5):
             try:
                 d.send_command(f"ip link set eth{port_num} up", timeout=5)
-            except:
+            except Exception:
                 pass  # Port might not exist, that's ok
         
         # Now check for LOWER_UP on any eth port
@@ -528,7 +536,7 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
         return None
 
     # Step 6: Assign IP to the active interface (it's already up from Step 6a)
-    r = d.send_command(f"ip addr add {device_ip}/24 dev {iface}".format(device_ip), timeout=5)
+    r = d.send_command(f"ip addr add {device_ip}/24 dev {iface}", timeout=5)
     up = "error" not in r.lower() or "exists" in r.lower()
     if not step(6, f"{iface} up, device IP {device_ip} assigned", up, r if not up else ""):
         return None
@@ -548,7 +556,7 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
 
 
 def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
-                  firmware_size: int = 0) -> bool:
+                  firmware_size: int = 0, os_name: str = None) -> bool:
     """
     Phase 3: Flash — curl | dd on device, verify dd output.
 
@@ -716,6 +724,26 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
 
     use_streaming = firmware_size > 0 and firmware_size > FLASH_SIZE_CAP
 
+    # Step 9b: eMMC erase for OPNsense (mandatory per opnsense.mono.si docs)
+    # OPNsense requires eMMC to be wiped before flashing.
+    if os_name and os_name.lower() == "opnsense":
+        verbose("Erasing eMMC (OPNsense requirement)...")
+        erase_script = "mmc erase 0 3b48000"
+        try:
+            erase_resp, erase_err = with_spinner(
+                d.run_script, erase_script,
+                marker="step09b_erase", exec_timeout=60,
+                message="Erasing eMMC"
+            )
+            erase_ok = erase_err is None and "error" not in erase_resp.lower()
+            if not step(9, "eMMC erase (OPNsense)", erase_ok, 
+                       erase_resp[-100:] if not erase_ok else ""):
+                return False
+        except Exception as e:
+            verbose(f"✗ eMMC erase failed: {e}", "error")
+            step(9, "eMMC erase (OPNsense)", False, str(e))
+            return False
+
     verbose(f"Flashing {flash_target} — this may take several minutes...")
     console_logger.info("Flashing firmware — this may take several minutes...")
 
@@ -734,10 +762,15 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
         )
     else:
         local_fw_path = "/tmp/mono_imager_firmware.img"
+        # For eMMC targets, skip first 4KB block to preserve GPT and OS partitions at 32MB+
+        skip_seek = ""
+        if flash_target == "/dev/mmcblk0":
+            skip_seek = "skip=1 seek=1 "
+        
         flash_script = (
             f"curl -s -o {local_fw_path} {url} "
             f"> /tmp/mono_imager_step10_flash.log 2>&1; "
-            f"dd if={local_fw_path} of={flash_target} bs=1M "
+            f"dd if={local_fw_path} {skip_seek}of={flash_target} bs=4096 "
             f">> /tmp/mono_imager_step10_flash.log 2>&1; "
             f"rm -f {local_fw_path}; "
             f"cat /tmp/mono_imager_step10_flash.log"
@@ -766,25 +799,30 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     return has_records and not has_error
 
 
-def phase4_postflash(d: SerialDevice) -> bool:
+def phase4_postflash(d: SerialDevice, os_name: str = None, mac_address: str = None) -> bool:
     """
-    Phase 4: Post-flash — send reboot and say goodbye.
-
-    The flash itself is fully verified by Steps 1-12 (phase1_bootstrap
-    + phase2_network + phase3_flash) — that's where "did mono-imager
-    do its job correctly" is decided. What the device does after
-    reboot (timing, whether the USB-serial port drops, what OS/wizard
-    it lands in) depends on the new firmware and this hardware's
-    specific USB/UART behavior, which isn't well understood yet and
-    isn't this tool's job to verify. Earlier versions of this function
-    spent up to 60s trying to detect the device coming back, purely
-    informationally — wasted time spent confirming something explicitly
-    declared not to matter. Removed. This just sends reboot and exits.
+    Phase 4: Post-flash — firmware re-imaging (OPNsense) then reboot.
+    
+    For OPNsense: After OS flash, firmware bootloader must be re-imaged
+    to eMMC before device can boot from eMMC. This calls Phase 4b.
+    
+    For other OS: Just reboot (legacy behavior).
+    
+    Args:
+        d: SerialDevice (currently in recovery shell post-flash)
+        os_name: OS name ("OPNsense", "OpenWRT", etc.)
+        mac_address: Device MAC address (required for OPNsense firmware auth)
+    
+    Returns: True if phase succeeds
     """
     verbose("=" * 60)
     verbose("Phase 4 — Post-flash")
     verbose("=" * 60)
 
+    # OPNsense firmware re-imaging is handled by journey_steps.py via the
+    # step registry (step_reimage_emmc_firmware). phase4_postflash() is
+    # retained only for legacy test scripts; TUI-driven journeys never call it.
+    # Non-OPNsense: simple reboot
     verbose("Sending reboot command...")
     d.send_command("reboot", wait_for_prompt=False, timeout=5)
 
@@ -811,7 +849,7 @@ def print_report():
     verbose("-" * 60)
     verdict = "OK" if passed == total else "NOK"
     verbose(f"Result: {verdict} ({passed}/{total} steps passed)")
-    verbose(f"📄 Report saved to: {log_file}")
+    verbose(f"📄 Report saved to: {get_log_file()}")
 
     # Short, plain summary to the console — what a person actually
     # wants to know: did it work, and if not, what failed (in plain
@@ -824,6 +862,6 @@ def print_report():
         failed = [desc for _, desc, p, _ in results if not p]
         for desc in failed:
             console_logger.info(f"  - {desc}")
-        console_logger.info(f"  Full details: {log_file}")
+        console_logger.info(f"  Full details: {get_log_file()}")
 
     return verdict == "OK"

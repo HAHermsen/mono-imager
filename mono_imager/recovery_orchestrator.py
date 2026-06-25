@@ -32,11 +32,11 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.9.1
 License: MIT
 """
 
-__version__ = "0.5.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__  = "H.A. Hermsen"
 
 import re

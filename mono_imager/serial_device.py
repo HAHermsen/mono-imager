@@ -5,11 +5,11 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.6.0
+Version: 0.9.1
 License: MIT
 """
 
-__version__ = "0.6.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
 import serial
@@ -951,23 +951,31 @@ class SerialDevice:
         verbose(f"No serial output received within {timeout}s", "error")
         return False
 
-    def safe_write(self, data: bytes) -> bool:
+    def safe_write(self, data: bytes) -> Optional[int]:
         """
         Write data to the serial port with auto‑reconnect on failure.
+
+        Returns the number of bytes written (from serial.Serial.write()),
+        or None on unrecoverable failure.
+
+        NOTE: reaches through SerialProxy to self.ser._ser directly.
+        This bypasses the proxy's delegation layer. Acceptable for now
+        since safe_write is the only writer and the proxy is thin, but
+        worth consolidating if SerialProxy grows.
         """
         try:
-            return self.ser._ser.write(data)   # <-- REAL serial port
+            return self.ser._ser.write(data)
         except Exception as e:
             verbose(f"Write failed ({e}) — attempting reconnect...", "warning")
 
             if not self._attempt_reconnect():
-                return False
+                return None
 
             try:
                 return self.ser._ser.write(data)
             except Exception as e2:
                 verbose(f"Retry write failed: {e2}", "error")
-                return False
+                return None
             
     def safe_read(self, size: int = 1) -> bytes:
         """
@@ -1029,6 +1037,15 @@ class SerialProxy:
             self._parent._attempt_reconnect()
             return self._ser.in_waiting
 
-    # Fallback: forward any unknown attribute to real serial object
+    # Fallback: forward any unknown attribute to real serial object.
+    # Guard against missing _ser to prevent infinite recursion:
+    # if _ser is absent, __getattr__ would be called again to look it up,
+    # triggering RecursionError. object.__getattribute__ bypasses __getattr__.
     def __getattr__(self, name):
-        return getattr(self._ser, name)
+        try:
+            ser = object.__getattribute__(self, "_ser")
+        except AttributeError:
+            raise AttributeError(
+                f"SerialProxy has no attribute {name!r} and _ser is not initialised"
+            )
+        return getattr(ser, name)

@@ -3,11 +3,11 @@ mono-imager: Configuration manager
 Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.9.1
 License: MIT
 """
 
-__version__ = "0.5.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
 import json
@@ -100,4 +100,11 @@ def detect_serial_ports() -> tuple[list, list]:
         raise RuntimeError(
             "pyserial is not installed — cannot detect serial ports. "
             "Install it with: pip install pyserial"
+        ) from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"Permission denied accessing serial ports: {e}\n"
+            "On Linux/macOS add your user to the 'dialout' group:\n"
+            "  sudo usermod -a -G dialout $USER  (then log out and back in)\n"
+            "On Windows ensure no other application has the port open."
         ) from e

@@ -4,21 +4,31 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: 0.6.0
+Version: 0.9.1
 License: MIT
 """
 
-__version__ = "0.6.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
 import sys
 import os
 import re
+
+# U-Boot output regexes — compiled once at module load, not per call.
+_RE_SOC       = re.compile(r'^SoC:\s+(.+)$',              re.MULTILINE)
+_RE_MODEL     = re.compile(r'^Model:\s+(.+)$',            re.MULTILINE)
+_RE_DRAM      = re.compile(r'^DRAM:\s+(.+)$',             re.MULTILINE)
+_RE_CPU_CLK   = re.compile(r'CPU\d+\([^)]*\):(\d+)\s*MHz')
+_RE_BUS_CLK   = re.compile(r'Bus:\s+(\d+)\s*MHz')
+_RE_DDR_CLK   = re.compile(r'DDR:\s+(\d+)\s*MT/s')
+_RE_FMAN_CLK  = re.compile(r'FMAN:\s+(\d+)\s*MHz')
 import time
 import logging
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -55,19 +65,19 @@ def parse_uboot_identity(raw_output: str) -> dict:
     """
     result = {}
 
-    soc = re.search(r'^SoC:\s+(.+)$', raw_output, re.MULTILINE)
+    soc = _RE_SOC.search(raw_output)
     if soc:
         result["SoC"] = soc.group(1).strip()
 
-    model = re.search(r'^Model:\s+(.+)$', raw_output, re.MULTILINE)
+    model = _RE_MODEL.search(raw_output)
     if model:
         result["Model"] = model.group(1).strip()
 
-    dram = re.search(r'^DRAM:\s+(.+)$', raw_output, re.MULTILINE)
+    dram = _RE_DRAM.search(raw_output)
     if dram:
         result["DRAM"] = dram.group(1).strip()
 
-    cpu_clocks = re.findall(r'CPU\d+\([^)]*\):(\d+)\s*MHz', raw_output)
+    cpu_clocks = _RE_CPU_CLK.findall(raw_output)
     if cpu_clocks:
         unique = sorted(set(cpu_clocks), key=int)
         if len(unique) == 1:
@@ -75,15 +85,15 @@ def parse_uboot_identity(raw_output: str) -> dict:
         else:
             result["CPU clock"] = ", ".join(f"{c} MHz" for c in cpu_clocks)
 
-    bus = re.search(r'Bus:\s+(\d+)\s*MHz', raw_output)
+    bus = _RE_BUS_CLK.search(raw_output)
     if bus:
         result["Bus clock"] = f"{bus.group(1)} MHz"
 
-    ddr = re.search(r'DDR:\s+(\d+)\s*MT/s', raw_output)
+    ddr = _RE_DDR_CLK.search(raw_output)
     if ddr:
         result["DDR clock"] = f"{ddr.group(1)} MT/s"
 
-    fman = re.search(r'FMAN:\s+(\d+)\s*MHz', raw_output)
+    fman = _RE_FMAN_CLK.search(raw_output)
     if fman:
         result["FMAN clock"] = f"{fman.group(1)} MHz"
 
@@ -176,10 +186,24 @@ class MonoImager:
         self.net_device_ip    = None
         self.net_http_port    = 8080
         self.net_flash_target = None
+        self.os_name          = None  # Store selected OS for phase3 access
 
     def clear_screen(self):
         """Clear terminal"""
         os.system('clear' if os.name == 'posix' else 'cls')
+    
+    def safe_input(self, prompt: str) -> Optional[str]:
+        """
+        Wrapper around input() that checks for 'exit!' escape sequence.
+        If user types 'exit!', return None and set state to FLASH_AUTO_OR_MANUAL.
+        Otherwise return the user's input.
+        """
+        user_input = input(prompt).strip()
+        if user_input.lower() == "exit!":
+            print("\n  ⚠️  Escaping to main menu...")
+            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
+            return None
+        return user_input
 
     def print_header(self):
         """
@@ -292,15 +316,9 @@ class MonoImager:
         elif choice == "3":
             self.current_state = MenuState.CLI_CONSOLE
         elif choice == "4":
-            print()
-            print("  Test Serial connection not yet implemented.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
+            self.menu_test_serial()
         elif choice == "5":
-            print()
-            print("  Test LAN connection not yet implemented.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
+            self.menu_test_lan()
         elif choice == "6":
             self.current_state = MenuState.DEVICE_STATS
         elif choice == "7":
@@ -544,8 +562,11 @@ class MonoImager:
         print("    4) VyOS")
         print("    5) Other (manual target)")
         print("    6) Back")
+        print("  (Type 'exit!' at any prompt to escape to main menu)")
         print()
-        os_choice = input("  Select [1-6]: ").strip()
+        os_choice = self.safe_input("  Select [1-6]: ")
+        if os_choice is None:
+            return
 
         flash_target = "/dev/mmcblk0"  # Default for most OSes
         if os_choice == "1":
@@ -559,7 +580,9 @@ class MonoImager:
             os_name = "VyOS"
         elif os_choice == "5":
             os_name = "Other"
-            flash_target = input("  Enter flash target (e.g., /dev/mmcblk0 or /dev/mmcblk0p1): ").strip()
+            flash_target = self.safe_input("  Enter flash target (e.g., /dev/mmcblk0 or /dev/mmcblk0p1): ")
+            if flash_target is None:
+                return
             if not flash_target:
                 print("  ❌ Flash target is required.")
                 input("  Press Enter to continue...")
@@ -574,8 +597,13 @@ class MonoImager:
             self.current_state = MenuState.NETWORK_AUTO_CONFIG
             return
 
+        # Store os_name for phase3 access (eMMC erase for OPNsense)
+        self.os_name = os_name
+
         print()
-        firmware_raw = input("  Type the full path (or paste or drag-n-drop) of the image file: ")
+        firmware_raw = self.safe_input("  Type the full path (or paste or drag-n-drop) of the image file: ")
+        if firmware_raw is None:
+            return
         firmware_path, error = self._validate_firmware_path(firmware_raw)
         if error:
             print(f"  ❌ {error}")
@@ -632,7 +660,10 @@ class MonoImager:
         print("  while flashing — an interrupted write can leave the")
         print("  device unbootable.")
         print()
-        confirm = input("  This writes to the device. Proceed? [y/N]: ").strip().lower()
+        confirm = self.safe_input("  This writes to the device. Proceed? [y/N]: ")
+        if confirm is None:
+            return
+        confirm = confirm.lower()
         if confirm != "y":
             print("  Cancelled.")
             input("  Press Enter to continue...")
@@ -740,77 +771,64 @@ class MonoImager:
         """
         # DON'T clear screen here — keep all output visible for debugging
 
+        from mono_imager.flash_orchestrator import phase1_bootstrap
         from mono_imager import flash_orchestrator as core
+        from mono_imager.journey_steps import get_journey
 
-        server = None
         d = None
         try:
             print()
             print("=" * 60)
-            print("PHASE 1: Bootstrap (Serial)")
+            print("PHASE 1: Bootstrap (Serial Connection)")
             print("=" * 60)
             print(f"Port: {self.serial_port}")
-            print(f"Baud: 115200")
             print()
-            d = core.phase1_bootstrap(self.serial_port, 115200)
+
+            # Connect to device and interrupt U-Boot
+            d = phase1_bootstrap(self.serial_port, 115200, os_name=self.os_name)
             if d is None:
-                print("❌ Phase 1 FAILED")
-                print()
-                self.flash_success = core.print_report()
+                print("❌ Bootstrap FAILED")
                 self.current_state = MenuState.DONE
                 return
 
-            print("✓ Phase 1 PASSED")
+            print("✓ Bootstrap successful")
             print()
-            
-            print("=" * 60)
-            print("PHASE 2: Network Setup")
-            print("=" * 60)
-            print(f"Host IP: {self.net_host_ip}")
-            print(f"Device IP: {self.net_device_ip}")
-            print(f"HTTP Port: {self.net_http_port}")
-            print(f"Firmware: {self.custom_fw_path}")
-            print()
-            server = core.phase2_network(
-                d, self.net_host_ip, self.net_device_ip,
-                self.net_http_port, self.custom_fw_path
-            )
-            if server is None:
-                print("❌ Phase 2 FAILED")
-                print()
-                self.flash_success = core.print_report()
-                self.current_state = MenuState.DONE
-                return
 
-            print("✓ Phase 2 PASSED")
-            print()
             print("=" * 60)
-            print("PHASE 3: Flash (curl | dd)")
+            print("PHASE 2+: Flashing Firmware")
             print("=" * 60)
-            print(f"Target: {self.net_flash_target}")
+            print(f"OS:          {self.os_name}")
+            print(f"Firmware:    {self.custom_fw_path}")
+            print(f"Host IP:     {self.net_host_ip}:{self.net_http_port}")
+            print(f"Device IP:   {self.net_device_ip}")
             print()
-            ok = core.phase3_flash(
-                d, self.net_host_ip, self.net_http_port, self.net_flash_target,
-                firmware_size=os.path.getsize(self.custom_fw_path)
+
+            # Build journey via step registry — no hardcoded orchestrator
+            runner = get_journey(
+                os_name       = self.os_name,
+                transfer      = getattr(self, "transfer_method", "network"),
+                device        = d,
+                host_ip       = self.net_host_ip,
+                device_ip     = self.net_device_ip,
+                firmware_path = Path(self.custom_fw_path),
+                http_port     = self.net_http_port,
             )
+
+            ok = runner.run()
+
             if not ok:
-                print("❌ Phase 3 FAILED")
-                print()
-                self.flash_success = core.print_report()
-                self.current_state = MenuState.DONE
-                return
+                print("❌ Flashing did not complete successfully")
+            else:
+                print("✓ Flashing completed successfully")
 
-            print("✓ Phase 3 PASSED")
-            print()
-            print("=" * 60)
-            print("PHASE 4: Post-Flash (Reboot)")
-            print("=" * 60)
-            print()
-            core.phase4_postflash(d)
-            print("✓ Phase 4 PASSED")
+            self.flash_success = ok
             print()
 
         finally:
+            # Stop HTTP server if one was started during the journey
+            server = None
+            if d and hasattr(d, '_journey_ctx'):
+                server = getattr(d._journey_ctx, 'http_server', None)
             if server:
                 server.shutdown()
                 core.verbose("HTTP server stopped")
@@ -1182,6 +1200,326 @@ class MonoImager:
         finish(rec.print_report())
 
     # ------------------------------------------------------------------ #
+    #  TEST SERIAL — option 4 from main menu                             #
+    # ------------------------------------------------------------------ #
+    def menu_test_serial(self):
+        """
+        Run the serial connection test inline.
+
+        Reuses test logic from tests/hardware/test_serial_connect.py
+        directly — same steps, same pass/fail output, no subprocess.
+
+        If self.serial_port is already set (user connected earlier in
+        this session), it is used automatically. Otherwise the user is
+        prompted to pick a port first.
+        """
+        from mono_imager.config import detect_serial_ports, get_last_port
+        from mono_imager.serial_device import SerialDevice
+        import time
+
+        self.clear_screen()
+        self.print_header()
+        print("  Test Serial Connection")
+        print("  " + "─" * 56)
+        print()
+
+        # Resolve port
+        port = self.serial_port
+        if not port:
+            try:
+                known, other = detect_serial_ports()
+                all_ports = known + other
+            except Exception as e:
+                print(f"  ✗ Port detection failed: {e}")
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            if not all_ports:
+                print("  ✗ No serial ports detected.")
+                print("    Connect the USB-to-UART cable and try again.")
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            if len(all_ports) == 1:
+                port = all_ports[0].device
+                print(f"  Auto-selected: {port} ({all_ports[0].description})")
+            else:
+                print("  Available ports:")
+                for i, p in enumerate(all_ports, 1):
+                    print(f"    {i}) {p.device}  —  {p.description}")
+                print()
+                choice = input("  Select port [1-{}]: ".format(len(all_ports))).strip()
+                try:
+                    port = all_ports[int(choice) - 1].device
+                except (ValueError, IndexError):
+                    print("  ✗ Invalid selection.")
+                    input("\n  Press Enter to return to main menu...")
+                    self.current_state = MenuState.MAIN
+                    return
+
+        print()
+        print(f"  Port:  {port}")
+        print(f"  Baud:  115200")
+        print()
+
+        results = []
+
+        def check(label, passed, detail=""):
+            mark = "✓" if passed else "✗"
+            print(f"  {mark}  {label}")
+            if detail:
+                print(f"     {detail}")
+            results.append(passed)
+            return passed
+
+        # Step 1: connect
+        d = SerialDevice(port, timeout=5)
+        if not check("Connect at 115200 baud", d.connect(115200)):
+            input("\n  Press Enter to return to main menu...")
+            self.current_state = MenuState.MAIN
+            return
+
+        try:
+            # Step 2: interrupt U-Boot
+            print()
+            print("  " + "─" * 56)
+            print("  ⚡  POWER CYCLE YOUR DEVICE NOW  ⚡")
+            print("  " + "─" * 56)
+            print()
+            check("U-Boot autoboot interrupted", d.wait_for_autoboot(timeout=60))
+            if not results[-1]:
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            # Step 3: U-Boot responds to a command
+            response = d.send_command("printenv ethact", timeout=5)
+            check("U-Boot responds to commands",
+                  bool(response.strip()),
+                  response.strip() if response.strip() else "no response")
+
+            # Step 4: boot recovery
+            d.send_command("run recovery", wait_for_prompt=False, timeout=3)
+            start  = time.time()
+            buffer = b""
+            booted = False
+            while time.time() - start < 60:
+                byte = d.ser.read(1)
+                if byte:
+                    buffer += byte
+                    if b"root@recovery" in buffer or b"login:" in buffer:
+                        if b"login:" in buffer and b"root@recovery" not in buffer:
+                            d.ser.write(b"root\r\n")
+                            time.sleep(1)
+                        booted = True
+                        break
+            check("Recovery Linux booted", booted)
+
+            # Step 5: login confirmed
+            if booted:
+                d.ser.write(b"\r\n")
+                time.sleep(0.5)
+                waiting  = d.ser.in_waiting
+                response = d.ser.read(waiting) if waiting else b""
+                at_shell = b"root@recovery" in buffer or b"root@recovery" in response
+                check("Logged into recovery shell", at_shell)
+
+        finally:
+            d.disconnect()
+
+        # Summary
+        print()
+        print("  " + "─" * 56)
+        total  = len(results)
+        passed = sum(results)
+        if passed == total:
+            print(f"  ✓  All {total} checks passed — serial connection is healthy.")
+        else:
+            print(f"  ✗  {total - passed}/{total} checks failed.")
+
+        # Remember the working port for subsequent operations
+        if results and results[0]:  # connected successfully
+            self.serial_port = port
+
+        input("\n  Press Enter to return to main menu...")
+        self.current_state = MenuState.MAIN
+
+
+    # ------------------------------------------------------------------ #
+    #  TEST LAN — option 5 from main menu                                #
+    # ------------------------------------------------------------------ #
+    def menu_test_lan(self):
+        """
+        Full end-to-end LAN test — boots device into recovery, sets up
+        networking, and confirms the device can reach the host HTTP server.
+
+        Steps:
+          1. Resolve serial port (use known port or auto-detect)
+          2. Bootstrap device via serial (soft reboot → U-Boot → recovery)
+          3. Detect host IP, derive device IP
+          4. Assign IP to eth0 on device, ping from host
+          5. Start HTTP server on host
+          6. Device curls the server and reports back — confirms full path
+        """
+        from mono_imager.flash_orchestrator import (
+            phase1_bootstrap, detect_host_ip, pick_device_ip,
+            start_http_server, wait_for_report
+        )
+        from mono_imager.config import detect_serial_ports
+        from mono_imager.serial_device import SerialDevice
+        import time, tempfile, pathlib, socket
+
+        self.clear_screen()
+        self.print_header()
+        print("  Test LAN Connection")
+        print("  " + "─" * 56)
+        print()
+
+        results = []
+
+        def check(label, passed, detail=""):
+            mark = "✓" if passed else "✗"
+            print(f"  {mark}  {label}")
+            if detail:
+                print(f"     {detail}")
+            results.append(passed)
+            return passed
+
+        # Step 1: resolve serial port
+        port = self.serial_port
+        if not port:
+            try:
+                known, other = detect_serial_ports()
+                all_ports = known + other
+            except Exception as e:
+                print(f"  ✗ Port detection failed: {e}")
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            if not all_ports:
+                print("  ✗ No serial ports detected — connect USB-to-UART cable.")
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            if len(all_ports) == 1:
+                port = all_ports[0].device
+                print(f"  Auto-selected: {port}")
+            else:
+                for i, p in enumerate(all_ports, 1):
+                    print(f"    {i}) {p.device}  —  {p.description}")
+                choice = input("  Select port: ").strip()
+                try:
+                    port = all_ports[int(choice) - 1].device
+                except (ValueError, IndexError):
+                    print("  ✗ Invalid selection.")
+                    input("\n  Press Enter to return to main menu...")
+                    self.current_state = MenuState.MAIN
+                    return
+
+        print()
+
+        # Step 2: soft reboot then bootstrap into recovery
+        print("  Rebooting device into recovery Linux...")
+        try:
+            _d = SerialDevice(port, timeout=2)
+            if _d.connect(115200):
+                _d.ser.write(b"\r\nreset\r\nreboot\r\n")
+                time.sleep(0.5)
+                _d.disconnect()
+        except Exception:
+            pass  # best-effort — bootstrap will catch it either way
+
+        d = phase1_bootstrap(port, 115200)
+        if not check("Device in recovery shell", d is not None):
+            input("\n  Press Enter to return to main menu...")
+            self.current_state = MenuState.MAIN
+            return
+
+        try:
+            # Step 3: host IP + device IP
+            host_ip   = self.net_host_ip or detect_host_ip()
+            device_ip = self.net_device_ip or pick_device_ip(host_ip)
+
+            if not check("Host IP detected", bool(host_ip), host_ip or "could not detect"):
+                return
+            check("Device IP", True, device_ip)
+
+            # Step 4: assign IP on device, ping from host
+            d.send_command("ip link set eth0 up", timeout=10)
+            d.send_command(f"ip addr add {device_ip}/24 dev eth0", timeout=10)
+
+            try:
+                from icmplib import ping as icmp_ping
+                reachable = icmp_ping(device_ip, count=2, timeout=3).is_alive
+            except Exception:
+                reachable = False
+
+            # Ping is informational — ICMP may be blocked or require root.
+            # The curl step (step 6) is the real proof of connectivity.
+            if reachable:
+                print(f"  ✓  Device {device_ip} reachable from host")
+            else:
+                print(f"  ⚠  Device {device_ip} ping failed (continuing — curl will confirm)")
+
+            # Step 5: HTTP server
+            tmp = pathlib.Path(tempfile.mktemp(suffix=".bin"))
+            tmp.write_bytes(b"LAN_TEST")
+            http_port = 18080
+            server = start_http_server(host_ip, http_port, tmp)
+            if not check(f"HTTP server up on {host_ip}:{http_port}", server is not None):
+                tmp.unlink(missing_ok=True)
+                input("\n  Press Enter to return to main menu...")
+                self.current_state = MenuState.MAIN
+                return
+
+            # Step 6: device curls the server and reports back
+            url = f"http://{host_ip}:{http_port}/firmware.img"
+            check_script = (
+                f"curl -s -I -o /dev/null -w '%{{http_code}}' {url} "
+                f"> /tmp/lantest_code.txt; "
+                f"curl -s -X POST --data-binary @/tmp/lantest_code.txt "
+                f"\"http://{host_ip}:{http_port}/report?step=lantest\" >/dev/null 2>&1"
+            )
+            try:
+                d.launch_script(check_script, marker="lantest")
+                report = wait_for_report("lantest", timeout=15.0)
+                device_sees_host = report is not None and "200" in report
+            except Exception as e:
+                device_sees_host = False
+            finally:
+                server.shutdown()
+                tmp.unlink(missing_ok=True)
+
+            check("Device can reach host HTTP server", device_sees_host)
+
+            # Save working config
+            self.serial_port   = port
+            self.net_host_ip   = host_ip
+            self.net_device_ip = device_ip
+
+        finally:
+            if d:
+                d.disconnect()
+
+        # Summary
+        print()
+        print("  " + "─" * 56)
+        passed_count = sum(results)
+        total        = len(results)
+        if passed_count == total:
+            print("  ✓  LAN path confirmed end-to-end.")
+        else:
+            print(f"  ✗  {total - passed_count}/{total} checks failed.")
+
+        input("\n  Press Enter to return to main menu...")
+        self.current_state = MenuState.MAIN
+
+
+    # ------------------------------------------------------------------ #
     #  8. DONE                                                             #
     # ------------------------------------------------------------------ #
     def menu_done(self):
@@ -1551,23 +1889,11 @@ class MonoImager:
 
 def main():
     """Entry point"""
+    from mono_imager.logging_setup import configure_logging
     log_dir = Path(__file__).parent.parent / "logs"
-    log_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"flash_{timestamp}.log"
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-        force=True
-    )
+    log_file = configure_logging(log_dir)
     verbose(f"mono-imager v{__version__} by {__author__}")
     verbose(f"Log: {log_file}")
-
     app = MonoImager(log_file)
     app.run()
 

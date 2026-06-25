@@ -1,2 +1,4 @@
+# Runtime dependencies — canonical source is Pyproject.toml [project.dependencies].
+# This file is for pip install -r convenience only; keep in sync with Pyproject.toml.
 pyserial>=3.5
-requests>=2.28.0
+icmplib>=3.0

@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: 0.5.0
+Version: 0.9.1
 License: MIT
 """
 
@@ -31,7 +31,7 @@ import time
 import threading
 from typing import Any, Callable, Tuple, Optional
 
-__version__ = "0.5.0"
+from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 
 
 def _try_enable_windows_vt_processing() -> bool:
