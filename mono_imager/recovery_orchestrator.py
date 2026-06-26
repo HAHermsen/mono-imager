@@ -377,20 +377,21 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
 
 def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> bool:
     """
-    After a reboot, confirm the device actually booted from the
-    expected medium by watching for U-Boot's own confirmation line,
-    exactly as the docs say to check manually (Step 5) and as
-    confirmed in a real boot capture earlier this session:
+    Initiate a reboot, then confirm the device booted from the expected
+    medium by watching for U-Boot's own confirmation line, exactly as
+    the docs say to check manually (Step 5) and as confirmed in a real
+    boot capture earlier this session:
 
         "RCW BOOT SRC is SD/EMMC"   (eMMC boot)
         "RCW BOOT SRC is QSPI"      (NOR boot — QSPI is the real
                                       flash interface name U-Boot
                                       uses, not "NOR")
 
-    Reuses the same read-until-marker approach as
-    capture_boot_diagnostics() / wait_for_autoboot(), rather than
-    trusting the DIP switch position blindly (a user could flip it
-    without rebooting, or flip the wrong way).
+    CRITICAL FIX (v0.9.2): The device is at recovery shell prompt when
+    this is called — silent, no pending output. It won't emit boot
+    diagnostics until reboot is issued. Previous code listened passively
+    to the silent serial port and timed out 100% of the time.
+    Now: send 'reboot' command first (line 399), then listen.
 
     Args:
         expected: "EMMC" or "NOR" (caller-facing naming) — mapped
@@ -404,21 +405,57 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
     if marker_text is None:
         raise ValueError(f"verify_boot_source: expected must be 'EMMC' or 'NOR', got {expected!r}")
 
-    logger.info(f"Waiting for boot source confirmation ({marker_text!r})...")
-
+    logger.info(f"Initiating reboot to verify boot source ({marker_text!r})...")
+    
+    # CRITICAL: Send reboot command NOW. Device is at recovery shell
+    # prompt (silent). Without this command, the byte-reading loop below
+    # listens to empty serial → timeout → false failure 100% of the time.
+    try:
+        d.send_command("reboot", wait_for_prompt=False)
+    except Exception as e:
+        logger.warning(f"reboot command exception (expected — device disconnects): {e}")
+    
+    # HARDENING (v0.9.2): After reboot is issued, the device emits
+    # shutdown noise (/etc/init.d/rcK, umount messages, etc.) before
+    # U-Boot starts. We need to skip this garbage and listen only for
+    # U-Boot's actual boot diagnostics.
+    #
+    # Strategy: Watch for "U-Boot" string (appears early in U-Boot output),
+    # then switch to looking for the boot source marker. This skips the
+    # shutdown chatter and syncs us to the real boot output.
+    
     import time
     start = time.time()
     buffer = b""
+    uboot_found = False
+    
     while time.time() - start < timeout:
         try:
             byte = d.ser.read(1)
             if byte:
                 buffer += byte
+                
+                # First: sync to U-Boot output (skip shutdown noise)
+                if not uboot_found:
+                    if b"U-Boot" in buffer:
+                        uboot_found = True
+                        logger.debug("U-Boot output detected — now watching for boot marker")
+                        buffer = b""  # reset to fresh buffer
+                    continue
+                
+                # Second: look for boot source marker in U-Boot output
                 if marker_text.encode() in buffer:
+                    logger.info(f"✓ Boot source confirmed: {marker_text}")
                     return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Serial read exception: {e}")
             break
-    logger.warning(f"Did not see {marker_text!r} within {timeout}s")
+    
+    # Timeout without finding marker
+    if not uboot_found:
+        logger.warning(f"Did not detect U-Boot output within {timeout}s — device may not have rebooted")
+    else:
+        logger.warning(f"U-Boot detected but did not see {marker_text!r} within {timeout}s")
     return False
 
 

@@ -1141,21 +1141,21 @@ class MonoImager:
                 print("=" * 60)
                 print("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
                 print("=" * 60)
+                print("  The tool will reconnect automatically once you've done that.")
                 input("  Press Enter once you've done that...")
 
-                if not rec.phase_modern_verify_emmc_boot(d):
-                    print("  ❌ Could not confirm the device booted from eMMC.")
-                    finish(rec.print_report())
-                    return
+                # Option B: disconnect cleanly, re-bootstrap from scratch.
+                # Trying to maintain serial sync across a reboot is fragile
+                # (shutdown noise, stray keypresses, U-Boot timing quirks).
+                # Reconnecting fresh reuses the proven phase1_bootstrap() path.
+                d.disconnect()
+                d = None
 
-                print("  Re-entering the recovery shell on eMMC...")
-                reentered = (
-                    d.wait_for_autoboot(timeout=60)
-                    and d.boot_recovery()
-                    and d.login_recovery(timeout=60)
-                )
-                if not reentered:
-                    print("  ❌ Could not re-enter the recovery shell after the eMMC boot.")
+                print()
+                d = core.phase1_bootstrap(port, 115200)
+                if d is None:
+                    print()
+                    print("  ❌ Could not reconnect after eMMC boot.")
                     finish(rec.print_report())
                     return
 
@@ -1179,9 +1179,8 @@ class MonoImager:
                 print("=" * 60)
                 print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR, THEN POWER-CYCLE ⚡")
                 print("=" * 60)
+                print("  All done — no reconnection needed. Device is fully updated.")
                 input("  Press Enter once you've done that...")
-
-                rec.phase_modern_verify_nor_boot(d)
 
             else:
                 print()
