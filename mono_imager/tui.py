@@ -569,6 +569,29 @@ class MonoImager:
 
         self.os_name = os_name
 
+        if os_name == "OpenWRT":
+            print()
+            print("  ┌─────────────────────────────────────────────────────┐")
+            print("  │  ETHERNET CABLE REQUIRED — OpenWRT                  │")
+            print("  │                                                     │")
+            if transfer == "usb":
+                print("  │  The firmware update step (flashes the eMMC         │")
+                print("  │  bootloader) needs internet access from the device. │")
+                print("  │  Plug an ethernet cable into the RIGHTMOST          │")
+                print("  │  1 Gig RJ-45 jack before proceeding.               │")
+                print("  │                                                     │")
+                print("  │  The cable must be connected to a router/switch     │")
+                print("  │  that provides DHCP and internet access.            │")
+            else:
+                print("  │  The firmware update step routes internet traffic   │")
+                print("  │  through the host machine. Ensure the host has      │")
+                print("  │  internet sharing / NAT enabled on its ethernet     │")
+                print("  │  interface, or connect the device to a router       │")
+                print("  │  instead and use the USB flash method.              │")
+            print("  └─────────────────────────────────────────────────────┘")
+            print()
+            input("  Press Enter once the cable is plugged in...")
+
         print()
         from mono_imager.journeys import get_firmware_prompt
         firmware_prompt = get_firmware_prompt(os_name, transfer)

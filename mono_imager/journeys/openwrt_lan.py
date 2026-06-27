@@ -49,147 +49,6 @@ FIRMWARE_PROMPT = "Type the full path (or drag-n-drop) of the OpenWRT .img or .b
 TRANSFER = "lan"
 
 
-def _update_emmc_env(device) -> bool:
-    """
-    Scan the eMMC raw area for the Armbian U-Boot environment block and patch
-    bootcmd/bootargs so OpenWRT boots automatically when DIP switch is LEFT.
-
-    Tries several (sector_offset, sector_count, env_size_bytes) candidates that
-    cover the most common LS1046A Armbian U-Boot env layouts.  For each:
-      1. mmc read → scratch RAM
-      2. env import -c  (CRC check — fails cleanly on wrong offset/size)
-      3. setenv bootcmd / bootargs
-      4. env export -c -s → scratch RAM
-      5. mmc write → eMMC
-
-    Caller's in-memory NOR env vars are saved before and restored after so a
-    subsequent saveenv still writes the correct NOR environment.
-    Returns True if the eMMC env was successfully patched.
-    """
-    EMMC_BOOTCMD  = (
-        "ext4load mmc 0:1 0x82000000 /boot/kernel.itb; bootm 0x82000000#config-1"
-    )
-    EMMC_BOOTARGS = "root=/dev/mmcblk0p1 rw rootwait earlycon"
-    SCRATCH       = "0x84000000"
-
-    verbose("  Patching eMMC U-Boot env for OpenWRT boot (DIP=LEFT)...")
-
-    # Save key NOR env vars that env import -c will overwrite in memory.
-    saved = {}
-    for var in ("recovery", "kernel_comp_addr_r", "kernel_comp_size",
-                "fdt_high", "bootcmd"):
-        try:
-            out = device.send_command(f"printenv {var}", timeout=5)
-            if f"{var}=" in out:
-                val = (out.split(f"{var}=", 1)[1]
-                       .split("\r")[0].split("\n")[0].strip())
-                saved[var] = val
-        except Exception:
-            pass
-
-    def _restore():
-        for k, v in saved.items():
-            try:
-                device.send_command(f'setenv {k} "{v}"', timeout=5)
-            except Exception:
-                pass
-        # Remove eMMC-specific bootargs so it does not pollute NOR env.
-        try:
-            device.send_command("setenv bootargs", timeout=5)
-        except Exception:
-            pass
-
-    # (mmc_sector_offset, sector_count, env_size_bytes)
-    # CRC check is near-instant so a broad list is fine.
-    CANDIDATES = [
-        (0x1F80, 0x100, 0x20000),  # 3.9375 MB, 128 KB — Armbian LS1046A default
-        (0x1F80, 0x80,  0x10000),  # 3.9375 MB,  64 KB
-        (0x1F80, 0x200, 0x40000),  # 3.9375 MB, 256 KB
-        (0x2000, 0x200, 0x40000),  # 4 MB,      256 KB
-        (0x2000, 0x100, 0x20000),  # 4 MB,      128 KB
-        (0x2000, 0x80,  0x10000),  # 4 MB,       64 KB
-        (0x1C00, 0x100, 0x20000),  # 3.5 MB,    128 KB
-        (0x1C00, 0x80,  0x10000),  # 3.5 MB,     64 KB
-        (0x1800, 0x100, 0x20000),  # 3 MB,       128 KB
-        (0x1800, 0x80,  0x10000),  # 3 MB,        64 KB
-        (0x1800, 0x200, 0x40000),  # 3 MB,       256 KB
-        (0x1000, 0x100, 0x20000),  # 2 MB,       128 KB
-        (0x1000, 0x80,  0x10000),  # 2 MB,        64 KB
-        (0x800,  0x100, 0x20000),  # 1 MB,       128 KB
-        (0x800,  0x80,  0x10000),  # 1 MB,        64 KB
-        (0x800,  0x200, 0x40000),  # 1 MB,       256 KB
-        (0x600,  0x100, 0x20000),  # 768 KB,     128 KB
-        (0x600,  0x80,  0x10000),  # 768 KB,      64 KB
-        (0x400,  0x80,  0x10000),  # 512 KB,      64 KB
-        (0x2800, 0x100, 0x20000),  # 5 MB,       128 KB
-        (0x2800, 0x80,  0x10000),  # 5 MB,        64 KB
-    ]
-
-    updated = False
-    for sector, count, env_size in CANDIDATES:
-        imported = False
-        try:
-            device.send_command("mmc dev 0", timeout=5)
-            rd = device.send_command(
-                f"mmc read {SCRATCH} {hex(sector)} {hex(count)}", timeout=15
-            )
-            if "error" in rd.lower():
-                continue
-
-            # env import -c checks CRC32 and does NOT modify env on failure.
-            imp = device.send_command(
-                f"env import -c {SCRATCH} {hex(env_size)}", timeout=10
-            )
-            if "bad crc" in imp.lower() or "## error" in imp.lower():
-                continue
-
-            imported = True
-
-            # Sanity-check: a valid env must expose bootcmd after import.
-            chk = device.send_command("printenv bootcmd", timeout=5)
-            if "bootcmd=" not in chk:
-                continue
-
-            verbose(f"    Found eMMC env at sector {hex(sector)} "
-                    f"({hex(env_size)} B)")
-
-            device.send_command(f'setenv bootcmd "{EMMC_BOOTCMD}"', timeout=5)
-            device.send_command(f'setenv bootargs "{EMMC_BOOTARGS}"', timeout=5)
-
-            exp = device.send_command(
-                f"env export -c -s {hex(env_size)} {SCRATCH}", timeout=10
-            )
-            if "error" in exp.lower():
-                verbose("    env export failed — skipping", "warning")
-                continue
-
-            wr = device.send_command(
-                f"mmc write {SCRATCH} {hex(sector)} {hex(count)}", timeout=15
-            )
-            if "error" not in wr.lower() and "failed" not in wr.lower():
-                verbose("    ✓ eMMC env patched")
-                updated = True
-            else:
-                verbose(f"    mmc write failed: {wr.strip()}", "warning")
-
-            break
-
-        except Exception as e:
-            verbose(f"    sector={hex(sector)}/{hex(env_size)}: {e}", "debug")
-            continue
-        finally:
-            if imported:
-                _restore()
-
-    if not updated:
-        verbose("  ⚠ eMMC env auto-patch failed — manual fix after DIP→LEFT:",
-                "warning")
-        verbose(f'    setenv bootcmd "{EMMC_BOOTCMD}"', "warning")
-        verbose(f'    setenv bootargs "{EMMC_BOOTARGS}"', "warning")
-        verbose("    saveenv", "warning")
-
-    return updated
-
 
 def _uboot_steps_openwrt_lan(device) -> bool:
     """
@@ -276,7 +135,6 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 recovery_confirmed = True
 
             if recovery_confirmed:
-                _update_emmc_env(device)
                 return step(0, "U-Boot 'recovery' variable confirmed present", True)
     except Exception as e:
         verbose(f"  printenv recovery: {e}", "warning")
@@ -309,7 +167,6 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                     'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
                     timeout=10
                 )
-                _update_emmc_env(device)
                 device.send_command("saveenv", timeout=15)
                 return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
         except Exception as e:
@@ -421,7 +278,6 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
                 timeout=10
             )
-            _update_emmc_env(device)
             device.send_command("saveenv", timeout=15)
             return step(
                 0,
@@ -556,7 +412,33 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
+@register_step(
+    os=[OS], transfer=["lan", "usb"],
+    requires=[], produces=["emmc_partitioned"],
+    label="Partition eMMC (fdisk)"
+)
+def step_partition_emmc(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Partition eMMC"); verbose("=" * 60)
+    d = ctx.device
+    base = re.sub(r'p\d+$', '', ctx.flash_target)  # /dev/mmcblk0p1 → /dev/mmcblk0
+    try:
+        response = d.send_command(
+            f"printf 'o\\nn\\np\\n\\n65536\\n\\nw\\n' | fdisk {base} 2>&1; echo RC=$?",
+            timeout=30
+        )
+        ok = "RC=0" in response
+        if ok:
+            d.send_command(
+                f"partprobe {base} 2>/dev/null || blockdev --rereadpt {base} 2>/dev/null || true",
+                timeout=10
+            )
+        return step(0, f"eMMC partitioned ({ctx.flash_target}, first sector 65536)", ok,
+                   response[-200:] if not ok else "")
+    except Exception as e:
+        return step(0, "eMMC partition table", False, str(e))
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready", "emmc_partitioned"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
 def step_flash_openwrt(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Flash OpenWRT image"); verbose("=" * 60)
     d = ctx.device
@@ -634,7 +516,98 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     return has_real_data and not has_error
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["rebooted"], label="Reboot device")
+@register_step(
+    os=[OS], transfer=["lan", "usb"],
+    requires=["os_flashed"], produces=["firmware_updated"],
+    label="Firmware update (eMMC bootloader)"
+)
+def step_firmware_update(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Firmware update"); verbose("=" * 60)
+    d = ctx.device
+    try:
+        if ctx.transfer == "lan" and ctx.host_ip:
+            d.send_command(
+                f"ip route add default via {ctx.host_ip} 2>/dev/null || true",
+                timeout=10
+            )
+        else:
+            d.send_command(
+                "ip link set eth0 up 2>/dev/null; udhcpc -i eth0 -n -q 2>/dev/null || true",
+                timeout=25
+            )
+        response = d.send_command(
+            "printf 'yes\\n' | firmware update 2>&1; echo RC=$?",
+            timeout=120
+        )
+        ok = "RC=0" in response
+        return step(0, "Firmware update (eMMC bootloader)", ok,
+                   response[-200:] if not ok else "")
+    except Exception as e:
+        return step(0, "Firmware update", False, str(e))
+
+
+@register_step(
+    os=[OS], transfer=["lan", "usb"],
+    requires=["firmware_updated"], produces=["boot_configured"],
+    label="Prepare eMMC boot config"
+)
+def step_prepare_emmc_boot(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Prepare eMMC boot config"); verbose("=" * 60)
+    d = ctx.device
+
+    # The Armbian U-Boot on eMMC uses sysboot to load /boot/extlinux/extlinux.conf
+    # from partition 1.  OpenWRT does not ship this file, so we create it after
+    # flashing.  The FIT image (kernel.itb) is booted via the kernel directive;
+    # sysboot detects the FIT format and calls bootm internally.
+    extlinux_content = (
+        "timeout 1\\n"
+        "default openwrt\\n"
+        "\\n"
+        "label openwrt\\n"
+        "  kernel /boot/kernel.itb\\n"
+        "  append root=/dev/mmcblk0p1 rw rootwait earlycon\\n"
+    )
+    MNT = "/mnt/mono_owrt"
+    try:
+        d.send_command(f"mkdir -p {MNT}", timeout=5)
+        mount_resp = d.send_command(
+            f"mount /dev/mmcblk0p1 {MNT} 2>&1; echo RC=$?", timeout=15
+        )
+        if "RC=0" not in mount_resp:
+            verbose("  ⚠ Could not mount /dev/mmcblk0p1 — extlinux.conf not written", "warning")
+            verbose("  If DIP=LEFT boot fails, at the U-Boot prompt run:", "warning")
+            verbose('    setenv bootcmd "ext4load mmc 0:1 0x82000000 /boot/kernel.itb; bootm 0x82000000#config-1"', "warning")
+            verbose('    setenv bootargs "root=/dev/mmcblk0p1 rw rootwait earlycon"', "warning")
+            verbose("    saveenv", "warning")
+            return step(0, "eMMC boot config (mount failed — see warning)", True)
+
+        check = d.send_command(
+            f"test -f {MNT}/boot/extlinux/extlinux.conf && echo EXISTS || echo MISSING",
+            timeout=5
+        )
+        if "EXISTS" in check:
+            d.send_command(f"umount {MNT}", timeout=10)
+            return step(0, "eMMC extlinux.conf already present", True)
+
+        d.send_command(f"mkdir -p {MNT}/boot/extlinux", timeout=5)
+        d.send_command(
+            f"printf '{extlinux_content}' > {MNT}/boot/extlinux/extlinux.conf",
+            timeout=10
+        )
+        d.send_command("sync", timeout=10)
+        d.send_command(f"umount {MNT}", timeout=15)
+        d.send_command(f"rmdir {MNT} 2>/dev/null", timeout=5)
+        return step(0, "eMMC extlinux.conf created", True)
+    except Exception as e:
+        try:
+            d.send_command(f"umount {MNT} 2>/dev/null", timeout=10)
+        except Exception:
+            pass
+        verbose(f"  ⚠ eMMC boot config step: {e}", "warning")
+        return step(0, "eMMC boot config (warning — may need manual fix)", True)
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["boot_configured"], produces=["rebooted"], label="Reboot device")
 def step_reboot(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Reboot device"); verbose("=" * 60)
     try:

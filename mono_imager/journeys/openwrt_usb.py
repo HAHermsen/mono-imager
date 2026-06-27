@@ -76,7 +76,7 @@ def step_firmware_on_usb(ctx: StepContext) -> bool:
         return step(0, "Firmware on USB", False, str(e))
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
+@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready", "emmc_partitioned"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
 def step_flash_openwrt(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Flash OpenWRT image"); verbose("=" * 60)
     d = ctx.device
@@ -128,7 +128,7 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     return has_real_data and not has_error
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")
+@register_step(os=[OS], transfer=[TRANSFER], requires=["boot_configured"], produces=["usb_unmounted"], label="Unmount USB stick")
 def step_unmount_usb(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Unmount USB stick"); verbose("=" * 60)
     try:
