@@ -2,29 +2,32 @@
 """
 mono-imager: Unit tests for the step registry and journey resolution.
 
-No hardware required. Tests the declarative @register_step system
-introduced in v0.9.1.
+No hardware required. Tests the declarative @register_step system.
 
 What this tests:
   - All 6 journeys resolve to the correct ordered step sequence
   - Dependency ordering: requires/produces constraints are respected
   - OS isolation: OPNsense-only steps don't appear in OpenWRT/Armbian
-  - Transfer isolation: network steps don't appear in USB journeys and vice versa
-  - Shared steps: ALL_OS / ALL_TRANSFER steps appear in every applicable journey
-  - Context field coverage: StepContext carries the right fields for each journey
+  - Transfer isolation: lan steps don't appear in USB journeys and vice versa
+  - Flash targets correct per OS
+  - get_journey() populates StepContext correctly
   - No circular dependencies in any journey
-  - Adding a new OS to _FLASH_TARGETS makes it appear in SUPPORTED_OS
 
 Run: python tests/unit/test_journey_resolution.py
 """
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import mono_imager.journeys  # triggers auto-discovery of all journey modules
 from mono_imager.step_registry import list_journey, FlowRunner, StepContext
-from mono_imager.journey_steps import SUPPORTED_OS, SUPPORTED_TRANSFER, get_journey, _FLASH_TARGETS
+from mono_imager.journeys import discovered_journeys, get_journey, _FLASH_TARGETS
+
+SUPPORTED_OS       = ["Armbian", "OPNsense", "OpenWRT"]
+SUPPORTED_TRANSFER = ["lan", "usb"]
 
 passed = 0
 failed = 0
@@ -45,55 +48,52 @@ def check(label, condition):
 # ============================================================================
 
 EXPECTED = {
-    ("OPNsense", "network"): [
+    ("OPNsense", "lan"): [
+        "Confirm DIP switch is RIGHT (NOR)",
         "Network setup (eth0)",
         "Start HTTP server",
         "Verify firmware reachable",
-        "Erase eMMC (OPNsense requirement)",
-        "Flash OS image (dd)",
+        "Flash OPNsense image (bzip2 | dd)",
         "Detect device MAC address",
-        "DIP flip to NOR + power cycle",
-        "Confirm NOR recovery boot",
-        "Re-image eMMC firmware (first 32MB)",
-        "DIP flip to eMMC + power cycle",
+        "Re-image eMMC firmware (firmware update)",
+        "Reboot into OPNsense",
     ],
     ("OPNsense", "usb"): [
+        "Confirm DIP switch is RIGHT (NOR)",
         "Mount USB stick",
         "Verify firmware file on USB",
-        "Erase eMMC (OPNsense requirement)",
-        "Flash OS image (dd)",
+        "Flash OPNsense image (bzip2 | dd)",
         "Unmount USB stick",
         "Detect device MAC address",
-        "DIP flip to NOR + power cycle",
-        "Confirm NOR recovery boot",
-        "Re-image eMMC firmware (first 32MB)",
-        "DIP flip to eMMC + power cycle",
+        "Re-image eMMC firmware (firmware update)",
+        "Reboot into OPNsense",
     ],
-    ("OpenWRT", "network"): [
+    ("OpenWRT", "lan"): [
         "Network setup (eth0)",
         "Start HTTP server",
         "Verify firmware reachable",
-        "Flash OS image (dd)",
+        "Flash OpenWRT image (dd)",
         "Reboot device",
     ],
     ("OpenWRT", "usb"): [
         "Mount USB stick",
         "Verify firmware file on USB",
-        "Flash OS image (dd)",
+        "Flash OpenWRT image (dd)",
         "Unmount USB stick",
         "Reboot device",
     ],
-    ("Armbian", "network"): [
+    ("Armbian", "lan"): [
         "Network setup (eth0)",
         "Start HTTP server",
         "Verify firmware reachable",
-        "Flash OS image (dd)",
-        "Reboot device",
+        "Flash Armbian image (dd bs=1M)",
+        "Reboot to U-Boot",
+        "Configure U-Boot to boot Armbian",
     ],
     ("Armbian", "usb"): [
         "Mount USB stick",
         "Verify firmware file on USB",
-        "Flash OS image (dd)",
+        "Flash Armbian image (dd bs=1M)",
         "Unmount USB stick",
         "Reboot device",
     ],
@@ -121,12 +121,30 @@ for (os_name, transfer), expected_steps in EXPECTED.items():
         resolved == expected_steps
     )
     if resolved != expected_steps:
-        # Print diff for debugging
         for i, (got, exp) in enumerate(zip(resolved, expected_steps), 1):
             if got != exp:
                 print(f"    Step {i}: got '{got}', expected '{exp}'")
         if len(resolved) != len(expected_steps):
-            print(f"    Extra or missing steps: {resolved}")
+            print(f"    Full resolved: {resolved}")
+
+
+# ============================================================================
+# discovered_journeys() returns all 6
+# ============================================================================
+
+print()
+print("=" * 60)
+print("discovered_journeys()")
+print("=" * 60)
+
+discovered = discovered_journeys()
+check("discovered_journeys returns 6 entries", len(discovered) == 6)
+for os_name in SUPPORTED_OS:
+    for transfer in SUPPORTED_TRANSFER:
+        check(
+            f"({os_name}, {transfer}) in discovered_journeys",
+            (os_name, transfer) in discovered
+        )
 
 
 # ============================================================================
@@ -139,136 +157,38 @@ print("OS isolation — OPNsense-only steps")
 print("=" * 60)
 
 OPNSENSE_ONLY = [
-    "Erase eMMC (OPNsense requirement)",
-    "Detect device MAC address",
-    "DIP flip to NOR + power cycle",
-    "Confirm NOR recovery boot",
-    "Re-image eMMC firmware (first 32MB)",
-    "DIP flip to eMMC + power cycle",
+    "Confirm DIP switch is RIGHT (NOR)",
+    "Flash OPNsense image (bzip2 | dd)",
+    "Re-image eMMC firmware (firmware update)",
+    "Reboot into OPNsense",
 ]
 
 for os_name in ["OpenWRT", "Armbian"]:
     for transfer in SUPPORTED_TRANSFER:
         steps = list_journey(os_name, transfer)
-        for opnsense_step in OPNSENSE_ONLY:
-            check(
-                f"'{opnsense_step}' absent from {os_name} + {transfer}",
-                opnsense_step not in steps
-            )
+        for s in OPNSENSE_ONLY:
+            check(f"'{s}' absent from {os_name} + {transfer}", s not in steps)
 
 
 # ============================================================================
-# Transfer isolation: network steps absent from USB journeys and vice versa
+# Transfer isolation
 # ============================================================================
 
 print()
 print("=" * 60)
-print("Transfer isolation — network vs USB steps")
+print("Transfer isolation — lan vs USB steps")
 print("=" * 60)
 
-NETWORK_ONLY = ["Network setup (eth0)", "Start HTTP server", "Verify firmware reachable"]
-USB_ONLY     = ["Mount USB stick", "Verify firmware file on USB", "Unmount USB stick"]
+LAN_ONLY = ["Network setup (eth0)", "Start HTTP server", "Verify firmware reachable"]
+USB_ONLY = ["Mount USB stick", "Verify firmware file on USB", "Unmount USB stick"]
 
 for os_name in SUPPORTED_OS:
-    usb_steps     = list_journey(os_name, "usb")
-    network_steps = list_journey(os_name, "network")
-
-    for s in NETWORK_ONLY:
-        check(f"'{s}' absent from {os_name} + usb",     s not in usb_steps)
+    usb_steps = list_journey(os_name, "usb")
+    lan_steps = list_journey(os_name, "lan")
+    for s in LAN_ONLY:
+        check(f"'{s}' absent from {os_name} + usb", s not in usb_steps)
     for s in USB_ONLY:
-        check(f"'{s}' absent from {os_name} + network", s not in network_steps)
-
-
-# ============================================================================
-# Shared steps: flash step appears in every journey
-# ============================================================================
-
-print()
-print("=" * 60)
-print("Shared steps — Flash OS image present in all journeys")
-print("=" * 60)
-
-for os_name in SUPPORTED_OS:
-    for transfer in SUPPORTED_TRANSFER:
-        steps = list_journey(os_name, transfer)
-        check(
-            f"'Flash OS image (dd)' present in {os_name} + {transfer}",
-            "Flash OS image (dd)" in steps
-        )
-
-
-# ============================================================================
-# Dependency ordering: flash always after firmware_ready
-# ============================================================================
-
-print()
-print("=" * 60)
-print("Dependency ordering — flash comes after firmware_ready")
-print("=" * 60)
-
-FIRMWARE_READY_PRODUCERS = {
-    "network": "Verify firmware reachable",
-    "usb":     "Verify firmware file on USB",
-}
-
-for os_name in SUPPORTED_OS:
-    for transfer in SUPPORTED_TRANSFER:
-        steps = list_journey(os_name, transfer)
-        producer = FIRMWARE_READY_PRODUCERS[transfer]
-        if producer in steps and "Flash OS image (dd)" in steps:
-            producer_idx = steps.index(producer)
-            flash_idx    = steps.index("Flash OS image (dd)")
-            check(
-                f"{os_name} + {transfer}: firmware_ready before flash",
-                producer_idx < flash_idx
-            )
-
-
-# ============================================================================
-# OPNsense dependency chain: correct ordering of post-flash steps
-# ============================================================================
-
-print()
-print("=" * 60)
-print("Dependency ordering — OPNsense post-flash chain")
-print("=" * 60)
-
-OPNSENSE_CHAIN = [
-    "Flash OS image (dd)",
-    "DIP flip to NOR + power cycle",
-    "Confirm NOR recovery boot",
-    "Re-image eMMC firmware (first 32MB)",
-    "DIP flip to eMMC + power cycle",
-]
-
-for transfer in SUPPORTED_TRANSFER:
-    steps = list_journey("OPNsense", transfer)
-    indices = [steps.index(s) for s in OPNSENSE_CHAIN if s in steps]
-    check(
-        f"OPNsense + {transfer}: post-flash chain is strictly ordered",
-        indices == sorted(indices) and len(indices) == len(OPNSENSE_CHAIN)
-    )
-
-
-# ============================================================================
-# SUPPORTED_OS and SUPPORTED_TRANSFER coverage
-# ============================================================================
-
-print()
-print("=" * 60)
-print("SUPPORTED_OS / SUPPORTED_TRANSFER coverage")
-print("=" * 60)
-
-check("OPNsense in SUPPORTED_OS",  "OPNsense" in SUPPORTED_OS)
-check("OpenWRT in SUPPORTED_OS",   "OpenWRT"  in SUPPORTED_OS)
-check("Armbian in SUPPORTED_OS",   "Armbian"  in SUPPORTED_OS)
-check("network in SUPPORTED_TRANSFER", "network" in SUPPORTED_TRANSFER)
-check("usb in SUPPORTED_TRANSFER",     "usb"     in SUPPORTED_TRANSFER)
-
-check(
-    "SUPPORTED_OS matches _FLASH_TARGETS keys",
-    set(SUPPORTED_OS) == set(_FLASH_TARGETS.keys())
-)
+        check(f"'{s}' absent from {os_name} + lan", s not in lan_steps)
 
 
 # ============================================================================
@@ -294,7 +214,7 @@ for os_name, expected_target in EXPECTED_TARGETS.items():
 
 
 # ============================================================================
-# StepContext fields populated by get_journey()
+# StepContext populated correctly by get_journey()
 # ============================================================================
 
 print()
@@ -302,14 +222,12 @@ print("=" * 60)
 print("StepContext populated correctly by get_journey()")
 print("=" * 60)
 
-from unittest.mock import MagicMock
-
 mock_device = MagicMock()
-firmware    = Path("/tmp/firmware.img")
+firmware = Path("/tmp/firmware.img.bz2")
 
 runner = get_journey(
     os_name       = "OPNsense",
-    transfer      = "network",
+    transfer      = "lan",
     device        = mock_device,
     host_ip       = "192.168.168.84",
     device_ip     = "192.168.168.222",
@@ -319,31 +237,31 @@ runner = get_journey(
 )
 
 ctx = runner.ctx
-check("ctx.os_name == 'OPNsense'",              ctx.os_name == "OPNsense")
-check("ctx.transfer == 'network'",              ctx.transfer == "network")
-check("ctx.host_ip correct",                    ctx.host_ip == "192.168.168.84")
-check("ctx.device_ip correct",                  ctx.device_ip == "192.168.168.222")
-check("ctx.http_port correct",                  ctx.http_port == 8080)
-check("ctx.device_mac correct",                 ctx.device_mac == "e8:f6:d7:00:19:9c")
-check("ctx.firmware_path correct",              ctx.firmware_path == firmware)
-check("ctx.flash_target is /dev/mmcblk0",       ctx.flash_target == "/dev/mmcblk0")
-check("ctx.device is the mock",                 ctx.device is mock_device)
+check("ctx.os_name == 'OPNsense'",         ctx.os_name == "OPNsense")
+check("ctx.transfer == 'lan'",             ctx.transfer == "lan")
+check("ctx.host_ip correct",               ctx.host_ip == "192.168.168.84")
+check("ctx.device_ip correct",             ctx.device_ip == "192.168.168.222")
+check("ctx.http_port correct",             ctx.http_port == 8080)
+check("ctx.device_mac correct",            ctx.device_mac == "e8:f6:d7:00:19:9c")
+check("ctx.firmware_path correct",         ctx.firmware_path == firmware)
+check("ctx.flash_target is /dev/mmcblk0", ctx.flash_target == "/dev/mmcblk0")
+check("ctx.device is the mock",            ctx.device is mock_device)
 
 runner_usb = get_journey(
-    os_name  = "OpenWRT",
-    transfer = "usb",
-    device   = mock_device,
+    os_name    = "OpenWRT",
+    transfer   = "usb",
+    device     = mock_device,
     usb_device = "/dev/sdb",
     usb_mount  = "/mnt/stick",
 )
 ctx_usb = runner_usb.ctx
-check("ctx.usb_device set correctly",           ctx_usb.usb_device == "/dev/sdb")
-check("ctx.usb_mount set correctly",            ctx_usb.usb_mount == "/mnt/stick")
-check("ctx.flash_target is /dev/mmcblk0p1",    ctx_usb.flash_target == "/dev/mmcblk0p1")
+check("ctx.usb_device set correctly",        ctx_usb.usb_device == "/dev/sdb")
+check("ctx.usb_mount set correctly",         ctx_usb.usb_mount == "/mnt/stick")
+check("ctx.flash_target is /dev/mmcblk0p1", ctx_usb.flash_target == "/dev/mmcblk0p1")
 
 
 # ============================================================================
-# No circular dependencies: all 6 journeys resolve without fallback
+# No circular dependencies
 # ============================================================================
 
 print()
@@ -351,26 +269,23 @@ print("=" * 60)
 print("No circular dependencies")
 print("=" * 60)
 
-import logging
-import io
+import logging, io
 
 for os_name in SUPPORTED_OS:
     for transfer in SUPPORTED_TRANSFER:
-        # Capture any error log output from FlowRunner._resolve()
         log_capture = io.StringIO()
         handler = logging.StreamHandler(log_capture)
         logging.getLogger("mono_imager.step_registry").addHandler(handler)
 
-        ctx      = StepContext(os_name=os_name, transfer=transfer)
-        runner   = FlowRunner(os_name, transfer, ctx)
-        resolved = runner.steps_for()
+        ctx    = StepContext(os_name=os_name, transfer=transfer)
+        runner = FlowRunner(os_name, transfer, ctx)
+        runner.steps_for()
 
         logging.getLogger("mono_imager.step_registry").removeHandler(handler)
-        log_output = log_capture.getvalue()
 
         check(
-            f"{os_name} + {transfer}: no circular dependency detected",
-            "circular dependency" not in log_output
+            f"{os_name} + {transfer}: no circular dependency",
+            "circular" not in log_capture.getvalue()
         )
 
 

@@ -18,7 +18,7 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 
@@ -82,7 +82,8 @@ console_logger = logging.getLogger("mono_imager.console")
 
 # --- Result tracker ----------------------------------------------------------
 
-results: list[tuple[int, str, bool, str]] = []  # (step, description, passed, reason)
+results: list[tuple[int, str, bool, str]] = []
+_step_counter = [0]  # (step, description, passed, reason)
 
 def reset_results():
     """
@@ -106,8 +107,12 @@ def reset_results():
     every caller (auto, manual, and any future one).
     """
     results.clear()
+    _step_counter[0] = 0
 
 def step(num: int, description: str, passed: bool, reason: str = ""):
+    if num == 0:
+        _step_counter[0] += 1
+        num = _step_counter[0]
     mark = "✓" if passed else "✗"
 
     # File gets the full technical detail: step number, PASS/FAIL, reason.
@@ -413,20 +418,21 @@ def ping(ip: str, count: int = 3) -> bool:
 # Unchanged from the proven test_flash_verify.py run (5/5 bootstrap on
 # real hardware, network phase confirmed once device-ip matches subnet).
 
-def phase1_bootstrap(port: str, baud: int = 115200, os_name: str = None) -> Optional[SerialDevice]:
+def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     """
-    Phase 1: Serial bootstrap — detect, connect, interrupt U-Boot, optionally erase eMMC (OPNsense),
-    boot recovery, login.
-    
-    Args:
-        port: Serial port (e.g., /dev/ttyUSB0, COM5)
-        baud: Baud rate (default 115200)
-        os_name: OS name to determine if erase is needed (OPNsense requires erase)
-    
-    Returns connected SerialDevice on full success, None on any failure.
+    Phase 1a: Serial bootstrap up to the U-Boot prompt.
+
+    Detects the port, connects, waits for the user to power-cycle,
+    and interrupts U-Boot autoboot. Returns the device at the U-Boot
+    prompt — ready for the caller to run any U-Boot commands before
+    handing off to phase1_recovery().
+
+    No OS awareness. No eMMC erase. No bootcmd changes.
+    Those belong in journey files.
+
+    Returns SerialDevice at U-Boot prompt on success, None on failure.
     """
-    reset_results()  # clear any stale results from a prior attempt in
-                      # this same process — see reset_results() docstring
+    reset_results()
     verbose("=" * 60)
     verbose("Phase 1 — Bootstrap (serial)")
     verbose("=" * 60)
@@ -460,36 +466,67 @@ def phase1_bootstrap(port: str, baud: int = 115200, os_name: str = None) -> Opti
         d.disconnect()
         return None
 
-    # Step 3b: Erase eMMC for OPNsense (must happen in U-Boot before recovery boots)
-    if os_name and os_name.lower() == "opnsense":
-        verbose("Erasing eMMC (OPNsense requirement)...")
-        erase_cmd = "mmc erase 0 3b48000"
-        try:
-            response = d.send_command(erase_cmd, timeout=60)
-            erase_ok = "error" not in response.lower()
-            if not step(3, "eMMC erase (mmc erase 0 3b48000)", erase_ok,
-                       response[-100:] if not erase_ok else ""):
-                d.disconnect()
-                return None
-        except Exception as e:
-            verbose(f"✗ eMMC erase failed: {e}", "error")
-            step(3, "eMMC erase (mmc erase 0 3b48000)", False, str(e))
-            d.disconnect()
-            return None
+    return d
 
-    # Step 4: Boot recovery Linux
-    booted = d.boot_recovery()
-    if not step(4, "Recovery Linux booted", booted):
+
+def phase1_recovery(d: SerialDevice,
+                     boot_method: str = "boot_recovery",
+                     login_method: str = "login_recovery") -> Optional[SerialDevice]:
+    """
+    Phase 1b: Boot staging Linux and log in.
+
+    Called after phase1_uboot() — and after any journey-specific
+    U-Boot commands (eMMC erase, bootcmd changes, etc.) have been
+    run by the journey file.
+
+    boot_method / login_method select which SerialDevice methods to call.
+    Default "boot_recovery" + "login_recovery" is the original behaviour.
+    Journeys that need a different staging OS (e.g., Armbian when the
+    'recovery' U-Boot variable has been lost) register alternative methods
+    via step_registry.register_staging_boot() and tui.py passes them here.
+
+    Returns the same SerialDevice now at the staging shell, or None on failure.
+    """
+    boot_fn  = getattr(d, boot_method)
+    login_fn = getattr(d, login_method)
+
+    boot_label  = "Recovery Linux booted" if boot_method == "boot_recovery" else "Staging Linux booted"
+    login_label = ("Logged into recovery shell (root@recovery)"
+                   if login_method == "login_recovery"
+                   else "Logged into staging shell")
+
+    # Step 4: Boot
+    booted = boot_fn()
+    if not step(4, boot_label, booted):
         d.disconnect()
         return None
 
     # Step 5: Login
-    logged_in = d.login_recovery(timeout=60)
-    if not step(5, "Logged into recovery shell (root@recovery)", logged_in):
+    logged_in = login_fn(timeout=60)
+    if not step(5, login_label, logged_in):
         d.disconnect()
         return None
 
     return d
+
+
+def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
+    """
+    Phase 1: Full bootstrap — U-Boot interrupt + recovery boot + login.
+
+    Convenience wrapper around phase1_uboot() + phase1_recovery() for
+    callers that have no U-Boot commands to run in between (option 2
+    firmware update, raw serial console, etc.).
+
+    For OS flash journeys, call phase1_uboot() and phase1_recovery()
+    separately so the journey can run its U-Boot steps in between.
+
+    Returns SerialDevice at recovery shell on success, None on failure.
+    """
+    d = phase1_uboot(port, baud)
+    if d is None:
+        return None
+    return phase1_recovery(d)
 
 
 def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, firmware_path: Path):
@@ -556,7 +593,7 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
 
 
 def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
-                  firmware_size: int = 0, os_name: str = None) -> bool:
+                  firmware_size: int = 0) -> bool:
     """
     Phase 3: Flash — curl | dd on device, verify dd output.
 
@@ -724,26 +761,6 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
 
     use_streaming = firmware_size > 0 and firmware_size > FLASH_SIZE_CAP
 
-    # Step 9b: eMMC erase for OPNsense (mandatory per opnsense.mono.si docs)
-    # OPNsense requires eMMC to be wiped before flashing.
-    if os_name and os_name.lower() == "opnsense":
-        verbose("Erasing eMMC (OPNsense requirement)...")
-        erase_script = "mmc erase 0 3b48000"
-        try:
-            erase_resp, erase_err = with_spinner(
-                d.run_script, erase_script,
-                marker="step09b_erase", exec_timeout=60,
-                message="Erasing eMMC"
-            )
-            erase_ok = erase_err is None and "error" not in erase_resp.lower()
-            if not step(9, "eMMC erase (OPNsense)", erase_ok, 
-                       erase_resp[-100:] if not erase_ok else ""):
-                return False
-        except Exception as e:
-            verbose(f"✗ eMMC erase failed: {e}", "error")
-            step(9, "eMMC erase (OPNsense)", False, str(e))
-            return False
-
     verbose(f"Flashing {flash_target} — this may take several minutes...")
     console_logger.info("Flashing firmware — this may take several minutes...")
 
@@ -762,15 +779,10 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
         )
     else:
         local_fw_path = "/tmp/mono_imager_firmware.img"
-        # For eMMC targets, skip first 4KB block to preserve GPT and OS partitions at 32MB+
-        skip_seek = ""
-        if flash_target == "/dev/mmcblk0":
-            skip_seek = "skip=1 seek=1 "
-        
         flash_script = (
             f"curl -s -o {local_fw_path} {url} "
             f"> /tmp/mono_imager_step10_flash.log 2>&1; "
-            f"dd if={local_fw_path} {skip_seek}of={flash_target} bs=4096 "
+            f"dd if={local_fw_path} of={flash_target} bs=4096 "
             f">> /tmp/mono_imager_step10_flash.log 2>&1; "
             f"rm -f {local_fw_path}; "
             f"cat /tmp/mono_imager_step10_flash.log"
@@ -799,34 +811,19 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     return has_records and not has_error
 
 
-def phase4_postflash(d: SerialDevice, os_name: str = None, mac_address: str = None) -> bool:
+def phase4_postflash(d: SerialDevice) -> bool:
     """
-    Phase 4: Post-flash — firmware re-imaging (OPNsense) then reboot.
-    
-    For OPNsense: After OS flash, firmware bootloader must be re-imaged
-    to eMMC before device can boot from eMMC. This calls Phase 4b.
-    
-    For other OS: Just reboot (legacy behavior).
-    
-    Args:
-        d: SerialDevice (currently in recovery shell post-flash)
-        os_name: OS name ("OPNsense", "OpenWRT", etc.)
-        mac_address: Device MAC address (required for OPNsense firmware auth)
-    
-    Returns: True if phase succeeds
+    Phase 4: Post-flash reboot.
+
+    Sends reboot to the device. Journey files handle any post-flash
+    steps before calling this (firmware re-image, DIP flip prompts, etc.).
     """
     verbose("=" * 60)
     verbose("Phase 4 — Post-flash")
     verbose("=" * 60)
-
-    # OPNsense firmware re-imaging is handled by journey_steps.py via the
-    # step registry (step_reimage_emmc_firmware). phase4_postflash() is
-    # retained only for legacy test scripts; TUI-driven journeys never call it.
-    # Non-OPNsense: simple reboot
     verbose("Sending reboot command...")
     d.send_command("reboot", wait_for_prompt=False, timeout=5)
-
-    verbose("Flash complete. Reboot sent — the rest is the new firmware's job.")
+    verbose("Flash complete. Reboot sent.")
     console_logger.info("Rebooting device...")
     return True
 

@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 
@@ -791,46 +791,67 @@ class SerialDevice:
         """
         Boot into recovery Linux from U-Boot and auto-login as root (no password).
 
+        Accepts any Linux login prompt and any root shell — the recovery Linux
+        hostname may differ from "recovery" depending on the firmware build.
+
         Returns:
-            True if recovery prompt reached and logged in, False otherwise
+            True if a root shell was reached, False otherwise
         """
         verbose("Booting into recovery Linux...")
 
         try:
-            # Send boot command raw — don't use send_command which has its own timeout
             verbose("Sending 'run recovery' command...", "debug")
             self.ser.write(b"run recovery\r\n")
 
-            # Poll for recovery login prompt or root@recovery
             poll_start = time.time()
             poll_timeout = 120.0
             poll_buf = b""
+            _last_log_len = 0
 
             while time.time() - poll_start < poll_timeout:
                 chunk = self.ser.read(256)
                 if chunk:
                     poll_buf += chunk
                     tail = poll_buf.decode("utf-8", errors="replace")
-                    
-                    if "recovery login:" in tail:
-                        verbose("✓ Recovery login prompt detected — auto-logging in as root...")
-                        # Send username and blank password
+
+                    # Periodic debug: show what the device is sending
+                    if len(poll_buf) - _last_log_len > 2048:
+                        verbose(f"  Boot output: {tail[-300:]!r}", "debug")
+                        _last_log_len = len(poll_buf)
+
+                    # Fast-fail: bootm failed and U-Boot prompt returned
+                    if b"\n=> " in poll_buf or b"\r=> " in poll_buf:
+                        verbose("✗ bootm failed — U-Boot prompt returned", "error")
+                        verbose(f"  Output: {tail[-500:]!r}", "error")
+                        return False
+
+                    # Any Linux login prompt (hostname may vary)
+                    if " login:" in tail:
+                        for line in tail.splitlines():
+                            if " login:" in line:
+                                verbose(f"✓ Login prompt: '{line.strip()}' — logging in as root...")
+                                break
                         self.ser.write(b"root\r\n")
                         time.sleep(0.5)
                         self.ser.write(b"\r\n")
                         time.sleep(0.5)
-                        # Verify we got the prompt
                         response = self.ser.read_all().decode("utf-8", errors="replace")
-                        if "root@recovery" in response:
+                        if "root@" in response and "#" in response:
                             verbose("✓ Recovery Linux booted and logged in")
                             return True
-                        else:
-                            verbose("Login attempt did not reach root@recovery prompt", "warning")
-                            return False
-                    elif "root@recovery" in tail:
+                        verbose(f"Login response: {response!r}", "warning")
+                        return False
+
+                    # Already at root shell (auto-login or no password)
+                    if "root@" in tail and "#" in tail:
                         verbose("✓ Recovery Linux booted (auto-logged in)")
                         return True
 
+            verbose(
+                f"✗ Recovery boot timed out after {poll_timeout}s — "
+                f"last output: {poll_buf.decode('utf-8', errors='replace')[-300:]!r}",
+                "error"
+            )
             logger.warning(
                 f"Recovery boot prompt not seen within {poll_timeout}s — "
                 f"last {len(poll_buf)} bytes: {repr(poll_buf[-120:])}"
@@ -841,6 +862,133 @@ class SerialDevice:
             verbose(f"Failed to boot recovery: {e}", "error")
             return False
     
+    def boot_linux_staging(self) -> bool:
+        """
+        Boot into a staging Linux environment (e.g., Armbian on eMMC) by
+        issuing 'boot' at the U-Boot prompt and waiting for any login prompt.
+
+        Used when the 'recovery' U-Boot env variable has been lost (e.g.,
+        after 'env default -a') and the recovery Linux cannot be booted via
+        'run recovery'. Armbian on eMMC has the same tools (curl, dd, ip)
+        as recovery Linux and serves as an equivalent staging environment.
+
+        The caller's U-Boot step must have already set bootcmd to the right
+        target (e.g., sysboot mmc 0:1 ... extlinux.conf) and saved it to NOR
+        before this is called — 'boot' here just executes that bootcmd.
+        """
+        verbose("Booting staging Linux (issuing 'boot' at U-Boot prompt)...")
+        try:
+            self.ser.write(b"boot\r\n")
+
+            poll_start = time.time()
+            poll_timeout = 120.0
+            poll_buf = b""
+
+            while time.time() - poll_start < poll_timeout:
+                chunk = self.ser.read(256)
+                if chunk:
+                    poll_buf += chunk
+                    tail = poll_buf.decode("utf-8", errors="replace")
+
+                    # Auto-login: already at root shell
+                    if "root@" in tail and "#" in tail:
+                        verbose("✓ Staging Linux booted (auto-logged in as root)")
+                        return True
+
+                    if "login:" in tail:
+                        verbose("✓ Staging Linux login prompt — logging in as root...")
+                        self.ser.write(b"root\r\n")
+                        time.sleep(1.0)
+                        resp = self.ser.read(512).decode("utf-8", errors="replace")
+
+                        if "root@" in resp and "#" in resp:
+                            verbose("✓ Logged in to staging Linux (empty password)")
+                            return True
+
+                        if "Password" in resp or "password" in resp.lower():
+                            # Try empty password first
+                            self.ser.write(b"\r\n")
+                            time.sleep(0.5)
+                            r2 = self.ser.read(256).decode("utf-8", errors="replace")
+                            if "root@" in r2 and "#" in r2:
+                                verbose("✓ Logged in to staging Linux (empty password)")
+                                return True
+
+                            # Fall back to Armbian default: 1234
+                            self.ser.write(b"1234\r\n")
+                            time.sleep(0.5)
+                            r3 = self.ser.read(256).decode("utf-8", errors="replace")
+                            if "root@" in r3 and "#" in r3:
+                                verbose("✓ Logged in to staging Linux (password: 1234)")
+                                return True
+
+                            verbose(
+                                "Staging login failed — neither empty password nor '1234' worked",
+                                "warning"
+                            )
+                            return False
+
+                        if "#" in resp:
+                            verbose("✓ Logged in to staging Linux")
+                            return True
+
+            logger.warning(
+                f"Staging Linux boot prompt not seen within {poll_timeout}s — "
+                f"last {len(poll_buf)} bytes: {repr(poll_buf[-120:])}"
+            )
+            return False
+
+        except Exception as e:
+            verbose(f"Failed to boot staging Linux: {e}", "error")
+            return False
+
+    def login_staging(self, timeout: float = 30) -> bool:
+        """
+        Confirm we are at a root shell in the staging Linux environment.
+        Checks for any 'root@<hostname>#' prompt — not locked to 'root@recovery'.
+        Called after boot_linux_staging() in the staging-boot path.
+        """
+        verbose("Verifying staging Linux login...")
+
+        start_time = time.time()
+        attempt = 0
+        backoff = 0.5
+
+        while time.time() - start_time < timeout:
+            attempt += 1
+            try:
+                if not self.ser or not self.ser.is_open:
+                    verbose("Serial disconnected — waiting for device to reappear...", "warning")
+                    if not self.wait_for_port(timeout=10):
+                        time.sleep(min(backoff, 5.0))
+                        backoff = min(backoff * 2, 5.0)
+                        continue
+                    self.connect(self.baud_rate or 115200)
+
+                self.ser.write(b"\r\n")
+                time.sleep(0.3)
+                response = self.ser.read_all().decode("utf-8", errors="replace")
+
+                if "root@" in response and "#" in response:
+                    verbose(f"✓ Logged into staging Linux shell (attempt {attempt})")
+                    return True
+
+                if self.RECOVERY_PROMPT in response.encode():
+                    verbose(f"✓ Recovery Linux available (attempt {attempt})")
+                    return True
+
+                verbose(f"Staging login attempt {attempt} — retrying in {backoff:.1f}s", "debug")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+
+            except Exception as e:
+                verbose(f"Staging login attempt {attempt} failed: {e}", "debug")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+
+        verbose(f"Failed to verify staging Linux login after {attempt} attempts", "error")
+        return False
+
     def login_recovery(self, timeout: float = 30) -> bool:
         """
         Verify we are logged into recovery Linux (root@recovery prompt).
@@ -872,7 +1020,7 @@ class SerialDevice:
                 time.sleep(0.3)
                 response = self.ser.read_all().decode("utf-8", errors="replace")
 
-                if "root@recovery" in response:
+                if "root@" in response and "#" in response:
                     verbose(f"✓ Logged into recovery Linux (attempt {attempt})")
                     return True
 

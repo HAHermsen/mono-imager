@@ -214,32 +214,9 @@ def check_flash_am_transition(choice, expected_state, label):
         app.menu_flash_auto_or_manual()
     check(label, app.current_state == expected_state)
 
-check_flash_am_transition("1", MenuState.NETWORK_AUTO_CONFIG, "option 1 → NETWORK_AUTO_CONFIG (auto)")
-check_flash_am_transition("2", MenuState.CONNECTION,          "option 2 → CONNECTION (manual)")
-check_flash_am_transition("3", MenuState.MAIN,               "option 3 → MAIN (back)")
-
-
-# ============================================================================
-# Transfer method routing
-# ============================================================================
-
-print()
-print("=" * 60)
-print("Transfer method routing")
-print("=" * 60)
-
-def check_transfer_transition(choice, expected_state, expected_method, label):
-    app = make_app()
-    app.os_name     = "Armbian"
-    app.serial_port = "COM5"
-    with patch("builtins.input", return_value=choice), patch("builtins.print"):
-        app.menu_transfer_method()
-    check(label + " — state",           app.current_state == expected_state)
-    if expected_method is not None:
-        check(label + " — transfer_method", app.transfer_method == expected_method)
-
-check_transfer_transition("1", MenuState.NETWORK_FLASH_CONFIG, "network", "option 1 → network")
-check_transfer_transition("2", MenuState.DEVICE_SELECT,        None,      "option 2 → back")
+check_flash_am_transition("1", MenuState.NETWORK_AUTO_CONFIG,  "option 1 → NETWORK_AUTO_CONFIG (auto)")
+check_flash_am_transition("2", MenuState.MAIN,                 "option 2 → MAIN (back)")
+check_flash_am_transition("x", MenuState.FLASH_AUTO_OR_MANUAL, "invalid → stays in FLASH_AUTO_OR_MANUAL")
 
 
 # ============================================================================
@@ -278,13 +255,10 @@ print("=" * 60)
 states_and_methods = [
     (MenuState.MAIN,                 "menu_main"),
     (MenuState.FLASH_AUTO_OR_MANUAL, "menu_flash_auto_or_manual"),
-    (MenuState.CONNECTION,           "menu_connection"),
-    (MenuState.DEVICE_SELECT,        "menu_device_select"),
-    (MenuState.TRANSFER_METHOD,      "menu_transfer_method"),
     (MenuState.NETWORK_AUTO_CONFIG,  "menu_network_auto_config"),
-    (MenuState.NETWORK_FLASH_CONFIG, "menu_network_flash_config"),
     (MenuState.NETWORK_FLASHING,     "menu_network_flashing"),
     (MenuState.RECOVERY_FLOW,        "menu_recovery_flow"),
+    (MenuState.DONE,                 "menu_done"),
     (MenuState.CLI_CONSOLE,          "menu_cli_console"),
     (MenuState.DEVICE_STATS,         "device_stats"),
 ]

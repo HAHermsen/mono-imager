@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 
@@ -387,7 +387,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
                                       flash interface name U-Boot
                                       uses, not "NOR")
 
-    CRITICAL FIX (v0.9.2): The device is at recovery shell prompt when
+    CRITICAL FIX (v0.9.5): The device is at recovery shell prompt when
     this is called — silent, no pending output. It won't emit boot
     diagnostics until reboot is issued. Previous code listened passively
     to the silent serial port and timed out 100% of the time.
@@ -415,7 +415,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
     except Exception as e:
         logger.warning(f"reboot command exception (expected — device disconnects): {e}")
     
-    # HARDENING (v0.9.2): After reboot is issued, the device emits
+    # HARDENING (v0.9.5): After reboot is issued, the device emits
     # shutdown noise (/etc/init.d/rcK, umount messages, etc.) before
     # U-Boot starts. We need to skip this garbage and listen only for
     # U-Boot's actual boot diagnostics.

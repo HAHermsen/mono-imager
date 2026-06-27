@@ -3,7 +3,7 @@ mono-imager: Configuration manager
 Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 

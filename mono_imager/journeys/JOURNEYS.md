@@ -1,6 +1,6 @@
 # Adding Journeys to mono-imager
 
-mono-imager v0.9.1 uses a declarative step registry. You add journeys by writing decorated functions — no orchestrator rewrites, no hardcoded sequences, no dispatch tables to update.
+mono-imager v0.9.5 uses a declarative step registry. You add journeys by writing decorated functions — no orchestrator rewrites, no hardcoded sequences, no dispatch tables to update.
 
 ---
 

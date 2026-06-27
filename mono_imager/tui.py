@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 
@@ -141,21 +141,11 @@ def parse_uboot_self_test(raw_output: str) -> list:
 
 
 
-class ConnectionMode(Enum):
-    """Connection type to device"""
-    SERIAL  = "Serial (USB/UART)"
-    NETWORK = "Network (Ethernet)"
-
-
 class MenuState(Enum):
     """Main menu states"""
     MAIN                   = "main"
     FLASH_AUTO_OR_MANUAL   = "flash_auto_or_manual"
-    CONNECTION             = "connection"
-    DEVICE_SELECT          = "device_select"
-    TRANSFER_METHOD        = "transfer_method"
     NETWORK_AUTO_CONFIG    = "network_auto_config"
-    NETWORK_FLASH_CONFIG  = "network_flash_config"
     NETWORK_FLASHING      = "network_flashing"
     RECOVERY_FLOW         = "recovery_flow"
     DONE                  = "done"
@@ -168,25 +158,17 @@ class MonoImager:
 
     def __init__(self, log_file: Path = None):
         self.current_state   = MenuState.MAIN
-        self.connection_mode = None
         self.device          = None
         self.custom_fw_path  = None
         self.serial_port     = None
-        self.network_host    = None
         self.flash_success   = False
         self.log_file        = log_file
-        self.cli_port        = None
-
-        # Transfer method (asked after serial port is selected — serial
-        # is always mandatory for bootstrap; this chooses how the actual
-        # firmware bytes get transferred): "network" or "serial"
         self.transfer_method = None
-        # Network transfer config, only used when transfer_method == "network"
-        self.net_host_ip      = None
-        self.net_device_ip    = None
-        self.net_http_port    = 8080
+        self.net_host_ip     = None
+        self.net_device_ip   = None
+        self.net_http_port   = 8080
         self.net_flash_target = None
-        self.os_name          = None  # Store selected OS for phase3 access
+        self.os_name         = None
 
     def clear_screen(self):
         """Clear terminal"""
@@ -289,6 +271,169 @@ class MonoImager:
 
         return path, None
 
+    # All imports inside methods are intentional — deferred to keep
+    # startup fast and avoid circular import issues at module load time.
+
+    def _select_port(
+        self,
+        *,
+        auto_select_single: bool = False,
+        show_categories: bool = False,
+        allow_back: bool = True,
+        allow_enter_last: bool = False,
+        save_on_select: bool = False,
+    ) -> Optional[str]:
+        """
+        Detect serial ports, list them, and prompt for a selection.
+        Returns the chosen device string, or None if detection failed,
+        no ports found, user chose Back, or input was invalid.
+        """
+        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
+
+        try:
+            known, other = detect_serial_ports()
+            all_ports = known + other
+        except Exception as e:
+            print(f"  ❌ Port detection failed: {e}")
+            input("  Press Enter to continue...")
+            return None
+
+        if not all_ports:
+            print("  ❌ No serial devices found. Connect the USB-to-UART cable and try again.")
+            input("  Press Enter to continue...")
+            return None
+
+        if auto_select_single and len(all_ports) == 1:
+            port = all_ports[0].device
+            print(f"  Auto-selected: {port} ({all_ports[0].description})")
+            return port
+
+        last_port = get_last_port()
+
+        if show_categories:
+            if known:
+                print("  USB-UART adapters (recommended):")
+                for i, p in enumerate(known, 1):
+                    marker = " ◄ last used" if p.device == last_port else ""
+                    print(f"    {i}) {p.device} — {p.description}{marker}")
+            if other:
+                if known:
+                    print()
+                print("  Other ports:")
+                offset = len(known)
+                for i, p in enumerate(other, offset + 1):
+                    marker = " ◄ last used" if p.device == last_port else ""
+                    print(f"    {i}) {p.device} — {p.description}{marker}")
+        else:
+            for i, p in enumerate(all_ports, 1):
+                marker = " ◄ last used" if p.device == last_port else ""
+                print(f"  {i}) {p.device} — {p.description}{marker}")
+
+        if allow_back:
+            print()
+            print(f"  {len(all_ports) + 1}) Back")
+
+        enter_uses_last = allow_enter_last and bool(last_port) and last_port in [p.device for p in all_ports]
+        if enter_uses_last:
+            print()
+            print(f"  [Enter] Use last port ({last_port})")
+        print()
+
+        total = len(all_ports) + (1 if allow_back else 0)
+        choice = input(f"Select [1-{total}]: ").strip()
+
+        if enter_uses_last and choice == "":
+            if save_on_select:
+                save_last_port(last_port)
+            return last_port
+
+        try:
+            idx = int(choice) - 1
+            if allow_back and idx == len(all_ports):
+                return None
+            if not (0 <= idx < len(all_ports)):
+                raise ValueError("out of range")
+            port_device = all_ports[idx].device
+            if save_on_select:
+                save_last_port(port_device)
+            return port_device
+        except ValueError:
+            print("  Invalid selection.")
+            input("  Press Enter to continue...")
+            return None
+
+    def _check(self, results: list, label: str, passed: bool, detail: str = "") -> bool:
+        """Record pass/fail in results and print a status line."""
+        mark = "✓" if passed else "✗"
+        print(f"  {mark}  {label}")
+        if detail:
+            print(f"     {detail}")
+        results.append(passed)
+        return passed
+
+    def _show_flash_confirmation(
+        self,
+        *,
+        os_name: str,
+        port: str,
+        firmware_path,
+        flash_target: str,
+        host_ip: str,
+        device_ip: str,
+    ) -> Optional[bool]:
+        """
+        Print the pre-flash summary and NOR/eMMC diagram, then prompt.
+        Returns True (confirmed), False (declined), or None (exit! escape).
+        """
+        print()
+        print("  About to flash:")
+        print(f"    OS:          {os_name}")
+        print(f"    Port:        {port}")
+        print(f"    Firmware:    {firmware_path}")
+        print(f"    Target:      {flash_target}")
+        print(f"    Host IP:     {host_ip}:8080  (auto-detected)")
+        print(f"    Device IP:   {device_ip}  (auto-derived)")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  This writes to eMMC, the device's main storage  │")
+        print("  │  (32 GB). It does NOT touch NOR flash (64 MB —   │")
+        print("  │  the bootloader + recovery tool).                │")
+        print("  │                                                   │")
+        print("  │     NOR (64 MB)          eMMC (32 GB)            │")
+        print("  │   ┌─────────────┐      ┌─────────────────┐      │")
+        print("  │   │ Bootloader  │      │  Your OS goes    │      │")
+        print("  │   │ + Recovery  │      │  here — this is  │      │")
+        print("  │   │ (untouched) │      │  what gets       │      │")
+        print("  │   └─────────────┘      │  flashed now ✓   │      │")
+        print("  │                        └─────────────────┘      │")
+        print("  │                                                   │")
+        print("  │  After flashing, the DIP switch picks which one  │")
+        print("  │  the board actually boots:                       │")
+        print("  │    LEFT  = eMMC  (your new OS boots)             │")
+        print("  │    RIGHT = NOR   (boots recovery instead)        │")
+        print("  └─────────────────────────────────────────────────┘")
+        print()
+        print("  This tool is well tested, but writing firmware is never")
+        print("  without risk. Do not unplug power or disconnect the cable")
+        print("  while flashing — an interrupted write can leave the")
+        print("  device unbootable.")
+        print()
+        confirm = self.safe_input("  This writes to the device. Proceed? [y/N]: ")
+        if confirm is None:
+            return None
+        return confirm.lower() == "y"
+
+    def _recovery_finish(self, success: bool) -> None:
+        """Set flash result, wait for Enter, and return to main menu."""
+        self.flash_success = success
+        input("  Press Enter to continue...")
+        self.current_state = MenuState.MAIN
+
+    def _show_firmware_output(self, chunk: str) -> None:
+        """Print a live firmware-update chunk and log it for post-mortem."""
+        print(chunk, end="", flush=True)
+        verbose(f"[firmware update output] {chunk!r}", "debug")
+
     # ------------------------------------------------------------------ #
     #  1. MAIN MENU                                                        #
     # ------------------------------------------------------------------ #
@@ -328,186 +473,20 @@ class MonoImager:
             input("  Press Enter to continue...")
             self.current_state = MenuState.MAIN
 
-    # ------------------------------------------------------------------ #
-    #  2. CONNECTION (serial is always required — go straight to port    #
-    #     selection; the network-vs-serial choice happens AFTER connecting,#
-    #     and is about transfer method, not connection method)            #
-    # ------------------------------------------------------------------ #
-    def menu_connection(self):
-        """
-        Entry point into the connect-to-device flow. Serial is mandatory
-        for every flash (it's how mono-imager bootstraps the device and
-        interrupts U-Boot) — there is no connection-method choice here
-        anymore. This just hands off straight to serial port detection.
-        """
-        self.connection_mode = ConnectionMode.SERIAL
-        self.current_state   = MenuState.DEVICE_SELECT
-
-    # ------------------------------------------------------------------ #
-    #  3. DEVICE / PORT SELECTION                                          #
-    # ------------------------------------------------------------------ #
-    def menu_device_select(self):
-        """Device detection and selection"""
+    def menu_flash_auto_or_manual(self):
         self.clear_screen()
         self.print_header()
-
-        if self.connection_mode == ConnectionMode.SERIAL:
-            self._detect_serial_devices()
-        elif self.connection_mode == ConnectionMode.NETWORK:
-            self._detect_network_devices()
-
-    def _detect_serial_devices(self):
-        """Detect available serial ports with USB-UART filtering and last-used memory"""
-        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
-
-        print("Scanning for serial devices...")
+        print("  ⚠️  ETHERNET: Plug into RIGHTMOST 1 Gig RJ-45 jack (not SFP+ cages)")
         print()
-
-        try:
-            known_ports, other_ports = detect_serial_ports()
-        except RuntimeError as e:
-            print(f"  ❌ {e}")
-            print()
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        all_ports = known_ports + other_ports
-
-        if not all_ports:
-            print("  ❌ No serial devices found.")
-            print()
-            print("  Please ensure your USB/UART cable is connected.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        last_port = get_last_port()
-
-        if known_ports:
-            print("  USB-UART adapters (recommended):")
-            for i, port in enumerate(known_ports, 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-
-        if other_ports:
-            print()
-            print("  Other ports:")
-            offset = len(known_ports)
-            for i, port in enumerate(other_ports, offset + 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-
-        print()
-        print(f"  {len(all_ports) + 1}) Back")
-        print()
-
-        if last_port and last_port in [p.device for p in all_ports]:
-            print(f"  [Enter] Use last port ({last_port})")
-            print()
-
-        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
-
-        if choice == "" and last_port and last_port in [p.device for p in all_ports]:
-            self.serial_port   = last_port
-            self.current_state = MenuState.TRANSFER_METHOD
-            return
-
-        try:
-            idx = int(choice) - 1
-            if idx == len(all_ports):
-                self.current_state = MenuState.MAIN
-                return
-            if 0 <= idx < len(all_ports):
-                self.serial_port = all_ports[idx].device
-                save_last_port(self.serial_port)
-                verbose(f"Selected serial port: {self.serial_port}")
-                self.current_state = MenuState.TRANSFER_METHOD
-            else:
-                print("  Invalid selection.")
-                input("  Press Enter to continue...")
-                self.current_state = MenuState.DEVICE_SELECT
-        except ValueError:
-            print("  Invalid input.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.DEVICE_SELECT
-
-    def _detect_network_devices(self):
-        """Network host entry — stub, no longer reachable from the menu
-        (kept only because removing it wasn't part of the agreed scope
-        for this change; transfer-method selection replaced its role)."""
-        print("  Network device detection not yet implemented.")
-        print()
-        input("  Press Enter to continue...")
-        self.current_state = MenuState.CONNECTION
-
-    # ------------------------------------------------------------------ #
-    #  3b. TRANSFER METHOD (how the firmware bytes actually get moved —  #
-    #      serial connection above is always required for bootstrap;     #
-    #      this only affects the data transfer, not the connection)      #
-    # ------------------------------------------------------------------ #
-    def menu_transfer_method(self):
-        """
-        Ask how to transfer the firmware after serial bootstrap.
-
-        Only Network is currently offered. A Serial-only transfer
-        option (_flash_serial() / flasher.py's Flasher class) existed
-        here but was removed: it predated this session's reliability
-        hardening — it still used raw send_command() calls instead of
-        the proven run_script()/launch_script() heredoc-write-then-
-        verify pattern that exists specifically because naive serial
-        command execution was found to be unreliable (see
-        flash_orchestrator.py history) — and had never been tested on
-        real hardware. The whole menu chain it routed through
-        (FLASH_MODE/FIRMWARE_SOURCE/CONFIRM/FLASHING) was unreachable
-        anyway, so it was deleted outright rather than left disabled.
-        """
-        self.clear_screen()
-        self.print_header()
-        print(f"  Connected: {self.serial_port}")
-        print()
-        print("How should the firmware be transferred to the device?")
-        print()
-        print("  1) Serial, then Network — fast (~2.7 MB/s, ~2.5 min for 400MB)")
+        print("  1) Fully Auto — flash via LAN or USB")
         print("  2) Back")
         print()
 
         choice = input("Select [1-2]: ").strip()
 
         if choice == "1":
-            self.transfer_method = "network"
-            self.current_state   = MenuState.NETWORK_FLASH_CONFIG
-        elif choice == "2":
-            self.current_state = MenuState.DEVICE_SELECT
-        else:
-            print("  Invalid selection.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.TRANSFER_METHOD
-
-    # ------------------------------------------------------------------ #
-    #  1b. FLASH: AUTO OR MANUAL — the real fork. Fully Auto matches      #
-    #      tests/test_verify_flash_auto.py exactly: port is              #
-    #      auto-detected (first port found), host/device IP auto-        #
-    #      derived, only the firmware file is asked. Manual goes through #
-    #      the existing port-selection screen, then the full config form.#
-    # ------------------------------------------------------------------ #
-    def menu_flash_auto_or_manual(self):
-        self.clear_screen()
-        self.print_header()
-        print("  ⚠️  ETHERNET: Plug into RIGHTMOST 1 Gig RJ-45 jack (not SFP+ cages)")
-        print()
-        print("  1) Fully Auto — just point it at a firmware file")
-        print("  2) Manual     — choose port, network settings yourself")
-        print("  3) Back")
-        print()
-
-        choice = input("Select [1-3]: ").strip()
-
-        if choice == "1":
             self.current_state = MenuState.NETWORK_AUTO_CONFIG
         elif choice == "2":
-            self.current_state = MenuState.CONNECTION
-        elif choice == "3":
             self.current_state = MenuState.MAIN
         else:
             print("  Invalid selection.")
@@ -554,54 +533,46 @@ class MonoImager:
         print("  ℹ️  Images over ~3GB auto-switch to streaming flash mode (slower, no local copy).")
         print()
 
-        # OS selection to determine flash target
-        print("  Select the OS you're flashing:")
-        print("    1) Armbian (Debian/Ubuntu)")
-        print("    2) OPNsense")
-        print("    3) OpenWRT")
-        print("    4) VyOS")
-        print("    5) Other (manual target)")
-        print("    6) Back")
+        # OS selection — built dynamically from discovered journey files
+        from mono_imager.journeys import discovered_journeys
+
+        journeys = discovered_journeys()  # [(os_name, transfer), ...]
+
+        print("  Select OS and flash method:")
+        for i, (os_name, transfer) in enumerate(journeys, 1):
+            print(f"    {i}) {os_name} via {transfer}")
+        back_idx = len(journeys) + 1
+        print(f"    {back_idx}) Back")
         print("  (Type 'exit!' at any prompt to escape to main menu)")
         print()
-        os_choice = self.safe_input("  Select [1-6]: ")
+        os_choice = self.safe_input(f"  Select [1-{back_idx}]: ")
         if os_choice is None:
             return
 
-        flash_target = "/dev/mmcblk0"  # Default for most OSes
-        if os_choice == "1":
-            os_name = "Armbian"
-        elif os_choice == "2":
-            os_name = "OPNsense"
-        elif os_choice == "3":
-            os_name = "OpenWRT"
-            flash_target = "/dev/mmcblk0p1"  # OpenWRT uses partition 1
-        elif os_choice == "4":
-            os_name = "VyOS"
-        elif os_choice == "5":
-            os_name = "Other"
-            flash_target = self.safe_input("  Enter flash target (e.g., /dev/mmcblk0 or /dev/mmcblk0p1): ")
-            if flash_target is None:
-                return
-            if not flash_target:
-                print("  ❌ Flash target is required.")
-                input("  Press Enter to continue...")
-                self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
-                return
-        elif os_choice == "6":
+        if os_choice == str(back_idx):
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
             return
-        else:
+
+        try:
+            os_name, transfer = journeys[int(os_choice) - 1]
+        except (ValueError, IndexError):
             print("  ❌ Invalid selection.")
             input("  Press Enter to continue...")
             self.current_state = MenuState.NETWORK_AUTO_CONFIG
             return
 
-        # Store os_name for phase3 access (eMMC erase for OPNsense)
+        self.transfer_method = transfer
+
+        # Flash target is owned by the journeys package.
+        from mono_imager.journeys import _FLASH_TARGETS
+        flash_target = _FLASH_TARGETS.get(os_name, "/dev/mmcblk0")
+
         self.os_name = os_name
 
         print()
-        firmware_raw = self.safe_input("  Type the full path (or paste or drag-n-drop) of the image file: ")
+        from mono_imager.journeys import get_firmware_prompt
+        firmware_prompt = get_firmware_prompt(os_name, transfer)
+        firmware_raw = self.safe_input(f"  {firmware_prompt} ")
         if firmware_raw is None:
             return
         firmware_path, error = self._validate_firmware_path(firmware_raw)
@@ -627,44 +598,17 @@ class MonoImager:
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
             return
 
-        print()
-        print("  About to flash:")
-        print(f"    OS:          {os_name}")
-        print(f"    Port:        {port}")
-        print(f"    Firmware:    {firmware_path}")
-        print(f"    Target:      {flash_target}")
-        print(f"    Host IP:     {host_ip}:8080  (auto-detected)")
-        print(f"    Device IP:   {device_ip}  (auto-derived)")
-        print()
-        print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  This writes to eMMC, the device's main storage  │")
-        print("  │  (32 GB). It does NOT touch NOR flash (64 MB —   │")
-        print("  │  the bootloader + recovery tool).                │")
-        print("  │                                                   │")
-        print("  │     NOR (64 MB)          eMMC (32 GB)            │")
-        print("  │   ┌─────────────┐      ┌─────────────────┐      │")
-        print("  │   │ Bootloader  │      │  Your OS goes    │      │")
-        print("  │   │ + Recovery  │      │  here — this is  │      │")
-        print("  │   │ (untouched) │      │  what gets       │      │")
-        print("  │   └─────────────┘      │  flashed now ✓   │      │")
-        print("  │                        └─────────────────┘      │")
-        print("  │                                                   │")
-        print("  │  After flashing, the DIP switch picks which one  │")
-        print("  │  the board actually boots:                       │")
-        print("  │    LEFT  = eMMC  (your new OS boots)             │")
-        print("  │    RIGHT = NOR   (boots recovery instead)        │")
-        print("  └─────────────────────────────────────────────────┘")
-        print()
-        print("  This tool is well tested, but writing firmware is never")
-        print("  without risk. Do not unplug power or disconnect the cable")
-        print("  while flashing — an interrupted write can leave the")
-        print("  device unbootable.")
-        print()
-        confirm = self.safe_input("  This writes to the device. Proceed? [y/N]: ")
-        if confirm is None:
+        confirmed = self._show_flash_confirmation(
+            os_name=os_name,
+            port=port,
+            firmware_path=firmware_path,
+            flash_target=flash_target,
+            host_ip=host_ip,
+            device_ip=device_ip,
+        )
+        if confirmed is None:
             return
-        confirm = confirm.lower()
-        if confirm != "y":
+        if not confirmed:
             print("  Cancelled.")
             input("  Press Enter to continue...")
             self.current_state = MenuState.MAIN
@@ -686,82 +630,6 @@ class MonoImager:
     #  been removed — they were unreachable and flash_orchestrator.py    #
     #  never used them anyway.)                                         #
     # ------------------------------------------------------------------ #
-    def menu_network_flash_config(self):
-        """
-        Collect network flash parameters. Prompts mirror
-        tests/test_verify_flash_manual.py, which is proven working on
-        real hardware — including the quote-stripping fix for Windows
-        paths typed with quotes (e.g. "C:\\path with spaces\\file.img"),
-        which previously caused a silent failure if omitted.
-        """
-        self.clear_screen()
-        self.print_header()
-        print(f"  Connected: {self.serial_port}  |  Transfer: Network")
-        print()
-        print("Network configuration:")
-
-        host_ip = input("  Host IP (this machine's IP on the device's network): ").strip()
-        if not host_ip:
-            print("  Host IP is required.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.TRANSFER_METHOD
-            return
-
-        device_ip = input("  Device IP to assign (must be on host's subnet): ").strip()
-        if not device_ip:
-            print("  Device IP is required.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.TRANSFER_METHOD
-            return
-
-        http_port_raw = input("  HTTP server port [8080]: ").strip()
-        try:
-            http_port = int(http_port_raw) if http_port_raw else 8080
-        except ValueError:
-            print(f"  '{http_port_raw}' is not a number, using default 8080")
-            http_port = 8080
-
-        firmware_raw = input("  Type or paste the full path of the image file: ")
-        firmware_path, error = self._validate_firmware_path(firmware_raw)
-        if error:
-            print(f"  ❌ {error}")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.NETWORK_FLASH_CONFIG
-            return
-
-        flash_target = input("  Flash target device (e.g. /dev/mmcblk0): ").strip()
-        if not flash_target:
-            print("  Flash target is required.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.NETWORK_FLASH_CONFIG
-            return
-
-        print()
-        print("  About to flash:")
-        print(f"    Firmware:    {firmware_path}")
-        print(f"    Target:      {flash_target}")
-        print(f"    Device IP:   {device_ip}")
-        print(f"    Host IP:     {host_ip}:{http_port}")
-        print()
-        print("  This tool is well tested, but writing firmware is never")
-        print("  without risk. Do not unplug power or disconnect the cable")
-        print("  while flashing — an interrupted write can leave the")
-        print("  device unbootable.")
-        print()
-        confirm = input("  This writes to the device. Proceed? [y/N]: ").strip().lower()
-        if confirm != "y":
-            print("  Cancelled.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        self.net_host_ip    = host_ip
-        self.net_device_ip  = device_ip
-        self.net_http_port  = http_port
-        self.custom_fw_path = firmware_path
-        self.net_flash_target = flash_target
-        self.current_state  = MenuState.NETWORK_FLASHING
-
     def menu_network_flashing(self):
         """
         Run the actual flash via flash_orchestrator.py — the same
@@ -771,9 +639,10 @@ class MonoImager:
         """
         # DON'T clear screen here — keep all output visible for debugging
 
-        from mono_imager.flash_orchestrator import phase1_bootstrap
+        from mono_imager.flash_orchestrator import phase1_uboot, phase1_recovery
         from mono_imager import flash_orchestrator as core
-        from mono_imager.journey_steps import get_journey
+        from mono_imager.journeys import get_journey
+        from mono_imager.step_registry import get_staging_boot_methods
 
         d = None
         try:
@@ -784,8 +653,35 @@ class MonoImager:
             print(f"Port: {self.serial_port}")
             print()
 
-            # Connect to device and interrupt U-Boot
-            d = phase1_bootstrap(self.serial_port, 115200, os_name=self.os_name)
+            # Step 1: Connect and interrupt U-Boot — no OS awareness
+            d = phase1_uboot(self.serial_port, 115200)
+            if d is None:
+                print("❌ Bootstrap FAILED")
+                self.current_state = MenuState.DONE
+                return
+
+            # Step 2: Journey-specific U-Boot commands (eMMC erase, bootcmd, etc.)
+            # Delegated entirely to the journey file via run_uboot_steps()
+            journey = get_journey(
+                os_name       = self.os_name,
+                transfer      = getattr(self, "transfer_method", "lan"),
+                device        = d,
+                host_ip       = self.net_host_ip,
+                device_ip     = self.net_device_ip,
+                firmware_path = Path(self.custom_fw_path),
+                http_port     = self.net_http_port,
+            )
+            if not journey.run_uboot_steps():
+                print("❌ U-Boot setup FAILED")
+                d.disconnect()
+                self.current_state = MenuState.DONE
+                return
+
+            # Step 3: Boot staging Linux (recovery or alternative, per journey)
+            staging = get_staging_boot_methods(
+                self.os_name, getattr(self, "transfer_method", "lan")
+            )
+            d = phase1_recovery(d, **staging)
             if d is None:
                 print("❌ Bootstrap FAILED")
                 self.current_state = MenuState.DONE
@@ -803,18 +699,7 @@ class MonoImager:
             print(f"Device IP:   {self.net_device_ip}")
             print()
 
-            # Build journey via step registry — no hardcoded orchestrator
-            runner = get_journey(
-                os_name       = self.os_name,
-                transfer      = getattr(self, "transfer_method", "network"),
-                device        = d,
-                host_ip       = self.net_host_ip,
-                device_ip     = self.net_device_ip,
-                firmware_path = Path(self.custom_fw_path),
-                http_port     = self.net_http_port,
-            )
-
-            ok = runner.run()
+            ok = journey.run()
 
             if not ok:
                 print("❌ Flashing did not complete successfully")
@@ -995,7 +880,6 @@ class MonoImager:
         """
         from mono_imager import flash_orchestrator as core
         from mono_imager import recovery_orchestrator as rec
-        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
 
         self.clear_screen()
         self.print_header()
@@ -1030,44 +914,10 @@ class MonoImager:
         print()
 
         # --- Port selection ---
-        try:
-            known, other = detect_serial_ports()
-            all_ports = known + other
-        except Exception as e:
-            print(f"  ❌ Port detection failed: {e}")
-            input("  Press Enter to continue...")
+        port = self._select_port(allow_back=True, save_on_select=True)
+        if port is None:
             self.current_state = MenuState.MAIN
             return
-
-        if not all_ports:
-            print("  ❌ No serial device found. Connect the device and try again.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        last_port = get_last_port()
-        for i, p in enumerate(all_ports, 1):
-            marker = " ◄ last used" if p.device == last_port else ""
-            print(f"  {i}) {p.device} — {p.description}{marker}")
-        print(f"  {len(all_ports) + 1}) Back")
-        print()
-
-        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
-        try:
-            idx = int(choice) - 1
-            if idx == len(all_ports):
-                self.current_state = MenuState.MAIN
-                return
-            if not (0 <= idx < len(all_ports)):
-                raise ValueError("out of range")
-            port = all_ports[idx].device
-        except ValueError:
-            print("  Invalid selection.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        save_last_port(port)
 
         print()
         print("⚠️  This can write firmware to your device's NOR and/or eMMC.")
@@ -1078,29 +928,13 @@ class MonoImager:
             self.current_state = MenuState.MAIN
             return
 
-        def show_progress(chunk):
-            print(chunk, end="", flush=True)
-            # BUG THIS FIXES: live 'firmware update' output only ever
-            # went to print() — if the process gets killed (e.g. a
-            # runaway prompt requiring Ctrl+C) before _stream_command()
-            # returns and logs the full buffer, none of what was on
-            # screen ever made it into the log file. Logging each
-            # chunk as it arrives means a forced kill still leaves a
-            # real trail to diagnose from.
-            verbose(f"[firmware update output] {chunk!r}", "debug")
-
-        def finish(success: bool):
-            self.flash_success = success
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-
         d = None
         try:
             d = core.phase1_bootstrap(port, 115200)
             if d is None:
                 print()
                 print("  ❌ Could not bootstrap into the recovery shell.")
-                finish(core.print_report())
+                self._recovery_finish(core.print_report())
                 return
 
             rec.reset_results()
@@ -1109,18 +943,18 @@ class MonoImager:
             if is_modern is None:
                 print()
                 print("  ❌ Could not determine the device's firmware tool type.")
-                finish(rec.print_report())
+                self._recovery_finish(rec.print_report())
                 return
 
             if not self._setup_recovery_network(d):
-                finish(rec.print_report())
+                self._recovery_finish(rec.print_report())
                 return
 
             if is_modern:
                 print()
                 print("  Modern firmware tool detected.")
                 print()
-                emmc_ok = rec.phase_modern_flash_emmc(d, on_output=show_progress)
+                emmc_ok = rec.phase_modern_flash_emmc(d, on_output=self._show_firmware_output)
                 if not emmc_ok:
                     print()
                     print("  ⚠ Modern 'firmware update' failed for eMMC — falling back")
@@ -1128,42 +962,42 @@ class MonoImager:
                     emmc_ok = rec.phase_legacy_flash_emmc(d)
                     if not emmc_ok:
                         print("  ❌ Legacy fallback also failed for eMMC. Nothing more to try automatically.")
-                        finish(rec.print_report())
+                        self._recovery_finish(rec.print_report())
                         return
                     print("  ✓ Legacy fallback succeeded for eMMC.")
                     print("  Backend that serves the modern tool looks broken for this device —")
                     print("  continuing with the legacy method for NOR too (no DIP flip needed).")
                     rec.phase_legacy_flash_nor(d)
-                    finish(rec.print_report())
+                    self._recovery_finish(rec.print_report())
                     return
 
                 print()
                 print("=" * 60)
                 print("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
                 print("=" * 60)
-                print("  The tool will reconnect automatically once you've done that.")
                 input("  Press Enter once you've done that...")
 
-                # Option B: disconnect cleanly, re-bootstrap from scratch.
-                # Trying to maintain serial sync across a reboot is fragile
-                # (shutdown noise, stray keypresses, U-Boot timing quirks).
-                # Reconnecting fresh reuses the proven phase1_bootstrap() path.
-                d.disconnect()
-                d = None
+                if not rec.phase_modern_verify_emmc_boot(d):
+                    print("  ❌ Could not confirm the device booted from eMMC.")
+                    self._recovery_finish(rec.print_report())
+                    return
 
-                print()
-                d = core.phase1_bootstrap(port, 115200)
-                if d is None:
-                    print()
-                    print("  ❌ Could not reconnect after eMMC boot.")
-                    finish(rec.print_report())
+                print("  Re-entering the recovery shell on eMMC...")
+                reentered = (
+                    d.wait_for_autoboot(timeout=60)
+                    and d.boot_recovery()
+                    and d.login_recovery(timeout=60)
+                )
+                if not reentered:
+                    print("  ❌ Could not re-enter the recovery shell after the eMMC boot.")
+                    self._recovery_finish(rec.print_report())
                     return
 
                 if not self._setup_recovery_network(d):
-                    finish(rec.print_report())
+                    self._recovery_finish(rec.print_report())
                     return
 
-                nor_ok = rec.phase_modern_flash_nor(d, on_output=show_progress)
+                nor_ok = rec.phase_modern_flash_nor(d, on_output=self._show_firmware_output)
                 if not nor_ok:
                     print()
                     print("  ⚠ Modern 'firmware update' failed for NOR — falling back")
@@ -1171,7 +1005,7 @@ class MonoImager:
                     nor_ok = rec.phase_legacy_flash_nor(d)
                     if not nor_ok:
                         print("  ❌ Legacy fallback also failed for NOR. Nothing more to try automatically.")
-                        finish(rec.print_report())
+                        self._recovery_finish(rec.print_report())
                         return
                     print("  ✓ Legacy fallback succeeded for NOR.")
 
@@ -1179,8 +1013,9 @@ class MonoImager:
                 print("=" * 60)
                 print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR, THEN POWER-CYCLE ⚡")
                 print("=" * 60)
-                print("  All done — no reconnection needed. Device is fully updated.")
                 input("  Press Enter once you've done that...")
+
+                rec.phase_modern_verify_nor_boot(d)
 
             else:
                 print()
@@ -1188,7 +1023,7 @@ class MonoImager:
                 print("  (No DIP-switch flips needed for this path.)")
                 print()
                 if not rec.phase_legacy_flash_emmc(d):
-                    finish(rec.print_report())
+                    self._recovery_finish(rec.print_report())
                     return
                 rec.phase_legacy_flash_nor(d)
 
@@ -1196,7 +1031,7 @@ class MonoImager:
             if d:
                 d.disconnect()
 
-        finish(rec.print_report())
+        self._recovery_finish(rec.print_report())
 
     # ------------------------------------------------------------------ #
     #  TEST SERIAL — option 4 from main menu                             #
@@ -1212,7 +1047,6 @@ class MonoImager:
         this session), it is used automatically. Otherwise the user is
         prompted to pick a port first.
         """
-        from mono_imager.config import detect_serial_ports, get_last_port
         from mono_imager.serial_device import SerialDevice
         import time
 
@@ -1225,38 +1059,10 @@ class MonoImager:
         # Resolve port
         port = self.serial_port
         if not port:
-            try:
-                known, other = detect_serial_ports()
-                all_ports = known + other
-            except Exception as e:
-                print(f"  ✗ Port detection failed: {e}")
-                input("\n  Press Enter to return to main menu...")
+            port = self._select_port(auto_select_single=True, allow_back=False)
+            if port is None:
                 self.current_state = MenuState.MAIN
                 return
-
-            if not all_ports:
-                print("  ✗ No serial ports detected.")
-                print("    Connect the USB-to-UART cable and try again.")
-                input("\n  Press Enter to return to main menu...")
-                self.current_state = MenuState.MAIN
-                return
-
-            if len(all_ports) == 1:
-                port = all_ports[0].device
-                print(f"  Auto-selected: {port} ({all_ports[0].description})")
-            else:
-                print("  Available ports:")
-                for i, p in enumerate(all_ports, 1):
-                    print(f"    {i}) {p.device}  —  {p.description}")
-                print()
-                choice = input("  Select port [1-{}]: ".format(len(all_ports))).strip()
-                try:
-                    port = all_ports[int(choice) - 1].device
-                except (ValueError, IndexError):
-                    print("  ✗ Invalid selection.")
-                    input("\n  Press Enter to return to main menu...")
-                    self.current_state = MenuState.MAIN
-                    return
 
         print()
         print(f"  Port:  {port}")
@@ -1265,17 +1071,9 @@ class MonoImager:
 
         results = []
 
-        def check(label, passed, detail=""):
-            mark = "✓" if passed else "✗"
-            print(f"  {mark}  {label}")
-            if detail:
-                print(f"     {detail}")
-            results.append(passed)
-            return passed
-
         # Step 1: connect
         d = SerialDevice(port, timeout=5)
-        if not check("Connect at 115200 baud", d.connect(115200)):
+        if not self._check(results, "Connect at 115200 baud", d.connect(115200)):
             input("\n  Press Enter to return to main menu...")
             self.current_state = MenuState.MAIN
             return
@@ -1287,7 +1085,7 @@ class MonoImager:
             print("  ⚡  POWER CYCLE YOUR DEVICE NOW  ⚡")
             print("  " + "─" * 56)
             print()
-            check("U-Boot autoboot interrupted", d.wait_for_autoboot(timeout=60))
+            self._check(results, "U-Boot autoboot interrupted", d.wait_for_autoboot(timeout=60))
             if not results[-1]:
                 input("\n  Press Enter to return to main menu...")
                 self.current_state = MenuState.MAIN
@@ -1295,9 +1093,9 @@ class MonoImager:
 
             # Step 3: U-Boot responds to a command
             response = d.send_command("printenv ethact", timeout=5)
-            check("U-Boot responds to commands",
-                  bool(response.strip()),
-                  response.strip() if response.strip() else "no response")
+            self._check(results, "U-Boot responds to commands",
+                        bool(response.strip()),
+                        response.strip() if response.strip() else "no response")
 
             # Step 4: boot recovery
             d.send_command("run recovery", wait_for_prompt=False, timeout=3)
@@ -1314,7 +1112,7 @@ class MonoImager:
                             time.sleep(1)
                         booted = True
                         break
-            check("Recovery Linux booted", booted)
+            self._check(results, "Recovery Linux booted", booted)
 
             # Step 5: login confirmed
             if booted:
@@ -1323,7 +1121,7 @@ class MonoImager:
                 waiting  = d.ser.in_waiting
                 response = d.ser.read(waiting) if waiting else b""
                 at_shell = b"root@recovery" in buffer or b"root@recovery" in response
-                check("Logged into recovery shell", at_shell)
+                self._check(results, "Logged into recovery shell", at_shell)
 
         finally:
             d.disconnect()
@@ -1366,7 +1164,6 @@ class MonoImager:
             phase1_bootstrap, detect_host_ip, pick_device_ip,
             start_http_server, wait_for_report
         )
-        from mono_imager.config import detect_serial_ports
         from mono_imager.serial_device import SerialDevice
         import time, tempfile, pathlib, socket
 
@@ -1378,46 +1175,13 @@ class MonoImager:
 
         results = []
 
-        def check(label, passed, detail=""):
-            mark = "✓" if passed else "✗"
-            print(f"  {mark}  {label}")
-            if detail:
-                print(f"     {detail}")
-            results.append(passed)
-            return passed
-
         # Step 1: resolve serial port
         port = self.serial_port
         if not port:
-            try:
-                known, other = detect_serial_ports()
-                all_ports = known + other
-            except Exception as e:
-                print(f"  ✗ Port detection failed: {e}")
-                input("\n  Press Enter to return to main menu...")
+            port = self._select_port(auto_select_single=True, allow_back=False)
+            if port is None:
                 self.current_state = MenuState.MAIN
                 return
-
-            if not all_ports:
-                print("  ✗ No serial ports detected — connect USB-to-UART cable.")
-                input("\n  Press Enter to return to main menu...")
-                self.current_state = MenuState.MAIN
-                return
-
-            if len(all_ports) == 1:
-                port = all_ports[0].device
-                print(f"  Auto-selected: {port}")
-            else:
-                for i, p in enumerate(all_ports, 1):
-                    print(f"    {i}) {p.device}  —  {p.description}")
-                choice = input("  Select port: ").strip()
-                try:
-                    port = all_ports[int(choice) - 1].device
-                except (ValueError, IndexError):
-                    print("  ✗ Invalid selection.")
-                    input("\n  Press Enter to return to main menu...")
-                    self.current_state = MenuState.MAIN
-                    return
 
         print()
 
@@ -1433,7 +1197,7 @@ class MonoImager:
             pass  # best-effort — bootstrap will catch it either way
 
         d = phase1_bootstrap(port, 115200)
-        if not check("Device in recovery shell", d is not None):
+        if not self._check(results, "Device in recovery shell", d is not None):
             input("\n  Press Enter to return to main menu...")
             self.current_state = MenuState.MAIN
             return
@@ -1443,9 +1207,9 @@ class MonoImager:
             host_ip   = self.net_host_ip or detect_host_ip()
             device_ip = self.net_device_ip or pick_device_ip(host_ip)
 
-            if not check("Host IP detected", bool(host_ip), host_ip or "could not detect"):
+            if not self._check(results, "Host IP detected", bool(host_ip), host_ip or "could not detect"):
                 return
-            check("Device IP", True, device_ip)
+            self._check(results, "Device IP", True, device_ip)
 
             # Step 4: assign IP on device, ping from host
             d.send_command("ip link set eth0 up", timeout=10)
@@ -1469,7 +1233,7 @@ class MonoImager:
             tmp.write_bytes(b"LAN_TEST")
             http_port = 18080
             server = start_http_server(host_ip, http_port, tmp)
-            if not check(f"HTTP server up on {host_ip}:{http_port}", server is not None):
+            if not self._check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
                 tmp.unlink(missing_ok=True)
                 input("\n  Press Enter to return to main menu...")
                 self.current_state = MenuState.MAIN
@@ -1493,7 +1257,7 @@ class MonoImager:
                 server.shutdown()
                 tmp.unlink(missing_ok=True)
 
-            check("Device can reach host HTTP server", device_sees_host)
+            self._check(results, "Device can reach host HTTP server", device_sees_host)
 
             # Save working config
             self.serial_port   = port
@@ -1560,7 +1324,6 @@ class MonoImager:
     # ------------------------------------------------------------------ #
     def menu_cli_console(self):
         """Serial console session — raw pass-through"""
-        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
         from mono_imager.serial_device import SerialDevice
         import threading
 
@@ -1569,70 +1332,15 @@ class MonoImager:
         print("  CLI Console — Serial")
         print()
 
-        try:
-            known_ports, other_ports = detect_serial_ports()
-        except RuntimeError as e:
-            print(f"  ❌ {e}")
-            print()
-            input("  Press Enter to continue...")
+        port = self._select_port(
+            show_categories=True,
+            allow_back=True,
+            allow_enter_last=True,
+            save_on_select=True,
+        )
+        if port is None:
             self.current_state = MenuState.MAIN
             return
-
-        all_ports = known_ports + other_ports
-
-        if not all_ports:
-            print("  ❌ No serial devices found.")
-            print()
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        last_port = get_last_port()
-
-        if known_ports:
-            print("  USB-UART adapters (recommended):")
-            for i, port in enumerate(known_ports, 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-        if other_ports:
-            print()
-            print("  Other ports:")
-            offset = len(known_ports)
-            for i, port in enumerate(other_ports, offset + 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-
-        print()
-        print(f"  {len(all_ports) + 1}) Back")
-        print()
-
-        if last_port and last_port in [p.device for p in all_ports]:
-            print(f"  [Enter] Use last port ({last_port})")
-            print()
-
-        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
-
-        if choice == "" and last_port and last_port in [p.device for p in all_ports]:
-            port = last_port
-        else:
-            try:
-                idx = int(choice) - 1
-                if idx == len(all_ports):
-                    self.current_state = MenuState.MAIN
-                    return
-                if 0 <= idx < len(all_ports):
-                    port = all_ports[idx].device
-                    save_last_port(port)
-                else:
-                    print("  Invalid selection.")
-                    input("  Press Enter to continue...")
-                    self.current_state = MenuState.CLI_CONSOLE
-                    return
-            except ValueError:
-                print("  Invalid input.")
-                input("  Press Enter to continue...")
-                self.current_state = MenuState.CLI_CONSOLE
-                return
 
         self.clear_screen()
         self.print_header()
@@ -1709,79 +1417,22 @@ class MonoImager:
 
     def device_stats(self):
         """Query and display Mono Gateway hardware statistics"""
-        from mono_imager.config import detect_serial_ports, get_last_port, save_last_port
         from mono_imager.serial_device import SerialDevice
-        
+
         self.clear_screen()
         self.print_header()
-        
-        # Port selection
-        try:
-            known_ports, other_ports = detect_serial_ports()
-        except RuntimeError as e:
-            print(f"  ❌ {e}")
-            print()
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        all_ports = known_ports + other_ports
-
-        if not all_ports:
-            print("  ❌ No serial devices found.")
-            print()
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        last_port = get_last_port()
 
         print("  Select device to query:")
         print()
-        if known_ports:
-            print("  USB-UART adapters (recommended):")
-            for i, port in enumerate(known_ports, 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-        if other_ports:
-            print()
-            print("  Other ports:")
-            offset = len(known_ports)
-            for i, port in enumerate(other_ports, offset + 1):
-                marker = " ◄ last used" if port.device == last_port else ""
-                print(f"    {i}) {port.device} — {port.description}{marker}")
-
-        print()
-        print(f"  {len(all_ports) + 1}) Back")
-        print()
-
-        if last_port and last_port in [p.device for p in all_ports]:
-            print(f"  [Enter] Use last port ({last_port})")
-            print()
-
-        choice = input(f"Select [1-{len(all_ports) + 1}]: ").strip()
-
-        if choice == "" and last_port and last_port in [p.device for p in all_ports]:
-            port = last_port
-        else:
-            try:
-                idx = int(choice) - 1
-                if idx == len(all_ports):
-                    self.current_state = MenuState.MAIN
-                    return
-                if 0 <= idx < len(all_ports):
-                    port = all_ports[idx].device
-                    save_last_port(port)
-                else:
-                    print("  Invalid selection.")
-                    input("  Press Enter to continue...")
-                    self.current_state = MenuState.DEVICE_STATS
-                    return
-            except ValueError:
-                print("  Invalid input.")
-                input("  Press Enter to continue...")
-                self.current_state = MenuState.DEVICE_STATS
-                return
+        port = self._select_port(
+            show_categories=True,
+            allow_back=True,
+            allow_enter_last=True,
+            save_on_select=True,
+        )
+        if port is None:
+            self.current_state = MenuState.MAIN
+            return
 
         # Query device
         self.clear_screen()
@@ -1825,27 +1476,32 @@ class MonoImager:
         self.current_state = MenuState.MAIN
 
     def _display_device_stats(self, raw_output: str):
-        """
-        Parse and display U-Boot's boot-time diagnostics: SoC/board identity.
+        """Parse and display U-Boot boot-time diagnostics."""
+        identity  = parse_uboot_identity(raw_output)
+        self_test = parse_uboot_self_test(raw_output)
 
-        Parses identity fields from U-Boot output.
-        """
-        identity = parse_uboot_identity(raw_output)
-
-        if not identity:
+        if not identity and not self_test:
             print()
             print("  ⚠️  No recognizable U-Boot diagnostic output found.")
             return
 
-        print()
-        print("  " + "─" * 56)
-        print("  BOARD IDENTITY")
-        print("  " + "─" * 56)
         if identity:
+            print()
+            print("  " + "─" * 56)
+            print("  BOARD IDENTITY")
+            print("  " + "─" * 56)
             for label, value in identity.items():
                 print(f"    {label:<22} {value}")
-        else:
-            print("    (none captured)")
+
+        if self_test:
+            print()
+            print("  " + "─" * 56)
+            print("  SELF-TEST")
+            print("  " + "─" * 56)
+            for label, value in self_test:
+                detail = f"  {value}" if value else ""
+                print(f"    ✓  {label}{detail}")
+
         print()
 
 
@@ -1861,16 +1517,8 @@ class MonoImager:
                     self.menu_main()
                 elif self.current_state == MenuState.FLASH_AUTO_OR_MANUAL:
                     self.menu_flash_auto_or_manual()
-                elif self.current_state == MenuState.CONNECTION:
-                    self.menu_connection()
-                elif self.current_state == MenuState.DEVICE_SELECT:
-                    self.menu_device_select()
-                elif self.current_state == MenuState.TRANSFER_METHOD:
-                    self.menu_transfer_method()
                 elif self.current_state == MenuState.NETWORK_AUTO_CONFIG:
                     self.menu_network_auto_config()
-                elif self.current_state == MenuState.NETWORK_FLASH_CONFIG:
-                    self.menu_network_flash_config()
                 elif self.current_state == MenuState.NETWORK_FLASHING:
                     self.menu_network_flashing()
                 elif self.current_state == MenuState.RECOVERY_FLOW:

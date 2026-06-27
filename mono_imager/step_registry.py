@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mono-imager: Step Registry (v0.9.1)
+mono-imager: Step Registry (v0.9.5)
 
 Decorator-based step registry. Steps declare os=, transfer=,
 requires=, produces=. FlowRunner resolves the correct sequence
@@ -23,11 +23,11 @@ ADDING A JOURNEY:
     3. FlowRunner builds the sequence from requires/produces
 
 Author:  H.A. Hermsen
-Version: 0.9.1
+Version: 0.9.5
 License: MIT
 """
 
-__version__ = "0.9.1"
+__version__ = "0.9.5"
 __author__  = "H.A. Hermsen"
 
 import logging
@@ -105,6 +105,44 @@ class StepDescriptor:
 # ============================================================================
 
 _registry: list[StepDescriptor] = []
+
+# Registry for U-Boot step functions keyed by (os_name, transfer)
+_uboot_registry: dict[tuple[str, str], callable] = {}
+
+# Registry for staging-boot method names — overrides boot_recovery/login_recovery
+# when the default recovery Linux is unavailable (e.g., recovery var wiped from NOR).
+_staging_boot_registry: dict[tuple[str, str], dict] = {}
+
+
+def register_uboot_steps(os_name: str, transfer: str, fn: callable):
+    """Register a U-Boot step function for a specific OS+transfer combination."""
+    _uboot_registry[(os_name, transfer)] = fn
+
+
+def register_staging_boot(os_name: str, transfer: str, *,
+                          boot_method: str = "boot_recovery",
+                          login_method: str = "login_recovery"):
+    """
+    Register custom SerialDevice method names to use for the staging-boot
+    phase instead of the default boot_recovery/login_recovery pair.
+    Used when recovery Linux is unavailable and an alternative staging OS
+    (e.g., Armbian already on eMMC) is used for the flash step.
+    """
+    _staging_boot_registry[(os_name, transfer)] = {
+        "boot_method": boot_method,
+        "login_method": login_method,
+    }
+
+
+def get_staging_boot_methods(os_name: str, transfer: str) -> dict:
+    """
+    Return the registered boot/login method names for this OS+transfer pair,
+    or the defaults (boot_recovery + login_recovery) if none registered.
+    """
+    return _staging_boot_registry.get((os_name, transfer), {
+        "boot_method": "boot_recovery",
+        "login_method": "login_recovery",
+    })
 
 
 def register_step(
@@ -201,6 +239,21 @@ class FlowRunner:
 
     def steps_for(self) -> list[StepDescriptor]:
         return self._steps
+
+    def run_uboot_steps(self) -> bool:
+        """
+        Run any U-Boot commands needed before recovery boots.
+        Journey files register functions via register_uboot_steps(os, transfer, fn).
+        Returns True if none registered or if they succeed.
+        """
+        fn = _uboot_registry.get((self.os_name, self.transfer))
+        if fn is None:
+            return True
+        try:
+            return fn(self.ctx.device)
+        except Exception as e:
+            logger.error(f"uboot_steps failed for {self.os_name}/{self.transfer}: {e}")
+            return False
 
     def run(self) -> bool:
         from mono_imager.flash_orchestrator import verbose, reset_results
