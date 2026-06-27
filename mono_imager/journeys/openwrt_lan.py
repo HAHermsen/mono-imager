@@ -100,13 +100,29 @@ def _update_emmc_env(device) -> bool:
             pass
 
     # (mmc_sector_offset, sector_count, env_size_bytes)
+    # CRC check is near-instant so a broad list is fine.
     CANDIDATES = [
-        (0x2000, 0x200, 0x40000),  # 4 MB, 256 KB  — most common LS1046A layout
-        (0x800,  0x100, 0x20000),  # 1 MB, 128 KB
-        (0x800,  0x200, 0x40000),  # 1 MB, 256 KB
-        (0x1800, 0x200, 0x40000),  # 3 MB, 256 KB
-        (0x2000, 0x100, 0x20000),  # 4 MB, 128 KB
-        (0x600,  0x100, 0x20000),  # 768 KB, 128 KB
+        (0x1F80, 0x100, 0x20000),  # 3.9375 MB, 128 KB — Armbian LS1046A default
+        (0x1F80, 0x80,  0x10000),  # 3.9375 MB,  64 KB
+        (0x1F80, 0x200, 0x40000),  # 3.9375 MB, 256 KB
+        (0x2000, 0x200, 0x40000),  # 4 MB,      256 KB
+        (0x2000, 0x100, 0x20000),  # 4 MB,      128 KB
+        (0x2000, 0x80,  0x10000),  # 4 MB,       64 KB
+        (0x1C00, 0x100, 0x20000),  # 3.5 MB,    128 KB
+        (0x1C00, 0x80,  0x10000),  # 3.5 MB,     64 KB
+        (0x1800, 0x100, 0x20000),  # 3 MB,       128 KB
+        (0x1800, 0x80,  0x10000),  # 3 MB,        64 KB
+        (0x1800, 0x200, 0x40000),  # 3 MB,       256 KB
+        (0x1000, 0x100, 0x20000),  # 2 MB,       128 KB
+        (0x1000, 0x80,  0x10000),  # 2 MB,        64 KB
+        (0x800,  0x100, 0x20000),  # 1 MB,       128 KB
+        (0x800,  0x80,  0x10000),  # 1 MB,        64 KB
+        (0x800,  0x200, 0x40000),  # 1 MB,       256 KB
+        (0x600,  0x100, 0x20000),  # 768 KB,     128 KB
+        (0x600,  0x80,  0x10000),  # 768 KB,      64 KB
+        (0x400,  0x80,  0x10000),  # 512 KB,      64 KB
+        (0x2800, 0x100, 0x20000),  # 5 MB,       128 KB
+        (0x2800, 0x80,  0x10000),  # 5 MB,        64 KB
     ]
 
     updated = False
