@@ -18,7 +18,7 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: 0.9.5
+Version: v.0.9.9 RC1
 License: MIT
 """
 
@@ -41,10 +41,14 @@ from typing import Optional
 
 from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
-from mono_imager.spinner import with_spinner
+from mono_imager.spinner import with_spinner, Spinner
 
 # OS detection — cached at module load; OS does not change mid-process
 _IS_WINDOWS = platform.system().lower() == "windows"
+
+# Set MONO_DEBUG=1 to restore full verbose output to console.
+import os as _os
+_DEBUG = _os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 # --- Logging setup -----------------------------------------------------------
 # Logging is initialised exactly once by tui.py/cli.py via
@@ -63,8 +67,9 @@ logger = logging.getLogger(__name__)
 
 
 def verbose(msg: str, level: str = "info"):
-    """Print to console immediately AND log it."""
-    print(msg, flush=True)
+    """Log always; print to console only in debug mode or for errors/warnings."""
+    if _DEBUG or level in ("error", "warning"):
+        print(msg, flush=True)
     if level == "error":
         logger.error(msg)
     elif level == "warning":
@@ -338,7 +343,7 @@ def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[
     """Start HTTP server in a daemon thread. Returns server or None on failure."""
     try:
         handler = type("Handler", (_FirmwareHandler,), {"firmware_path": firmware_path})
-        server  = HTTPServer((host_ip, port), handler)
+        server  = HTTPServer(("", port), handler)  # bind all interfaces
         thread  = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         verbose(f"✓ HTTP server listening on http://{host_ip}:{port}/", "debug")
@@ -461,7 +466,12 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
     print("=" * 60)
     print()
-    interrupted = d.wait_for_autoboot(timeout=60)
+    interrupted, _autoboot_err = with_spinner(
+        d.wait_for_autoboot, timeout=60,
+        message="Waiting for U-Boot autoboot interrupt..."
+    )
+    if _autoboot_err:
+        interrupted = False
     if not step(3, "U-Boot autoboot interrupted", interrupted):
         d.disconnect()
         return None
@@ -496,13 +506,19 @@ def phase1_recovery(d: SerialDevice,
                    else "Logged into staging shell")
 
     # Step 4: Boot
-    booted = boot_fn()
+    boot_msg = "Booting recovery Linux..." if boot_method == "boot_recovery" else "Booting staging Linux..."
+    booted, _boot_err = with_spinner(boot_fn, message=boot_msg)
+    if _boot_err:
+        booted = False
     if not step(4, boot_label, booted):
         d.disconnect()
         return None
 
     # Step 5: Login
-    logged_in = login_fn(timeout=60)
+    login_msg = "Logging into recovery shell..." if login_method == "login_recovery" else "Logging into staging shell..."
+    logged_in, _login_err = with_spinner(login_fn, timeout=60, message=login_msg)
+    if _login_err:
+        logged_in = False
     if not step(5, login_label, logged_in):
         d.disconnect()
         return None
@@ -545,15 +561,14 @@ def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, fir
     # then detect which one has LOWER_UP. Recovery Linux doesn't persist
     # network config across boots, so ports start DOWN.
     try:
-        # Try to bring up all eth ports (eth0-eth4 typically)
-        for port_num in range(5):
-            try:
-                d.send_command(f"ip link set eth{port_num} up", timeout=5)
-            except Exception:
-                pass  # Port might not exist, that's ok
-        
-        # Now check for LOWER_UP on any eth port
-        ip_output = d.send_command("ip link show", timeout=5)
+        ip_output = ""
+        with Spinner("Detecting active Ethernet port..."):
+            for port_num in range(5):
+                try:
+                    d.send_command(f"ip link set eth{port_num} up", timeout=5)
+                except Exception:
+                    pass  # Port might not exist, that's ok
+            ip_output = d.send_command("ip link show", timeout=5)
         active_iface = None
         for line in ip_output.split('\n'):
             if 'LOWER_UP' in line and ': ' in line:

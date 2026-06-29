@@ -18,17 +18,16 @@ What this tests:
     - Unknown/invalid input stays in current state (no crash)
 
   Menu navigation paths:
-    - Main → Flash journey (option 1)
-    - Main → Recovery flow (option 2)
-    - Main → CLI console (option 3)
-    - Main → Device stats (option 6)
-    - Main → Quit (option q)
-    - Flash auto/manual → Auto config
-    - Flash auto/manual → Manual config (back to CONNECTION)
-    - Flash auto/manual → Back to main
-    - Transfer method → Network
-    - Transfer method → USB
-    - Transfer method → Back
+    - Main -> Flash journey (option 1)
+    - Main -> Update eMMC FW (option 2)
+    - Main -> Update NOR FW (option 3)
+    - Main -> CLI console (option 4)
+    - Main -> Test Serial (option 5)
+    - Main -> Test LAN (option 6)
+    - Main -> Device stats (option 7)
+    - Main -> Quit (option 8)
+    - Flash auto/manual -> Auto config
+    - Flash auto/manual -> Back to main
     - safe_input() escape hatch ('exit!')
 
 Run: python tests/unit/test_cli.py
@@ -96,14 +95,14 @@ with patch("mono_imager.tui.MonoImager") as MockApp:
     try:
         cli_module.main()
     except SystemExit as e:
-        check("KeyboardInterrupt → sys.exit(0)", e.code == 0)
+        check("KeyboardInterrupt -> sys.exit(0)", e.code == 0)
     else:
-        check("KeyboardInterrupt → sys.exit(0)", False)
+        check("KeyboardInterrupt -> sys.exit(0)", False)
 
     check("MonoImager was instantiated", MockApp.called)
     check("run() was called on the instance", instance.run.called)
 
-# Unhandled exception → sys.exit(1)
+# Unhandled exception -> sys.exit(1)
 import importlib
 with patch("mono_imager.tui.MonoImager") as MockApp:
     instance = MockApp.return_value
@@ -113,10 +112,11 @@ with patch("mono_imager.tui.MonoImager") as MockApp:
     importlib.reload(cli_module)  # ensure patch is active for this import
 
     try:
-        cli_module.main()
-        check("Unhandled exception → sys.exit(1)", False)
+        with patch("builtins.print"):
+            cli_module.main()
+        check("Unhandled exception -> sys.exit(1)", False)
     except SystemExit as e:
-        check("Unhandled exception → sys.exit(1)", e.code == 1)
+        check("Unhandled exception -> sys.exit(1)", e.code == 1)
 
 
 # ============================================================================
@@ -162,31 +162,32 @@ def check_main_transition(choice, expected_state, label):
         app.menu_main()
     check(label, app.current_state == expected_state)
 
-check_main_transition("1", MenuState.FLASH_AUTO_OR_MANUAL, "option 1 → FLASH_AUTO_OR_MANUAL")
-check_main_transition("2", MenuState.RECOVERY_FLOW,        "option 2 → RECOVERY_FLOW")
-check_main_transition("3", MenuState.CLI_CONSOLE,          "option 3 → CLI_CONSOLE")
-check_main_transition("6", MenuState.DEVICE_STATS,         "option 6 → DEVICE_STATS")
+check_main_transition("1", MenuState.FLASH_AUTO_OR_MANUAL, "option 1 -> FLASH_AUTO_OR_MANUAL")
+check_main_transition("2", MenuState.UPDATE_EMMC,          "option 2 -> UPDATE_EMMC")
+check_main_transition("3", MenuState.UPDATE_NOR,           "option 3 -> UPDATE_NOR")
+check_main_transition("4", MenuState.CLI_CONSOLE,          "option 4 -> CLI_CONSOLE")
+check_main_transition("7", MenuState.DEVICE_STATS,         "option 7 -> DEVICE_STATS")
 
-# Options 4 and 5 now route to menu_test_serial / menu_test_lan.
+# Options 5 and 6 call menu_test_serial / menu_test_lan directly (no state change).
 # Verify dispatch by mocking the methods and confirming they're called.
-for opt, method in [("4", "menu_test_serial"), ("5", "menu_test_lan")]:
+for opt, method in [("5", "menu_test_serial"), ("6", "menu_test_lan")]:
     app = make_app()
     mock_method = MagicMock()
     with patch.object(app, method, mock_method), \
          patch("builtins.input", return_value=opt), \
          patch("builtins.print"):
         app.menu_main()
-    check(f"option {opt} → {method}() called", mock_method.called)
+    check(f"option {opt} -> {method}() called", mock_method.called)
 
-# Quit is option 7
+# Quit is option 8
 app = make_app()
-with patch("builtins.input", return_value="7"), patch("builtins.print"):
+with patch("builtins.input", return_value="8"), patch("builtins.print"):
     try:
         app.menu_main()
     except SystemExit as e:
-        check("option 7 → sys.exit(0)", e.code == 0)
+        check("option 8 -> sys.exit(0)", e.code == 0)
     else:
-        check("option 7 → sys.exit(0)", False)
+        check("option 8 -> sys.exit(0)", False)
 
 # Invalid input stays in MAIN (no crash, no transition)
 app = make_app()
@@ -214,9 +215,9 @@ def check_flash_am_transition(choice, expected_state, label):
         app.menu_flash_auto_or_manual()
     check(label, app.current_state == expected_state)
 
-check_flash_am_transition("1", MenuState.NETWORK_AUTO_CONFIG,  "option 1 → NETWORK_AUTO_CONFIG (auto)")
-check_flash_am_transition("2", MenuState.MAIN,                 "option 2 → MAIN (back)")
-check_flash_am_transition("x", MenuState.FLASH_AUTO_OR_MANUAL, "invalid → stays in FLASH_AUTO_OR_MANUAL")
+check_flash_am_transition("1", MenuState.NETWORK_AUTO_CONFIG,  "option 1 -> NETWORK_AUTO_CONFIG (auto)")
+check_flash_am_transition("2", MenuState.MAIN,                 "option 2 -> MAIN (back)")
+check_flash_am_transition("x", MenuState.FLASH_AUTO_OR_MANUAL, "invalid -> stays in FLASH_AUTO_OR_MANUAL")
 
 
 # ============================================================================
@@ -257,7 +258,8 @@ states_and_methods = [
     (MenuState.FLASH_AUTO_OR_MANUAL, "menu_flash_auto_or_manual"),
     (MenuState.NETWORK_AUTO_CONFIG,  "menu_network_auto_config"),
     (MenuState.NETWORK_FLASHING,     "menu_network_flashing"),
-    (MenuState.RECOVERY_FLOW,        "menu_recovery_flow"),
+    (MenuState.UPDATE_EMMC,          "menu_update_emmc"),
+    (MenuState.UPDATE_NOR,           "menu_update_nor"),
     (MenuState.DONE,                 "menu_done"),
     (MenuState.CLI_CONSOLE,          "menu_cli_console"),
     (MenuState.DEVICE_STATS,         "device_stats"),
@@ -273,7 +275,7 @@ for state, method_name in states_and_methods:
             app.run()
         except (KeyboardInterrupt, SystemExit):
             pass
-    check(f"run() dispatches {state.value} → {method_name}()", mock_method.called)
+    check(f"run() dispatches {state.value} -> {method_name}()", mock_method.called)
 
 
 # ============================================================================

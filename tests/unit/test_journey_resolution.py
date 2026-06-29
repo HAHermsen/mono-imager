@@ -61,7 +61,7 @@ EXPECTED = {
     ("OPNsense", "usb"): [
         "Confirm DIP switch is RIGHT (NOR)",
         "Mount USB stick",
-        "Verify firmware file on USB",
+        "Detect firmware file on USB",
         "Flash OPNsense image (bzip2 | dd)",
         "Unmount USB stick",
         "Detect device MAC address",
@@ -72,13 +72,19 @@ EXPECTED = {
         "Network setup (eth0)",
         "Start HTTP server",
         "Verify firmware reachable",
+        "Partition eMMC (fdisk)",
         "Flash OpenWRT image (dd)",
+        "Firmware update (eMMC bootloader)",
+        "Prepare eMMC boot config",
         "Reboot device",
     ],
     ("OpenWRT", "usb"): [
+        "Partition eMMC (fdisk)",
         "Mount USB stick",
-        "Verify firmware file on USB",
+        "Detect firmware file on USB",
         "Flash OpenWRT image (dd)",
+        "Firmware update (eMMC bootloader)",
+        "Prepare eMMC boot config",
         "Unmount USB stick",
         "Reboot device",
     ],
@@ -92,8 +98,8 @@ EXPECTED = {
     ],
     ("Armbian", "usb"): [
         "Mount USB stick",
-        "Verify firmware file on USB",
-        "Flash Armbian image (dd bs=1M)",
+        "Detect firmware file on USB",
+        "Flash Armbian image",
         "Unmount USB stick",
         "Reboot device",
     ],
@@ -180,7 +186,7 @@ print("Transfer isolation — lan vs USB steps")
 print("=" * 60)
 
 LAN_ONLY = ["Network setup (eth0)", "Start HTTP server", "Verify firmware reachable"]
-USB_ONLY = ["Mount USB stick", "Verify firmware file on USB", "Unmount USB stick"]
+USB_ONLY = ["Mount USB stick", "Detect firmware file on USB", "Unmount USB stick"]
 
 for os_name in SUPPORTED_OS:
     usb_steps = list_journey(os_name, "usb")

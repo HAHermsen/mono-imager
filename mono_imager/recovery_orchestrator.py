@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: 0.9.5
+Version: v.0.9.9 RC1
 License: MIT
 """
 
@@ -80,15 +80,14 @@ LEGACY_NOR_URL  = "https://firmware.mono.si/firmware-qspi-gateway-dk.bin"
 def detect_modern_firmware_tool(d: SerialDevice) -> Optional[bool]:
     """
     Live-detect whether the device's CURRENT recovery Linux has the
-    modern `firmware` command, via `which firmware` — there is no
-    published firmware-version cutoff to gate on (checked the docs;
-    none exists), so this must be checked live, per device, every
-    time.
+    modern `firmware` command AND the kernel cmdline contains
+    boot_medium= (set by U-Boot at boot, required by the tool to know
+    which flash target to update). Both must be true for the modern
+    path to work — old U-Boot versions omit boot_medium= and the
+    command exits immediately with ERROR, making the modern path useless.
 
-    Returns True if found, False if confirmed absent, None if the
-    check itself failed (e.g. command didn't return cleanly) — None
-    is NOT the same as False, and callers should treat it as
-    "couldn't determine" rather than assuming legacy.
+    Returns True if both conditions are met, False if either is absent,
+    None if the detection itself failed (treat as "couldn't determine").
     """
     try:
         output = d.run_script("which firmware; echo RC=$?", marker="detect_fw_tool")
@@ -96,11 +95,28 @@ def detect_modern_firmware_tool(d: SerialDevice) -> Optional[bool]:
         logger.warning(f"detect_modern_firmware_tool: run_script failed: {e}")
         return None
 
-    if "RC=0" in output and "firmware" in output:
-        return True
-    if "RC=" in output:
+    if "RC=" not in output:
+        return None
+    if "RC=0" not in output or "firmware" not in output:
         return False
-    return None
+
+    # Command exists — also verify boot_medium= is in /proc/cmdline.
+    # U-Boot must pass this for `firmware update` to detect the target;
+    # without it the command prints "ERROR: Cannot detect boot medium"
+    # and exits immediately (confirmed on real hardware with old U-Boot).
+    try:
+        cmdline = d.run_script("cat /proc/cmdline", marker="check_cmdline", exec_timeout=5)
+    except RuntimeError:
+        cmdline = ""
+
+    if "boot_medium=" not in cmdline:
+        logger.info(
+            "'firmware' command present but boot_medium= absent from kernel cmdline "
+            "(old U-Boot) — falling back to legacy path"
+        )
+        return False
+
+    return True
 
 
 def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
@@ -352,19 +368,26 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
         logger.warning(f"run_firmware_update: could not verify exit code: {e}")
         rc_output = ""
 
-    # BUG FIXED: RC=0 alone isn't a reliable success signal here —
-    # confirmed on real hardware that the tool can print "Aborted."
-    # (self-abort on its own confirmation prompt) and still exit 0.
-    # Treat "Aborted" anywhere in the streamed output as a hard
-    # failure regardless of what the exit code says.
-    aborted = "Aborted" in output
-    success = ("RC=0" in rc_output) and not aborted
+    # RC=0 alone isn't a reliable success signal:
+    #   • "Aborted." — self-abort on confirmation prompt, exits 0.
+    #   • "ERROR:"   — e.g. "Cannot detect boot medium" when old U-Boot
+    #                  omits boot_medium= from the kernel cmdline; also exits 0.
+    # Both are treated as hard failures regardless of exit code.
+    aborted      = "Aborted" in output
+    error_output = "ERROR:" in output
+    success = ("RC=0" in rc_output) and not aborted and not error_output
     logger.info(f"firmware update — full streamed output:\n{output}")
     if aborted:
         logger.error(
             "firmware update printed 'Aborted.' — the confirmation prompt "
             "was not answered in time, nothing was flashed, regardless of "
             "the reported exit code."
+        )
+    elif error_output:
+        logger.error(
+            "firmware update printed 'ERROR:' — it failed before doing "
+            "anything (likely old U-Boot without boot_medium= on kernel "
+            "cmdline). Legacy curl+dd fallback will be used instead."
         )
     elif not success:
         logger.error(

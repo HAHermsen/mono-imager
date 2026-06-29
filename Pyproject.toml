@@ -17,6 +17,9 @@ dependencies = [
     "icmplib>=3.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["mono_imager*"]
+
 [tool.setuptools.dynamic]
 version = {attr = "mono_imager.__version__"}
 

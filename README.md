@@ -93,7 +93,15 @@ OPNsense requires two DIP switch flips during installation. The tool pauses and 
 
 ### USB stick preparation
 
-Name the firmware file `firmware.img` and place it at the root of a FAT32 formatted USB stick. The tool mounts and verifies it automatically.
+Place the firmware image at the root of a FAT32 formatted USB stick. The tool auto-detects it by filename pattern — no renaming needed:
+
+| OS | Accepted filenames |
+|----|--------------------|
+| Armbian | `Armbian_*.img.xz`, `Armbian_*.img` |
+| OpenWRT | `openwrt-*.bin.gz`, `openwrt-*.bin`, `openwrt-*.img` |
+| OPNsense | `OPNsense-*.img.bz2`, `OPNsense-*.img` |
+
+Matching is case-insensitive. A **16 GB minimum** stick is recommended to cache all three OS images simultaneously.
 
 ---
 
@@ -101,14 +109,14 @@ Name the firmware file `firmware.img` and place it at the root of a FAT32 format
 
 | OS | Transfer | Steps |
 |----|----------|-------|
-| OPNsense | HTTP server | 10 |
-| OPNsense | USB stick | 10 |
-| OpenWRT | HTTP server | 5 |
-| OpenWRT | USB stick | 5 |
-| Armbian | HTTP server | 5 |
+| OPNsense | LAN (HTTP server) | 8 |
+| OPNsense | USB stick | 8 |
+| OpenWRT | LAN (HTTP server) | 8 |
+| OpenWRT | USB stick | 8 |
+| Armbian | LAN (HTTP server) | 6 |
 | Armbian | USB stick | 5 |
 
-See [JOURNEYS.md](JOURNEYS.md) for how to add new OS support or transfer methods.
+See [mono_imager/journeys/JOURNEYS.md](mono_imager/journeys/JOURNEYS.md) for how to add new OS support or transfer methods.
 
 ---
 
@@ -116,15 +124,24 @@ See [JOURNEYS.md](JOURNEYS.md) for how to add new OS support or transfer methods
 
 ```
 mono_imager/
+├── cli.py                    # Entry point
 ├── tui.py                    # Menu-driven CLI
-├── step_registry.py          # @register_step decorator, FlowRunner, StepContext
-├── journey_steps.py          # All flash journey steps — edit this to add journeys
 ├── flash_orchestrator.py     # Bootstrap, HTTP server, logging, result tracking
 ├── recovery_orchestrator.py  # Firmware update flow (separate from flash journeys)
+├── step_registry.py          # @register_step decorator, FlowRunner, StepContext
 ├── serial_device.py          # Serial comms layer
 ├── config.py                 # Port detection, config persistence
 ├── spinner.py                # Terminal progress spinner
-└── cli.py                    # Entry point
+├── logging_setup.py          # Logging initialisation
+└── journeys/                 # Flash journey files — one file per OS/transfer pair
+    ├── __init__.py           # Auto-discovery, get_journey(), flash targets
+    ├── armbian_lan.py
+    ├── armbian_usb.py
+    ├── openwrt_lan.py
+    ├── openwrt_usb.py
+    ├── opnsense_lan.py
+    ├── opnsense_usb.py
+    └── usb_utils.py          # Shared USB file detection helpers
 ```
 
 ---
@@ -139,7 +156,19 @@ mono_imager/
 
 **OPNsense auth error (401)** — The MAC address provided does not match the firmware server's records. Check the label on the device or the U-Boot output for the correct MAC.
 
-**Flash takes a long time** — Normal. OPNsense images are ~5GB and transfer at ~2–3 MB/s over a local HTTP connection.
+**Flash takes a long time** — Normal. OPNsense LAN flash typically completes in ~5–6 minutes over a local gigabit connection.
+
+**Need full serial trace output** — Set `MONO_DEBUG=1` before launching to restore verbose console output including all serial commands sent and received:
+
+```bash
+# Windows
+set MONO_DEBUG=1 && mono-imager
+
+# macOS / Linux
+MONO_DEBUG=1 mono-imager
+```
+
+All serial I/O is always written to the log file regardless of this setting.
 
 For more help, open an issue on GitHub or join the [Mono Discord](https://discord.gg/mono).
 
@@ -159,7 +188,7 @@ for i, label in enumerate(list_journey("OPNsense", "usb"), 1):
     print(f"  {i}. {label}")
 ```
 
-See [JOURNEYS.md](JOURNEYS.md) for the full guide to adding journeys.
+See [mono_imager/journeys/JOURNEYS.md](mono_imager/journeys/JOURNEYS.md) for the full guide to adding journeys.
 
 ---
 

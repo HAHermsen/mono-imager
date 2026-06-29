@@ -1,4 +1,4 @@
-"""
+﻿"""
 mono-imager journey: OPNsense via LAN
 
 Steps:
@@ -9,18 +9,18 @@ Steps:
   5. Flash OPNsense image (curl | bzip2 -dck | dd bs=1M)
   6. Detect device MAC address
   7. Re-image eMMC firmware (firmware update)
-  8. DIP flip to eMMC + power cycle
+  8. Reboot into OPNsense (DIP stays RIGHT / NOR)
 
 Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "0.9.5"
+__version__ = "v.0.9.9 RC1"
 __author__  = "H.A. Hermsen"
 
 import logging
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
-from mono_imager.spinner import with_spinner
+from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
 
 logger = logging.getLogger(__name__)
@@ -51,9 +51,14 @@ def _uboot_steps_opnsense_lan(device) -> bool:
         verbose(f"✗ U-Boot env set failed: {e}", "error")
         return False
 
-    verbose("Erasing eMMC (OPNsense requirement)...")
+    print("  Erasing eMMC (OPNsense requirement)...")
     try:
-        response = device.send_command("mmc erase 0 3b48000", timeout=120)
+        response, _erase_err = with_spinner(
+            device.send_command, "mmc erase 0 3b48000", timeout=120,
+            message="Erasing eMMC (this takes ~60s)..."
+        )
+        if _erase_err:
+            raise _erase_err
         if "error" in response.lower():
             verbose(f"✗ eMMC erase failed: {response[-100:]}", "error")
             return False
@@ -86,7 +91,6 @@ def step_confirm_dip_nor(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["dip_confirmed_nor"], produces=["network_up"], label="Network setup (eth0)")
 def step_network_setup(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Network setup"); verbose("=" * 60)
     d = ctx.device
     try:
         d.send_command("ip link set eth0 up", timeout=10)
@@ -98,7 +102,6 @@ def step_network_setup(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["http_server_up"], label="Start HTTP server")
 def step_http_server_start(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
     try:
         server = start_http_server(ctx.host_ip, ctx.http_port, ctx.firmware_path)
         if server:
@@ -111,7 +114,6 @@ def step_http_server_start(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up", "http_server_up"], produces=["firmware_ready"], label="Verify firmware reachable")
 def step_firmware_reachable(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Verify firmware reachable"); verbose("=" * 60)
     url = f"http://{ctx.host_ip}:{ctx.http_port}/firmware.img"
     ctx.set("firmware_source", url)
     check_script = (
@@ -124,14 +126,13 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
         ctx.device.launch_script(check_script, marker="step06_reachable")
     except Exception as e:
         return step(0, f"Firmware reachable ({url})", False, str(e))
-    check = wait_for_report("06", timeout=20.0)
+    check, _rep_err = with_spinner(wait_for_report, "06", timeout=20.0, message="Verifying firmware reachable...")
     ok = check is not None and "200" in check
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OPNsense image (bzip2 | dd)")
 def step_flash_opnsense(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Flash OPNsense image"); verbose("=" * 60)
     d = ctx.device
     source = ctx.get("firmware_source")
     # { } group captures stderr from curl, bzip2, and dd into one log file.
@@ -162,7 +163,6 @@ def step_flash_opnsense(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["device_mac_known"], label="Detect device MAC address")
 def step_detect_mac(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Detect device MAC address"); verbose("=" * 60)
     d = ctx.device
     try:
         result = d.run_script("cat /sys/class/net/eth0/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=5)
@@ -182,11 +182,11 @@ def step_detect_mac(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")
 def step_reimage_emmc_firmware(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Re-image eMMC firmware via 'firmware update'"); verbose("=" * 60)
     from mono_imager.recovery_orchestrator import run_firmware_update
     d = ctx.device
     try:
-        ok = run_firmware_update(d)
+        with Spinner("Re-imaging eMMC firmware (firmware update)..."):
+            ok = run_firmware_update(d)
         return step(0, "eMMC firmware re-image (firmware update)", ok)
     except Exception as e:
         return step(0, "eMMC firmware re-image (firmware update)", False, str(e))
@@ -194,7 +194,6 @@ def step_reimage_emmc_firmware(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_firmware_reimaged"], produces=["rebooted"], label="Reboot into OPNsense")
 def step_reboot(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Reboot into OPNsense"); verbose("=" * 60)
     console_logger.info("")
     console_logger.info("✓ Rebooting — U-Boot will boot OPNsense from eMMC automatically.")
     console_logger.info("  DIP stays RIGHT (NOR). No action needed.")

@@ -1,5 +1,7 @@
-"""
+﻿"""
 mono-imager journey: Armbian via LAN
+
+DIP switch: RIGHT (NOR) throughout — NOR U-Boot loads Armbian from eMMC via extlinux.
 
 Steps:
   1. Network setup (eth0)
@@ -13,12 +15,12 @@ Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "0.9.5"
+__version__ = "v.0.9.9 RC1"
 __author__  = "H.A. Hermsen"
 
 import logging
 from mono_imager.step_registry import register_step, StepContext
-from mono_imager.spinner import with_spinner
+from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,6 @@ TRANSFER     = "lan"
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["network_up"], label="Network setup (eth0)")
 def step_network_setup(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Network setup"); verbose("=" * 60)
     d = ctx.device
     try:
         d.send_command("ip link set eth0 up", timeout=10)
@@ -42,7 +43,6 @@ def step_network_setup(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["http_server_up"], label="Start HTTP server")
 def step_http_server_start(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
     try:
         server = start_http_server(ctx.host_ip, ctx.http_port, ctx.firmware_path)
         if server:
@@ -55,7 +55,6 @@ def step_http_server_start(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up", "http_server_up"], produces=["firmware_ready"], label="Verify firmware reachable")
 def step_firmware_reachable(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Verify firmware reachable"); verbose("=" * 60)
     url = f"http://{ctx.host_ip}:{ctx.http_port}/firmware.img"
     ctx.set("firmware_source", url)
     check_script = (
@@ -68,14 +67,13 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
         ctx.device.launch_script(check_script, marker="step06_reachable")
     except Exception as e:
         return step(0, f"Firmware reachable ({url})", False, str(e))
-    check = wait_for_report("06", timeout=20.0)
+    check, _rep_err = with_spinner(wait_for_report, "06", timeout=20.0, message="Verifying firmware reachable...")
     ok = check is not None and "200" in check
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash Armbian image (dd bs=1M)")
 def step_flash_armbian(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Flash Armbian image"); verbose("=" * 60)
     d = ctx.device
     source = ctx.get("firmware_source")
     # launch_script + wait_for_report (not run_script): serial readback after a long
@@ -124,9 +122,8 @@ def step_flash_armbian(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["reboot_triggered"], label="Reboot to U-Boot")
 def step_reboot_to_uboot(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Reboot to U-Boot"); verbose("=" * 60)
     try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
+        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=1)
         console_logger.info("  Rebooting — waiting for U-Boot autoboot...")
     except Exception as e:
         verbose(f"⚠ Reboot warning: {e}", "warning")
@@ -145,10 +142,9 @@ def step_configure_uboot(ctx: StepContext) -> bool:
       saveenv
     Source: https://opnsense.mono.si/experimental/
     """
-    verbose("=" * 60); verbose("Configure U-Boot for Armbian"); verbose("=" * 60)
     d = ctx.device
-    console_logger.info("  Waiting for U-Boot autoboot countdown (up to 90s)...")
-    if not d.wait_for_autoboot(timeout=90):
+    interrupted, _ab_err = with_spinner(d.wait_for_autoboot, timeout=90, message="Waiting for U-Boot autoboot (up to 90s)...")
+    if _ab_err or not interrupted:
         return step(0, "U-Boot interrupt", False, "autoboot message not seen within 90s")
     try:
         d.send_command(

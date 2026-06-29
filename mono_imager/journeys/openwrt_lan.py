@@ -26,7 +26,7 @@ Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "0.9.5"
+__version__ = "v.0.9.9 RC1"
 __author__  = "H.A. Hermsen"
 
 import gzip
@@ -39,7 +39,7 @@ import tempfile
 from pathlib import Path
 
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
-from mono_imager.spinner import with_spinner
+from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
 
     If all candidates fail, the step fails with instructions for manual repair.
     """
-    verbose("Checking U-Boot 'recovery' variable...")
+    print("  Checking U-Boot 'recovery' variable...")
 
     # Fast path: recovery already present (normal case on any clean device).
     # If 'recovery' uses 'sf read', also validate the kernel size at that
@@ -135,6 +135,16 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 recovery_confirmed = True
 
             if recovery_confirmed:
+                device.send_command(
+                    'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
+                    timeout=10
+                )
+                # Re-persist decompression vars — something (firmware update?) can wipe them
+                # between runs, causing the next run to fall through to the slow NOR scan.
+                device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
+                device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
+                device.send_command("saveenv", timeout=15)
+                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
                 return step(0, "U-Boot 'recovery' variable confirmed present", True)
     except Exception as e:
         verbose(f"  printenv recovery: {e}", "warning")
@@ -142,7 +152,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     # 'recovery' is missing — attempt NOR backup env restoration.
     # Primary env is typically at 0x300000; redundant slot is at primary+size.
     # Try both 128KB (0x20000) and 64KB (0x10000) size variants.
-    verbose("  'recovery' not found — attempting restore from NOR backup env...")
+    print("  'recovery' not found — attempting restore from NOR backup env...")
     CANDIDATES = [
         ("0x320000", "0x20000"),   # primary=0x300000 size=128KB
         ("0x310000", "0x10000"),   # primary=0x300000 size=64KB
@@ -168,6 +178,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                     timeout=10
                 )
                 device.send_command("saveenv", timeout=15)
+                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
                 return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
         except Exception as e:
             verbose(f"  Candidate {offset} failed: {e}", "debug")
@@ -182,7 +193,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     # booti command.  Also try external-FIT (bootm) as fallback in the
     # same 'recovery' variable so U-Boot tries both automatically.
     # Only print lines when something non-trivial is found.
-    verbose("  NOR backup env unavailable — scanning NOR for recovery kernel...")
+    print(f"  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
 
     FIT_MAGIC  = "d0 0d fe ed"
     UIMG_MAGIC = "27 05 19 56"
@@ -192,7 +203,6 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     LOAD_SZ    = "0x2000000"    # 32 MB — comfortably covers any recovery image
 
     KERNEL_OFFSETS = [f"0x{off:x}" for off in range(0x400000, 0x3C00000, 0x100000)]
-    verbose(f"  Scanning {len(KERNEL_OFFSETS)} 1MB offsets across 4–60 MB of NOR...")
 
     try:
         device.send_command("sf probe 0", timeout=10)
@@ -203,91 +213,84 @@ def _uboot_steps_openwrt_lan(device) -> bool:
 
     dtb_offset = None   # first small FDT found (potential DTB or ext-FIT header)
 
-    for koffset in KERNEL_OFFSETS:
-        try:
-            device.send_command(f"sf read {LOAD_ADDR} {koffset} 0x100", timeout=15)
-            magic_out = device.send_command(f"md.b {LOAD_ADDR} 4", timeout=5)
+    with Spinner(f"Scanning NOR ({len(KERNEL_OFFSETS)} offsets)..."):
+        for koffset in KERNEL_OFFSETS:
+            try:
+                device.send_command(f"sf read {LOAD_ADDR} {koffset} 0x100", timeout=15)
+                magic_out = device.send_command(f"md.b {LOAD_ADDR} 4", timeout=5)
 
-            # ── Large standalone FIT (kernel+initrd inline) ──────────────
-            if FIT_MAGIC in magic_out:
-                size_out = device.send_command("md.b 0x82000004 4", timeout=5)
-                try:
-                    hex_b = size_out.split(":")[-1].strip().split()[:4]
-                    fit_size = (int(hex_b[0], 16) << 24 | int(hex_b[1], 16) << 16 |
-                                int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
-                except (ValueError, IndexError):
-                    fit_size = 0
+                # ── Large standalone FIT (kernel+initrd inline) ──────────────
+                if FIT_MAGIC in magic_out:
+                    size_out = device.send_command("md.b 0x82000004 4", timeout=5)
+                    try:
+                        hex_b = size_out.split(":")[-1].strip().split()[:4]
+                        fit_size = (int(hex_b[0], 16) << 24 | int(hex_b[1], 16) << 16 |
+                                    int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
+                    except (ValueError, IndexError):
+                        fit_size = 0
 
-                if fit_size >= 5 * 1024 * 1024:
-                    verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size/1024/1024:.1f} MB)")
+                    if fit_size >= 5 * 1024 * 1024:
+                        verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size/1024/1024:.1f} MB)")
+                        recovery_cmd = (
+                            f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
+                            f"bootm {LOAD_ADDR}"
+                        )
+                        # fall through to save & return below
+                    else:
+                        # Small FDT: either raw DTB or external-FIT header —
+                        # remember it in case we find the kernel (gzip) later.
+                        verbose(f"  DTB/ext-FIT at {koffset} ({fit_size/1024:.1f} KB) — noted")
+                        if dtb_offset is None:
+                            dtb_offset = koffset
+                        continue
+
+                # ── Legacy uImage ─────────────────────────────────────────────
+                elif UIMG_MAGIC in magic_out:
+                    verbose(f"  ✓ uImage at {koffset}")
                     recovery_cmd = (
                         f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
                         f"bootm {LOAD_ADDR}"
                     )
-                    # fall through to save & return below
-                else:
-                    # Small FDT: either raw DTB or external-FIT header —
-                    # remember it in case we find the kernel (gzip) later.
-                    verbose(f"  DTB/ext-FIT at {koffset} ({fit_size/1024:.1f} KB) — noted")
-                    if dtb_offset is None:
-                        dtb_offset = koffset
-                    continue
 
-            # ── Legacy uImage ─────────────────────────────────────────────
-            elif UIMG_MAGIC in magic_out:
-                verbose(f"  ✓ uImage at {koffset}")
-                recovery_cmd = (
-                    f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                    f"bootm {LOAD_ADDR}"
+                # ── Gzip compressed ARM64 Image.gz ───────────────────────────
+                elif GZIP_MAGIC in magic_out:
+                    verbose(f"  ✓ Gzip kernel at {koffset}")
+                    if dtb_offset:
+                        recovery_cmd = (
+                            f"sf probe 0;"
+                            f"sf read {DTB_ADDR} {dtb_offset} 0x20000;"
+                            f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
+                            f"booti {LOAD_ADDR} - {DTB_ADDR}"
+                        )
+                        device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
+                        device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
+                    else:
+                        recovery_cmd = (
+                            f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
+                            f"booti {LOAD_ADDR}"
+                        )
+                        device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
+                        device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
+
+                else:
+                    continue  # no interesting magic at this offset
+
+                device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=10)
+                device.send_command(
+                    'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
+                    timeout=10
+                )
+                device.send_command("saveenv", timeout=15)
+                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
+                return step(
+                    0,
+                    f"U-Boot 'recovery' reconstructed — NOR {koffset}",
+                    True
                 )
 
-            # ── Gzip compressed ARM64 Image.gz ───────────────────────────
-            elif GZIP_MAGIC in magic_out:
-                verbose(f"  ✓ Gzip kernel at {koffset}")
-                if dtb_offset:
-                    # The LS1046A uses booti (AArch64 Image.gz) + separate DTB.
-                    # Also embed an external-FIT attempt first so U-Boot tries
-                    # AArch64 booti path: load DTB + gzip kernel separately.
-                    # kernel_comp_addr_r / kernel_comp_size tell U-Boot where
-                    # to decompress Image.gz; wiped by env default -a so we
-                    # set them permanently alongside the recovery command.
-                    recovery_cmd = (
-                        f"sf probe 0;"
-                        f"sf read {DTB_ADDR} {dtb_offset} 0x20000;"
-                        f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                        f"booti {LOAD_ADDR} - {DTB_ADDR}"
-                    )
-                    # Save decompression workspace vars to NOR so they
-                    # survive future reboots.
-                    device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
-                    device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
-                    device.send_command("setenv fdt_high 0xffffffffffffffff", timeout=5)
-                else:
-                    recovery_cmd = (
-                        f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                        f"booti {LOAD_ADDR}"
-                    )
-                    device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
-                    device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
-
-            else:
-                continue  # no interesting magic at this offset
-
-            device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=10)
-            device.send_command(
-                'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
-                timeout=10
-            )
-            device.send_command("saveenv", timeout=15)
-            return step(
-                0,
-                f"U-Boot 'recovery' reconstructed — NOR {koffset}",
-                True
-            )
-
-        except Exception as e:
-            verbose(f"  Probe at {koffset} failed: {e}", "debug")
-            continue
+            except Exception as e:
+                verbose(f"  Probe at {koffset} failed: {e}", "debug")
+                continue
 
     verbose("  ✗ No recovery kernel found anywhere in NOR flash", "error")
     verbose("  Manual fix: on a working device run 'printenv recovery' then", "error")
@@ -332,7 +335,14 @@ def _extract_sysupgrade_rootfs(firmware_path: Path) -> tuple[Path, bool]:
                     suffix=".ext4", delete=False,
                     dir=firmware_path.parent,
                 )
-                shutil.copyfileobj(f, tmp)
+                data = f.read()
+                if data[:2] == b'\x1f\x8b':
+                    # root member is gzip-compressed (LS1046A sysupgrade format:
+                    # gzip(tar(kernel, root_gz)) — the ext4 is compressed inside the tar)
+                    with gzip.open(io.BytesIO(data)) as gz:
+                        shutil.copyfileobj(gz, tmp)
+                else:
+                    tmp.write(data)
                 tmp.close()
                 return Path(tmp.name)
         return None
@@ -407,7 +417,7 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
         ctx.device.launch_script(check_script, marker="step06_reachable")
     except Exception as e:
         return step(0, f"Firmware reachable ({url})", False, str(e))
-    check = wait_for_report("06", timeout=20.0)
+    check, _rep_err = with_spinner(wait_for_report, "06", timeout=20.0, message="Verifying firmware reachable...")
     ok = check is not None and "200" in check
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
 
@@ -422,10 +432,14 @@ def step_partition_emmc(ctx: StepContext) -> bool:
     d = ctx.device
     base = re.sub(r'p\d+$', '', ctx.flash_target)  # /dev/mmcblk0p1 → /dev/mmcblk0
     try:
-        response = d.send_command(
+        response, _fdisk_err = with_spinner(
+            d.send_command,
             f"printf 'o\\nn\\np\\n\\n65536\\n\\nw\\n' | fdisk {base} 2>&1; echo RC=$?",
-            timeout=30
+            timeout=30,
+            message="Partitioning eMMC..."
         )
+        if _fdisk_err:
+            raise _fdisk_err
         ok = "RC=0" in response
         if ok:
             d.send_command(
@@ -535,10 +549,14 @@ def step_firmware_update(ctx: StepContext) -> bool:
                 "ip link set eth0 up 2>/dev/null; udhcpc -i eth0 -n -q 2>/dev/null || true",
                 timeout=25
             )
-        response = d.send_command(
+        response, _fw_err = with_spinner(
+            d.send_command,
             "printf 'yes\\n' | firmware update 2>&1; echo RC=$?",
-            timeout=120
+            timeout=120,
+            message="Updating eMMC bootloader (firmware update)..."
         )
+        if _fw_err:
+            raise _fw_err
         ok = "RC=0" in response
         return step(0, "Firmware update (eMMC bootloader)", ok,
                    response[-200:] if not ok else "")
@@ -570,9 +588,14 @@ def step_prepare_emmc_boot(ctx: StepContext) -> bool:
     MNT = "/mnt/mono_owrt"
     try:
         d.send_command(f"mkdir -p {MNT}", timeout=5)
-        mount_resp = d.send_command(
-            f"mount /dev/mmcblk0p1 {MNT} 2>&1; echo RC=$?", timeout=15
+        mount_resp, _mnt_err = with_spinner(
+            d.send_command,
+            f"mount -t ext4 /dev/mmcblk0p1 {MNT} 2>&1; echo RC=$?",
+            timeout=15,
+            message="Mounting eMMC partition..."
         )
+        if _mnt_err:
+            raise _mnt_err
         if "RC=0" not in mount_resp:
             verbose("  ⚠ Could not mount /dev/mmcblk0p1 — extlinux.conf not written", "warning")
             verbose("  If DIP=LEFT boot fails, at the U-Boot prompt run:", "warning")

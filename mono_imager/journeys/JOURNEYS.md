@@ -1,6 +1,6 @@
 # Adding Journeys to mono-imager
 
-mono-imager v0.9.5 uses a declarative step registry. You add journeys by writing decorated functions — no orchestrator rewrites, no hardcoded sequences, no dispatch tables to update.
+mono-imager uses a declarative step registry. You add journeys by writing decorated functions — no orchestrator rewrites, no hardcoded sequences, no dispatch tables to update.
 
 ---
 
@@ -9,7 +9,7 @@ mono-imager v0.9.5 uses a declarative step registry. You add journeys by writing
 Every flash journey is built from **steps**. Each step is a plain Python function decorated with `@register_step`, which declares:
 
 - **`os`** — which operating systems this step applies to
-- **`transfer`** — which transfer methods (`"network"`, `"usb"`) this step applies to
+- **`transfer`** — which transfer methods (`"lan"`, `"usb"`) this step applies to
 - **`requires`** — state keys that must exist before this step can run
 - **`produces`** — state keys this step marks as done on success
 
@@ -18,12 +18,12 @@ When a journey runs, `FlowRunner` filters the registry to steps matching the cho
 The resolved sequences for all current journeys:
 
 ```
-OPNsense + network   →  10 steps
-OPNsense + usb       →  10 steps
-OpenWRT  + network   →   5 steps
-OpenWRT  + usb       →   5 steps
-Armbian  + network   →   5 steps
-Armbian  + usb       →   5 steps
+OPNsense + lan   →  8 steps
+OPNsense + usb   →  8 steps
+OpenWRT  + lan   →  8 steps
+OpenWRT  + usb   →  8 steps
+Armbian  + lan   →  6 steps
+Armbian  + usb   →  5 steps
 ```
 
 You never write that sequence by hand. It falls out of the `requires`/`produces` declarations.
@@ -35,9 +35,19 @@ You never write that sequence by hand. It falls out of the `requires`/`produces`
 | File | Purpose |
 |------|---------|
 | `mono_imager/step_registry.py` | `@register_step` decorator, `StepContext`, `FlowRunner` |
-| `mono_imager/journey_steps.py` | All step implementations — the only file you edit |
+| `mono_imager/journeys/__init__.py` | Auto-discovery, `get_journey()`, `discovered_journeys()`, flash targets |
+| `mono_imager/journeys/<os>_<transfer>.py` | Step implementations — one file per OS/transfer pair |
+| `mono_imager/journeys/usb_utils.py` | Shared USB file detection helpers |
 
-Everything else (`flash_orchestrator.py`, `tui.py`, etc.) is infrastructure. You don't touch it when adding journeys.
+To add or modify journey steps, edit or create the appropriate `journeys/<os>_<transfer>.py` file. Everything else (`flash_orchestrator.py`, `tui.py`, etc.) is infrastructure you don't touch when adding journeys.
+
+Current journey files:
+- `journeys/armbian_lan.py`
+- `journeys/armbian_usb.py`
+- `journeys/openwrt_lan.py`
+- `journeys/openwrt_usb.py`
+- `journeys/opnsense_lan.py`
+- `journeys/opnsense_usb.py`
 
 ---
 
@@ -50,7 +60,7 @@ Every step function takes a single `StepContext` argument. It carries all runtim
 class StepContext:
     device:        SerialDevice   # connected serial device
     os_name:       str            # "OPNsense", "OpenWRT", "Armbian", ...
-    transfer:      str            # "network" | "usb"
+    transfer:      str            # "lan" | "usb"
 
     # Network journeys
     host_ip:       str            # host PC IP address
@@ -82,11 +92,11 @@ ctx.has("firmware_source")        # check — True if the key exists
 
 ## Adding a new OS
 
-Say you want to add **VyOS** with both network and USB support.
+Say you want to add **VyOS** with both LAN and USB support.
 
 VyOS flashes to the whole eMMC (`/dev/mmcblk0`) and reboots — identical to Armbian. So you need zero new steps. Just:
 
-**Step 1: Add the flash target** in `journey_steps.py`:
+**Step 1: Add the flash target** in `journeys/__init__.py`:
 
 ```python
 _FLASH_TARGETS = {
@@ -95,150 +105,55 @@ _FLASH_TARGETS = {
     "Armbian":  "/dev/mmcblk0",
     "VyOS":     "/dev/mmcblk0",   # ← add this
 }
-
-SUPPORTED_OS = list(_FLASH_TARGETS.keys())   # automatically includes VyOS
 ```
 
-**Step 2: Tag existing steps** with `"VyOS"` wherever they apply. For VyOS the reboot step is the only OS-specific one:
+**Step 2: Create journey files** `journeys/vyos_lan.py` and `journeys/vyos_usb.py`.
 
-```python
-@register_step(
-    os=["OpenWRT", "Armbian", "VyOS"],   # ← add VyOS here
-    transfer=[ALL_TRANSFER],
-    requires=["os_flashed"],
-    produces=["rebooted"],
-    label="Reboot device"
-)
-def step_reboot(ctx: StepContext) -> bool:
-    ...
-```
+Tag existing steps with `"VyOS"` wherever they apply, or import and re-register steps from an existing journey file (see `openwrt_usb.py` importing `_uboot_steps_openwrt_lan` from `openwrt_lan.py` as an example).
 
-Done. `FlowRunner` now builds correct 5-step journeys for `VyOS + network` and `VyOS + usb` automatically.
+Done. `FlowRunner` now builds correct journeys for `VyOS + lan` and `VyOS + usb` automatically.
 
 ---
 
 ## Adding a new transfer method
 
-Say you want to add **TFTP** as a transfer method alongside `network` and `usb`.
+Say you want to add **TFTP** as a transfer method alongside `lan` and `usb`.
 
-**Step 1: Add the sentinel** to `SUPPORTED_TRANSFER`:
-
-```python
-SUPPORTED_TRANSFER = ["network", "usb", "tftp"]
-```
-
-**Step 2: Add transfer-specific steps.** TFTP needs a step to configure the TFTP client on-device and fetch the image. Write two new steps:
+**Step 1: Add transfer-specific steps.** TFTP needs a step to fetch the image via TFTP. Create `journeys/<os>_tftp.py` with:
 
 ```python
 @register_step(
     os=[ALL_OS],
     transfer=["tftp"],
     requires=[],
-    produces=["tftp_ready"],
-    label="Configure TFTP client"
-)
-def step_tftp_setup(ctx: StepContext) -> bool:
-    d = ctx.device
-    try:
-        # Set server IP in busybox tftp syntax
-        response = d.send_command(
-            f"tftp -g -r firmware.img -l /tmp/firmware.img {ctx.host_ip} 2>&1; echo RC=$?",
-            timeout=120
-        )
-        ok = "RC=0" in response
-        if ok:
-            ctx.set("firmware_source", "/tmp/firmware.img")
-        return step(4, f"TFTP fetch from {ctx.host_ip}", ok,
-                   response[-100:] if not ok else "")
-    except Exception as e:
-        return step(4, "TFTP fetch", False, str(e))
-```
-
-Because `step_tftp_setup` produces `"firmware_source"` and the existing `step_flash_dd` requires `"firmware_ready"` — not `"firmware_source"` — you also need a small bridge step:
-
-```python
-@register_step(
-    os=[ALL_OS],
-    transfer=["tftp"],
-    requires=["tftp_ready"],
     produces=["firmware_ready"],
-    label="Verify TFTP image received"
+    label="Fetch firmware via TFTP"
 )
-def step_tftp_verify(ctx: StepContext) -> bool:
-    d = ctx.device
-    response = d.send_command(
-        "test -f /tmp/firmware.img && echo FOUND || echo MISSING", timeout=5
-    )
-    ok = "FOUND" in response
-    if ok:
-        ctx.set("firmware_source", "/tmp/firmware.img")
-    return step(5, "TFTP image present on device", ok)
-```
-
-**Step 3: Add `"tftp"` to the reboot step** (and any other transfer-agnostic steps you want to include):
-
-```python
-@register_step(
-    os=["OpenWRT", "Armbian"],
-    transfer=[ALL_TRANSFER],   # ALL_TRANSFER already covers tftp
-    ...
-)
-def step_reboot(ctx: StepContext) -> bool:
+def step_tftp_fetch(ctx: StepContext) -> bool:
     ...
 ```
 
-Because `ALL_TRANSFER` is already used on most steps, they automatically apply to `"tftp"` journeys. You only need to add `"tftp"` explicitly on steps that currently list `["network"]` or `["usb"]` — like `step_network_setup`.
+**Step 2: Update `journeys/__init__.py`** to add `"tftp"` to the known transfer methods if you want it discoverable via `discovered_journeys()`.
 
 ---
 
 ## Adding a step to an existing journey
 
-Say OPNsense needs a **SHA256 checksum verification** step after flashing, before the firmware re-image.
+Say OPNsense needs a **SHA256 checksum verification** step after flashing.
 
 ```python
 @register_step(
     os=["OPNsense"],
-    transfer=[ALL_TRANSFER],
+    transfer=["lan", "usb"],
     requires=["os_flashed"],        # runs after flash completes
     produces=["flash_verified"],    # consumed by the next OPNsense step
     label="Verify flash SHA256"
 )
 def step_verify_sha256(ctx: StepContext) -> bool:
-    d = ctx.device
-    expected = ctx.get("expected_sha256")
-    if not expected:
-        verbose("⚠ No expected SHA256 in context — skipping verify", "warning")
-        return step(10, "SHA256 verify", True)   # non-fatal if not provided
-
-    response, err = with_spinner(
-        d.run_script,
-        f"sha256sum {ctx.flash_target} 2>&1",
-        marker="sha256", exec_timeout=120,
-        message="Verifying flash SHA256"
-    )
-    if err:
-        return step(10, "SHA256 verify", False, str(err))
-
-    ok = expected.lower() in response.lower()
-    return step(10, "SHA256 matches expected", ok,
-               f"got: {response[:80]}" if not ok else "")
-```
-
-Then update `step_dip_to_nor` to require `"flash_verified"` instead of `"os_flashed"`:
-
-```python
-@register_step(
-    os=["OPNsense"],
-    transfer=[ALL_TRANSFER],
-    requires=["flash_verified"],    # ← was "os_flashed"
-    produces=["dip_at_nor"],
-    label="DIP flip to NOR + power cycle"
-)
-def step_dip_to_nor(ctx: StepContext) -> bool:
     ...
 ```
 
-`FlowRunner` now inserts the verify step between flash and DIP flip automatically. No other files change.
+Then update the step that previously required `"os_flashed"` to require `"flash_verified"` instead. `FlowRunner` inserts the verify step automatically. No other files change.
 
 ---
 
@@ -253,7 +168,7 @@ class StepContext:
     sha256_hash: str = ""    # ← add this
 ```
 
-Then pass it from `get_journey()` in `journey_steps.py`:
+Then pass it from `get_journey()` in `journeys/__init__.py`:
 
 ```python
 def get_journey(
@@ -283,16 +198,14 @@ for i, label in enumerate(steps, 1):
 
 Output:
 ```
-  1. Mount USB stick
-  2. Verify firmware file on USB
-  3. Erase eMMC (OPNsense requirement)
-  4. Flash OS image (dd)
+  1. Confirm DIP switch is RIGHT (NOR)
+  2. Mount USB stick
+  3. Detect firmware file on USB
+  4. Flash OPNsense image (bzip2 | dd)
   5. Unmount USB stick
   6. Detect device MAC address
-  7. DIP flip to NOR + power cycle
-  8. Confirm NOR recovery boot
-  9. Re-image eMMC firmware (first 32MB)
-  10. DIP flip to eMMC + power cycle
+  7. Re-image eMMC firmware (firmware update)
+  8. Reboot into OPNsense
 ```
 
 ---
@@ -300,18 +213,16 @@ Output:
 ## Checklist for common tasks
 
 **New OS, same flash behaviour as existing OS:**
-- Add flash target to `_FLASH_TARGETS`
-- Add OS name to `SUPPORTED_OS` (automatic if using `list(_FLASH_TARGETS.keys())`)
-- Add new OS name to `os=` list on each applicable step
+- Add flash target to `_FLASH_TARGETS` in `journeys/__init__.py`
+- Create `journeys/<os>_lan.py` and `journeys/<os>_usb.py`
+- Tag or import steps that apply to the new OS
 
 **New OS, unique post-flash step:**
 - All of the above, plus write one new `@register_step` function with `os=["NewOS"]`
 
 **New transfer method:**
-- Add to `SUPPORTED_TRANSFER`
+- Create `journeys/<os>_<transfer>.py` for each OS
 - Write transfer-specific steps (mount/fetch/verify equivalent)
-- Tag steps that use `ALL_TRANSFER` — they apply automatically
-- Tag steps that list specific methods explicitly
 
 **New step in existing journey:**
 - Write `@register_step` with the right `os=`, `transfer=`, `requires=`, `produces=`
@@ -319,7 +230,7 @@ Output:
 
 **New runtime data:**
 - Add field to `StepContext` in `step_registry.py`
-- Pass it from `get_journey()` in `journey_steps.py`
+- Pass it from `get_journey()` in `journeys/__init__.py`
 
 ---
 
@@ -333,4 +244,4 @@ When adding journeys, you never need to edit:
 - `serial_device.py` — serial comms layer
 - `step_registry.py` — only touch this to add fields to `StepContext`
 
-All journey logic lives in `journey_steps.py`.
+All journey logic lives in the per-OS/transfer files under `journeys/`.

@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: 0.9.5
+Version: v.0.9.9 RC1
 License: MIT
 """
 
@@ -93,8 +93,10 @@ def _try_encode_braille() -> bool:
 _COLOR_SUPPORTED = _try_enable_windows_vt_processing()
 _BRAILLE_SUPPORTED = _try_encode_braille()
 
-_GREEN = "\x1b[32m" if _COLOR_SUPPORTED else ""
-_RESET = "\x1b[0m" if _COLOR_SUPPORTED else ""
+_GREEN       = "\x1b[32m"  if _COLOR_SUPPORTED else ""
+_RESET       = "\x1b[0m"   if _COLOR_SUPPORTED else ""
+_HIDE_CURSOR = "\x1b[?25l" if _COLOR_SUPPORTED else ""
+_SHOW_CURSOR = "\x1b[?25h" if _COLOR_SUPPORTED else ""
 
 
 class Spinner:
@@ -121,8 +123,12 @@ class Spinner:
         self.message = message
         self._stop = threading.Event()
         self._thread = None
+        self._started = None
 
     def __enter__(self):
+        self._started = time.monotonic()
+        sys.stdout.write(_HIDE_CURSOR)
+        sys.stdout.flush()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         return self
@@ -131,15 +137,24 @@ class Spinner:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=1)
-        # Clear the spinner line
-        sys.stdout.write("\r" + " " * (len(self.message) + 4) + "\r")
+        elapsed = self._elapsed_str()
+        sys.stdout.write("\r" + " " * (len(self.message) + len(elapsed) + 8) + "\r")
+        sys.stdout.write(_SHOW_CURSOR)
         sys.stdout.flush()
+
+    def _elapsed_str(self) -> str:
+        if self._started is None:
+            return ""
+        secs = int(time.monotonic() - self._started)
+        m, s = divmod(secs, 60)
+        return f"{m}:{s:02d}"
 
     def _spin(self):
         i = 0
         while not self._stop.is_set():
-            frame = self.FRAMES[i % len(self.FRAMES)]
-            sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}")
+            frame   = self.FRAMES[i % len(self.FRAMES)]
+            elapsed = self._elapsed_str()
+            sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}  {elapsed}")
             sys.stdout.flush()
             i += 1
             time.sleep(0.15)

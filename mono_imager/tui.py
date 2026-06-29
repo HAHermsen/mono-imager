@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: 0.9.5
+Version: v.0.9.9 RC1
 License: MIT
 """
 
@@ -29,6 +29,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+from mono_imager.spinner import with_spinner, Spinner
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,8 @@ class MenuState(Enum):
     FLASH_AUTO_OR_MANUAL   = "flash_auto_or_manual"
     NETWORK_AUTO_CONFIG    = "network_auto_config"
     NETWORK_FLASHING      = "network_flashing"
-    RECOVERY_FLOW         = "recovery_flow"
+    UPDATE_EMMC            = "update_emmc"
+    UPDATE_NOR             = "update_nor"
     DONE                  = "done"
     CLI_CONSOLE           = "cli_console"
     DEVICE_STATS          = "device_stats"
@@ -430,9 +432,10 @@ class MonoImager:
         self.current_state = MenuState.MAIN
 
     def _show_firmware_output(self, chunk: str) -> None:
-        """Print a live firmware-update chunk and log it for post-mortem."""
-        print(chunk, end="", flush=True)
-        verbose(f"[firmware update output] {chunk!r}", "debug")
+        """Print live firmware-update output; log raw bytes to file for post-mortem."""
+        clean = re.sub(r'\x1b\[[0-9;:]*[mGKHF]', '', chunk)
+        print(clean, end="", flush=True)
+        logger.debug("[firmware update] %r", chunk)
 
     # ------------------------------------------------------------------ #
     #  1. MAIN MENU                                                        #
@@ -444,29 +447,32 @@ class MonoImager:
         print("What would you like to do?")
         print()
         print("  1) Flash OS")
-        print("  2) Update / Recover Firmware")
-        print("  3) CLI only (serial)")
-        print("  4) Test Serial connection")
-        print("  5) Test LAN connection")
-        print("  6) Show Device Stats")
-        print("  7) Exit")
+        print("  2) Update eMMC FW")
+        print("  3) Update NOR FW")
+        print("  4) CLI only (serial)")
+        print("  5) Test Serial connection")
+        print("  6) Test LAN connection")
+        print("  7) Show Device Stats")
+        print("  8) Exit")
         print()
 
-        choice = input("Select [1-7]: ").strip()
+        choice = input("Select [1-8]: ").strip()
 
         if choice == "1":
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
         elif choice == "2":
-            self.current_state = MenuState.RECOVERY_FLOW
+            self.current_state = MenuState.UPDATE_EMMC
         elif choice == "3":
-            self.current_state = MenuState.CLI_CONSOLE
+            self.current_state = MenuState.UPDATE_NOR
         elif choice == "4":
-            self.menu_test_serial()
+            self.current_state = MenuState.CLI_CONSOLE
         elif choice == "5":
-            self.menu_test_lan()
+            self.menu_test_serial()
         elif choice == "6":
-            self.current_state = MenuState.DEVICE_STATS
+            self.menu_test_lan()
         elif choice == "7":
+            self.current_state = MenuState.DEVICE_STATS
+        elif choice == "8":
             sys.exit(0)
         else:
             print("  Invalid selection.")
@@ -593,17 +599,25 @@ class MonoImager:
             input("  Press Enter once the cable is plugged in...")
 
         print()
-        from mono_imager.journeys import get_firmware_prompt
-        firmware_prompt = get_firmware_prompt(os_name, transfer)
-        firmware_raw = self.safe_input(f"  {firmware_prompt} ")
-        if firmware_raw is None:
-            return
-        firmware_path, error = self._validate_firmware_path(firmware_raw)
-        if error:
-            print(f"  ❌ {error}")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.NETWORK_AUTO_CONFIG
-            return
+        if transfer == "usb":
+            print("  Image will be auto-detected from USB stick.")
+            print(f"  Recommended: 16 GB minimum (holds all three OS images simultaneously).")
+            print()
+            firmware_path     = Path(".")
+            firmware_display  = "auto-detected from USB stick (16 GB min. recommended)"
+        else:
+            from mono_imager.journeys import get_firmware_prompt
+            firmware_prompt = get_firmware_prompt(os_name, transfer)
+            firmware_raw = self.safe_input(f"  {firmware_prompt} ")
+            if firmware_raw is None:
+                return
+            firmware_path, error = self._validate_firmware_path(firmware_raw)
+            if error:
+                print(f"  ❌ {error}")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.NETWORK_AUTO_CONFIG
+                return
+            firmware_display = str(firmware_path)
 
         host_ip = core.detect_host_ip()
         if not host_ip:
@@ -624,7 +638,7 @@ class MonoImager:
         confirmed = self._show_flash_confirmation(
             os_name=os_name,
             port=port,
-            firmware_path=firmware_path,
+            firmware_path=firmware_display,
             flash_target=flash_target,
             host_ip=host_ip,
             device_ip=device_ip,
@@ -668,6 +682,7 @@ class MonoImager:
         from mono_imager.step_registry import get_staging_boot_methods
 
         d = None
+        journey = None
         try:
             print()
             print("=" * 60)
@@ -685,6 +700,8 @@ class MonoImager:
 
             # Step 2: Journey-specific U-Boot commands (eMMC erase, bootcmd, etc.)
             # Delegated entirely to the journey file via run_uboot_steps()
+            print()
+            print("  Configuring U-Boot...")
             journey = get_journey(
                 os_name       = self.os_name,
                 transfer      = getattr(self, "transfer_method", "lan"),
@@ -716,8 +733,9 @@ class MonoImager:
             print("=" * 60)
             print("PHASE 2+: Flashing Firmware")
             print("=" * 60)
+            fw_display = "auto-detected from USB" if self.custom_fw_path == Path(".") else str(self.custom_fw_path)
             print(f"OS:          {self.os_name}")
-            print(f"Firmware:    {self.custom_fw_path}")
+            print(f"Firmware:    {fw_display}")
             print(f"Host IP:     {self.net_host_ip}:{self.net_http_port}")
             print(f"Device IP:   {self.net_device_ip}")
             print()
@@ -733,10 +751,18 @@ class MonoImager:
             print()
 
         finally:
-            # Stop HTTP server if one was started during the journey
             server = None
-            if d and hasattr(d, '_journey_ctx'):
-                server = getattr(d._journey_ctx, 'http_server', None)
+            if journey is not None:
+                try:
+                    server = journey.ctx.get("http_server")
+                except Exception:
+                    pass
+                try:
+                    extracted = journey.ctx.get("extracted_rootfs")
+                    if extracted:
+                        Path(extracted).unlink(missing_ok=True)
+                except Exception:
+                    pass
             if server:
                 server.shutdown()
                 core.verbose("HTTP server stopped")
@@ -747,11 +773,11 @@ class MonoImager:
         self.current_state = MenuState.DONE
 
     # ------------------------------------------------------------------ #
-    #  RECOVERY — Update / Recover Firmware. Guided (guardrailed)         #
-    #  semi-automated: device/firmware-type detection is automatic, but #
-    #  the physical DIP-switch flips pause for an explicit Enter rather #
-    #  than blindly polling immediately — the user stays in control of  #
-    #  timing while not needing to know modern-vs-legacy device details.#
+    #  UPDATE eMMC / NOR — split FW update journeys.                    #
+    #  eMMC journey: DIP RIGHT (NOR), flashes eMMC via firmware update. #
+    #  NOR journey:  DIP LEFT (eMMC), flashes NOR via firmware update.  #
+    #  Both detect modern vs. legacy automatically and fall back to      #
+    #  curl+dd / curl+flashcp when the modern tool is unavailable.       #
     # ------------------------------------------------------------------ #
     def _setup_recovery_network(self, d) -> bool:
         """
@@ -819,7 +845,13 @@ class MonoImager:
             return False
         
         try:
-            ip_output = d.run_script("sleep 2; ip link show eth0", marker="recovery_eth0_check", exec_timeout=10)
+            ip_output, _eth0_err = with_spinner(
+                d.run_script, "sleep 2; ip link show eth0",
+                marker="recovery_eth0_check", exec_timeout=10,
+                message="Checking eth0 carrier..."
+            )
+            if _eth0_err:
+                raise _eth0_err
             if 'LOWER_UP' not in ip_output:
                 print("  ❌ eth0 has no carrier.")
                 print("     Plug an Ethernet cable into the RIGHTMOST 1 Gig RJ-45 jack (not the SFP+ cages).")
@@ -850,7 +882,7 @@ class MonoImager:
             print("  ❌ Gateway is required.")
             return False
 
-        from mono_imager.spinner import with_spinner
+
 
         iface = "eth0"
         print(f"  Configuring {iface} = {device_ip}/{prefix}, gateway {gateway}...")
@@ -888,62 +920,42 @@ class MonoImager:
         print("     Check the gateway IP, cable, and network configuration.")
         return False
 
-    def menu_recovery_flow(self):
+    def menu_update_emmc(self):
         """
-        Run the documented modern recovery sequence (NOR -> flash eMMC
-        -> [DIP flip] -> eMMC -> flash NOR -> [DIP flip back]), or the
-        legacy curl-based sequence on older devices — detected live,
-        per device, via recovery_orchestrator.detect_modern_firmware_tool().
-
-        Reuses flash_orchestrator.phase1_bootstrap() for the initial
-        connect/interrupt/boot-recovery/login sequence (same proven
-        bootstrap used by the Flash OS path), then hands off to
-        recovery_orchestrator.py's phase_* functions, which already
-        do the actual device-talking and result tracking.
+        Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT).
+        The 'firmware update' command auto-targets eMMC when booted from NOR.
+        Falls back to legacy curl+dd if the modern tool is unavailable.
         """
         from mono_imager import flash_orchestrator as core
         from mono_imager import recovery_orchestrator as rec
 
         self.clear_screen()
         self.print_header()
-        print("Update / Recover Firmware")
-        print()
-        print("This walks you through recovering or refreshing your device's")
-        print("firmware, using the device's own 'firmware update' tool (or the")
-        print("legacy curl-based method on older devices, detected automatically).")
-        print("You'll be asked to flip the DIP switch and power-cycle the device")
-        print("at the right moments — nothing happens without your confirmation.")
+        print("Update eMMC Firmware")
         print()
         print("  ┌─────────────────────────────────────────────────┐")
         print("  │  START HERE: DIP switch → RIGHT (NOR)            │")
         print("  │                                                   │")
-        print("  │  This makes the board boot straight into         │")
-        print("  │  recovery on its own — you don't have to catch   │")
-        print("  │  the countdown or type anything.                 │")
+        print("  │  Booting from NOR recovery ensures 'firmware     │")
+        print("  │  update' targets eMMC automatically.             │")
         print("  │                                                   │")
-        print("  │  If your DIP is on LEFT (eMMC) right now, flip   │")
-        print("  │  it to RIGHT and power-cycle before continuing.  │")
+        print("  │  If DIP is LEFT (eMMC), flip it RIGHT and        │")
+        print("  │  power-cycle before continuing.                  │")
         print("  └─────────────────────────────────────────────────┘")
         print()
         print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  ETHERNET CABLE REQUIREMENT                      │")
-        print("  │                                                   │")
-        print("  │  Plug an Ethernet cable into the RIGHTMOST       │")
-        print("  │  1 Gig RJ-45 jack (not the SFP+ cages).          │")
-        print("  │                                                   │")
-        print("  │  The device needs internet access to download    │")
-        print("  │  firmware during the update process.             │")
+        print("  │  ETHERNET: RIGHTMOST 1 Gig RJ-45 jack           │")
+        print("  │  Device needs internet to download firmware.     │")
         print("  └─────────────────────────────────────────────────┘")
         print()
 
-        # --- Port selection ---
         port = self._select_port(allow_back=True, save_on_select=True)
         if port is None:
             self.current_state = MenuState.MAIN
             return
 
         print()
-        print("⚠️  This can write firmware to your device's NOR and/or eMMC.")
+        print("⚠️  This writes firmware to eMMC.")
         confirm = input("Proceed? [y/N]: ").strip().lower()
         if confirm != "y":
             print("  Cancelled.")
@@ -961,7 +973,12 @@ class MonoImager:
                 return
 
             rec.reset_results()
-            is_modern = rec.detect_modern_firmware_tool(d)
+            is_modern, _fw_err = with_spinner(
+                rec.detect_modern_firmware_tool, d,
+                message="Detecting firmware tool type..."
+            )
+            if _fw_err:
+                is_modern = None
 
             if is_modern is None:
                 print()
@@ -980,61 +997,139 @@ class MonoImager:
                 emmc_ok = rec.phase_modern_flash_emmc(d, on_output=self._show_firmware_output)
                 if not emmc_ok:
                     print()
-                    print("  ⚠ Modern 'firmware update' failed for eMMC — falling back")
-                    print("    to the legacy curl+dd method (same session, no reboot needed)...")
-                    emmc_ok = rec.phase_legacy_flash_emmc(d)
+                    print("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+dd...")
+                    emmc_ok, _leg_err = with_spinner(
+                        rec.phase_legacy_flash_emmc, d,
+                        message="Flashing eMMC (legacy curl+dd)..."
+                    )
+                    if _leg_err:
+                        emmc_ok = False
                     if not emmc_ok:
-                        print("  ❌ Legacy fallback also failed for eMMC. Nothing more to try automatically.")
+                        print("  ❌ Legacy fallback also failed for eMMC.")
                         self._recovery_finish(rec.print_report())
                         return
-                    print("  ✓ Legacy fallback succeeded for eMMC.")
-                    print("  Backend that serves the modern tool looks broken for this device —")
-                    print("  continuing with the legacy method for NOR too (no DIP flip needed).")
-                    rec.phase_legacy_flash_nor(d)
-                    self._recovery_finish(rec.print_report())
-                    return
-
+                    print("  ✓ Legacy fallback succeeded.")
+            else:
                 print()
-                print("=" * 60)
-                print("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
-                print("=" * 60)
-                input("  Press Enter once you've done that...")
-
-                if not rec.phase_modern_verify_emmc_boot(d):
-                    print("  ❌ Could not confirm the device booted from eMMC.")
-                    self._recovery_finish(rec.print_report())
-                    return
-
-                print("  Re-entering the recovery shell on eMMC...")
-                reentered = (
-                    d.wait_for_autoboot(timeout=60)
-                    and d.boot_recovery()
-                    and d.login_recovery(timeout=60)
+                print("  Legacy firmware tool detected — using curl+dd directly.")
+                print()
+                emmc_ok, _leg_err = with_spinner(
+                    rec.phase_legacy_flash_emmc, d,
+                    message="Flashing eMMC (legacy curl+dd)..."
                 )
-                if not reentered:
-                    print("  ❌ Could not re-enter the recovery shell after the eMMC boot.")
+                if _leg_err:
+                    emmc_ok = False
+                if not emmc_ok:
                     self._recovery_finish(rec.print_report())
                     return
 
-                if not self._setup_recovery_network(d):
-                    self._recovery_finish(rec.print_report())
-                    return
+        finally:
+            if d:
+                d.disconnect()
 
+        success = rec.print_report()
+        if success:
+            print()
+            print("=" * 60)
+            print("  ⚡ FLIP DIP SWITCH TO LEFT (eMMC), THEN POWER-CYCLE ⚡")
+            print("=" * 60)
+            print()
+        self._recovery_finish(success)
+
+    def menu_update_nor(self):
+        """
+        Flash NOR firmware only. Device must be in eMMC recovery (DIP LEFT).
+        The 'firmware update' command auto-targets NOR when booted from eMMC.
+        Falls back to legacy curl+flashcp if the modern tool is unavailable.
+        Requires eMMC to already have the official Mono firmware with recovery.
+        """
+        from mono_imager import flash_orchestrator as core
+        from mono_imager import recovery_orchestrator as rec
+
+        self.clear_screen()
+        self.print_header()
+        print("Update NOR Firmware")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  START HERE: DIP switch → LEFT (eMMC)            │")
+        print("  │                                                   │")
+        print("  │  Booting from eMMC recovery ensures 'firmware    │")
+        print("  │  update' targets NOR automatically.              │")
+        print("  │                                                   │")
+        print("  │  ⚠️  eMMC must already have the official Mono     │")
+        print("  │  Gateway firmware (with recovery partition).      │")
+        print("  └─────────────────────────────────────────────────┘")
+        print()
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  ETHERNET: RIGHTMOST 1 Gig RJ-45 jack           │")
+        print("  │  Device needs internet to download firmware.     │")
+        print("  └─────────────────────────────────────────────────┘")
+        print()
+
+        port = self._select_port(allow_back=True, save_on_select=True)
+        if port is None:
+            self.current_state = MenuState.MAIN
+            return
+
+        print()
+        print("⚠️  This writes firmware to NOR flash (bootloader + recovery).")
+        confirm = input("Proceed? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("  Cancelled.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.MAIN
+            return
+
+        d = None
+        try:
+            d = core.phase1_bootstrap(port, 115200)
+            if d is None:
+                print()
+                print("  ❌ Could not bootstrap into the recovery shell.")
+                self._recovery_finish(core.print_report())
+                return
+
+            rec.reset_results()
+            is_modern, _fw_err = with_spinner(
+                rec.detect_modern_firmware_tool, d,
+                message="Detecting firmware tool type..."
+            )
+            if _fw_err:
+                is_modern = None
+
+            if is_modern is None:
+                print()
+                print("  ❌ Could not determine the device's firmware tool type.")
+                self._recovery_finish(rec.print_report())
+                return
+
+            if not self._setup_recovery_network(d):
+                self._recovery_finish(rec.print_report())
+                return
+
+            if is_modern:
+                print()
+                print("  Modern firmware tool detected.")
+                print()
                 nor_ok = rec.phase_modern_flash_nor(d, on_output=self._show_firmware_output)
                 if not nor_ok:
                     print()
-                    print("  ⚠ Modern 'firmware update' failed for NOR — falling back")
-                    print("    to the legacy curl+flashcp method...")
-                    nor_ok = rec.phase_legacy_flash_nor(d)
+                    print("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+flashcp...")
+                    nor_ok, _leg_err = with_spinner(
+                        rec.phase_legacy_flash_nor, d,
+                        message="Flashing NOR (legacy curl+flashcp)..."
+                    )
+                    if _leg_err:
+                        nor_ok = False
                     if not nor_ok:
-                        print("  ❌ Legacy fallback also failed for NOR. Nothing more to try automatically.")
+                        print("  ❌ Legacy fallback also failed for NOR.")
                         self._recovery_finish(rec.print_report())
                         return
-                    print("  ✓ Legacy fallback succeeded for NOR.")
+                    print("  ✓ Legacy fallback succeeded.")
 
                 print()
                 print("=" * 60)
-                print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR, THEN POWER-CYCLE ⚡")
+                print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR (RIGHT), THEN POWER-CYCLE ⚡")
                 print("=" * 60)
                 input("  Press Enter once you've done that...")
 
@@ -1042,13 +1137,15 @@ class MonoImager:
 
             else:
                 print()
-                print("  Legacy firmware tool detected — using curl/dd/flashcp directly.")
-                print("  (No DIP-switch flips needed for this path.)")
+                print("  Legacy firmware tool detected — using curl+flashcp directly.")
+                print("  (No DIP-switch flip needed for this path.)")
                 print()
-                if not rec.phase_legacy_flash_emmc(d):
-                    self._recovery_finish(rec.print_report())
-                    return
-                rec.phase_legacy_flash_nor(d)
+                nor_ok, _leg_err = with_spinner(
+                    rec.phase_legacy_flash_nor, d,
+                    message="Flashing NOR (legacy curl+flashcp)..."
+                )
+                if _leg_err:
+                    nor_ok = False
 
         finally:
             if d:
@@ -1108,7 +1205,13 @@ class MonoImager:
             print("  ⚡  POWER CYCLE YOUR DEVICE NOW  ⚡")
             print("  " + "─" * 56)
             print()
-            self._check(results, "U-Boot autoboot interrupted", d.wait_for_autoboot(timeout=60))
+            _autoboot_ok, _autoboot_err = with_spinner(
+                d.wait_for_autoboot, timeout=60,
+                message="Waiting for U-Boot autoboot interrupt..."
+            )
+            if _autoboot_err:
+                _autoboot_ok = False
+            self._check(results, "U-Boot autoboot interrupted", bool(_autoboot_ok))
             if not results[-1]:
                 input("\n  Press Enter to return to main menu...")
                 self.current_state = MenuState.MAIN
@@ -1121,20 +1224,21 @@ class MonoImager:
                         response.strip() if response.strip() else "no response")
 
             # Step 4: boot recovery
-            d.send_command("run recovery", wait_for_prompt=False, timeout=3)
-            start  = time.time()
-            buffer = b""
             booted = False
-            while time.time() - start < 60:
-                byte = d.ser.read(1)
-                if byte:
-                    buffer += byte
-                    if b"root@recovery" in buffer or b"login:" in buffer:
-                        if b"login:" in buffer and b"root@recovery" not in buffer:
-                            d.ser.write(b"root\r\n")
-                            time.sleep(1)
-                        booted = True
-                        break
+            buffer = b""
+            with Spinner("Booting recovery Linux..."):
+                d.send_command("run recovery", wait_for_prompt=False, timeout=3)
+                start = time.time()
+                while time.time() - start < 60:
+                    byte = d.ser.read(1)
+                    if byte:
+                        buffer += byte
+                        if b"root@recovery" in buffer or b"login:" in buffer:
+                            if b"login:" in buffer and b"root@recovery" not in buffer:
+                                d.ser.write(b"root\r\n")
+                                time.sleep(1)
+                            booted = True
+                            break
             self._check(results, "Recovery Linux booted", booted)
 
             # Step 5: login confirmed
@@ -1234,27 +1338,58 @@ class MonoImager:
                 return
             self._check(results, "Device IP", True, device_ip)
 
-            # Step 4: assign IP on device, ping from host
-            d.send_command("ip link set eth0 up", timeout=10)
-            d.send_command(f"ip addr add {device_ip}/24 dev eth0", timeout=10)
+            # Step 4: auto-detect active ethernet port, assign IP, ping from host.
+            # Recovery Linux boots with all eth ports DOWN — bring them all up first,
+            # then find the one with carrier (LOWER_UP). Hardcoding eth0 was wrong:
+            # the cable may be on a different port, and an unchecked ip addr add to a
+            # no-carrier interface would silently assign the IP to a dead port.
+            eth_out = ""
+            with Spinner("Detecting active Ethernet port..."):
+                for _n in range(5):
+                    try:
+                        d.send_command(f"ip link set eth{_n} up 2>/dev/null", timeout=5)
+                    except Exception:
+                        pass
+                eth_out = d.send_command("sleep 2; ip link show", timeout=15)
+            iface = None
+            for _line in eth_out.split('\n'):
+                if 'LOWER_UP' in _line and ': ' in _line:
+                    _parts = _line.split(': ')
+                    if len(_parts) >= 2:
+                        _name = _parts[1].split()[0]
+                        if _name.startswith('eth'):
+                            iface = _name
+                            break
 
-            try:
-                from icmplib import ping as icmp_ping
-                reachable = icmp_ping(device_ip, count=2, timeout=3).is_alive
-            except Exception:
-                reachable = False
+            if not self._check(results, "Ethernet port with carrier detected", iface is not None,
+                               "plug cable into the RIGHTMOST 1 Gig RJ-45 jack" if iface is None else iface):
+                print()
+                print("  " + "─" * 56)
+                print("  ✗  1 check failed.")
+                input("\n  Press Enter to return to main menu...")
+                return
 
-            # Ping is informational — ICMP may be blocked or require root.
-            # The curl step (step 6) is the real proof of connectivity.
-            if reachable:
-                print(f"  ✓  Device {device_ip} reachable from host")
+            d.send_command(f"ip addr add {device_ip}/24 dev {iface}", timeout=10)
+
+            # Ping HOST from DEVICE via serial — tests the actual path curl will use.
+            # This is the useful direction: host->device ICMP needs admin on Windows
+            # and tests the wrong direction anyway.
+            ping_out, _ping_err = with_spinner(
+                d.send_command, f"ping -c 2 -W 2 {host_ip} 2>&1", timeout=15,
+                message=f"Testing device -> host connectivity..."
+            )
+            if _ping_err:
+                ping_out = ""
+            device_can_ping_host = "1 received" in ping_out or "2 received" in ping_out
+            if device_can_ping_host:
+                print(f"  ✓  Device can reach host {host_ip}")
             else:
-                print(f"  ⚠  Device {device_ip} ping failed (continuing — curl will confirm)")
+                print(f"  ⚠  Device cannot ping host (ICMP likely blocked by host firewall — non-fatal)")
 
             # Step 5: HTTP server
+            http_port = 18080
             tmp = pathlib.Path(tempfile.mktemp(suffix=".bin"))
             tmp.write_bytes(b"LAN_TEST")
-            http_port = 18080
             server = start_http_server(host_ip, http_port, tmp)
             if not self._check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
                 tmp.unlink(missing_ok=True)
@@ -1272,7 +1407,10 @@ class MonoImager:
             )
             try:
                 d.launch_script(check_script, marker="lantest")
-                report = wait_for_report("lantest", timeout=15.0)
+                report, _rep_err = with_spinner(
+                    wait_for_report, "lantest", timeout=15.0,
+                    message="Waiting for device HTTP report..."
+                )
                 device_sees_host = report is not None and "200" in report
             except Exception as e:
                 device_sees_host = False
@@ -1280,7 +1418,15 @@ class MonoImager:
                 server.shutdown()
                 tmp.unlink(missing_ok=True)
 
-            self._check(results, "Device can reach host HTTP server", device_sees_host)
+            if not device_sees_host:
+                _curl_detail = (
+                    "host reachable but port 18080 blocked — allow Python.exe through Windows Defender Firewall"
+                    if device_can_ping_host else
+                    "device cannot reach host — verify cable connects to the SAME router/switch as the host"
+                )
+            else:
+                _curl_detail = ""
+            self._check(results, "Device can reach host HTTP server", device_sees_host, _curl_detail)
 
             # Save working config
             self.serial_port   = port
@@ -1477,7 +1623,10 @@ class MonoImager:
             print()
             print("  Reading boot output (no need to interrupt autoboot)...")
 
-            raw_output = device.capture_boot_diagnostics(timeout=60)
+            raw_output, _diag_err = with_spinner(
+                device.capture_boot_diagnostics, timeout=60,
+                message="Reading boot diagnostics..."
+            )
             device.disconnect()
 
             if raw_output is None:
@@ -1544,8 +1693,10 @@ class MonoImager:
                     self.menu_network_auto_config()
                 elif self.current_state == MenuState.NETWORK_FLASHING:
                     self.menu_network_flashing()
-                elif self.current_state == MenuState.RECOVERY_FLOW:
-                    self.menu_recovery_flow()
+                elif self.current_state == MenuState.UPDATE_EMMC:
+                    self.menu_update_emmc()
+                elif self.current_state == MenuState.UPDATE_NOR:
+                    self.menu_update_nor()
                 elif self.current_state == MenuState.DONE:
                     self.menu_done()
                 elif self.current_state == MenuState.CLI_CONSOLE:
@@ -1562,7 +1713,7 @@ def main():
     from mono_imager.logging_setup import configure_logging
     log_dir = Path(__file__).parent.parent / "logs"
     log_file = configure_logging(log_dir)
-    verbose(f"mono-imager v{__version__} by {__author__}")
+    verbose(f"mono-imager {__version__} by {__author__}")
     verbose(f"Log: {log_file}")
     app = MonoImager(log_file)
     app.run()

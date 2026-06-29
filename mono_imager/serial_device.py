@@ -5,13 +5,14 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: 0.9.5
+Version: v.0.9.9 RC1
 License: MIT
 """
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
+import os
 import serial
 import time
 import logging
@@ -20,10 +21,13 @@ from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
+_DEBUG = os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+
 
 def verbose(msg: str, level: str = "info"):
-    """Print to console immediately AND log it"""
-    print(msg, flush=True)
+    """Log always; print to console only in debug mode or for errors/warnings."""
+    if _DEBUG or level in ("error", "warning"):
+        print(msg, flush=True)
     if level == "error":
         logger.error(msg)
     elif level == "warning":
@@ -819,8 +823,18 @@ class SerialDevice:
                         verbose(f"  Boot output: {tail[-300:]!r}", "debug")
                         _last_log_len = len(poll_buf)
 
-                    # Fast-fail: bootm failed and U-Boot prompt returned
+                    # U-Boot prompt returned — check why before failing.
                     if b"\n=> " in poll_buf or b"\r=> " in poll_buf:
+                        if b"not defined" in poll_buf:
+                            # 'recovery' env var missing (e.g. Armbian U-Boot on
+                            # eMMC boot0, or NOR env wiped). Fall back to running
+                            # the default bootcmd via 'boot'. On Armbian U-Boot
+                            # this loads Armbian via extlinux.conf; on the old SPI
+                            # U-Boot it falls through to the SPI recovery kernel.
+                            verbose("  'recovery' not defined — falling back to 'boot' (bootcmd)...", "warning")
+                            poll_buf = b""
+                            self.ser.write(b"boot\r\n")
+                            continue
                         verbose("✗ bootm failed — U-Boot prompt returned", "error")
                         verbose(f"  Output: {tail[-500:]!r}", "error")
                         return False
