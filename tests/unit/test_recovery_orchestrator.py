@@ -46,7 +46,7 @@ print("detect_modern_firmware_tool()")
 print("=" * 60)
 
 d = MagicMock()
-d.run_script.return_value = "/usr/sbin/firmware\nRC=0"
+d.run_script.side_effect = ["/usr/sbin/firmware\nRC=0", "root=/dev/mmcblk0 boot_medium=EMMC"]
 check("modern device detected as True", rec.detect_modern_firmware_tool(d) is True)
 
 d = MagicMock()
@@ -233,11 +233,11 @@ print("verify_boot_source()  (real marker text from hardware captures)")
 print("=" * 60)
 
 d = MagicMock()
-d.ser = FakeSerial(b"INFO: some boot stuff\r\nINFO: RCW BOOT SRC is SD/EMMC\r\nmore\r\n")
+d.ser = FakeSerial(b"U-Boot 2022.04\r\nINFO: some boot stuff\r\nINFO: RCW BOOT SRC is SD/EMMC\r\nmore\r\n")
 check("eMMC boot source confirmed", rec.verify_boot_source(d, "EMMC", timeout=5) is True)
 
 d = MagicMock()
-d.ser = FakeSerial(b"INFO: RCW BOOT SRC is QSPI\r\n")
+d.ser = FakeSerial(b"U-Boot 2022.04\r\nINFO: RCW BOOT SRC is QSPI\r\n")
 check("NOR boot source confirmed (QSPI marker)", rec.verify_boot_source(d, "NOR", timeout=5) is True)
 
 d = MagicMock()

@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
@@ -29,6 +29,7 @@ import sys
 import os
 import time
 import threading
+from itertools import cycle
 from typing import Any, Callable, Tuple, Optional
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
@@ -150,13 +151,12 @@ class Spinner:
         return f"{m}:{s:02d}"
 
     def _spin(self):
-        i = 0
-        while not self._stop.is_set():
-            frame   = self.FRAMES[i % len(self.FRAMES)]
+        for frame in cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
             elapsed = self._elapsed_str()
             sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}  {elapsed}")
             sys.stdout.flush()
-            i += 1
             time.sleep(0.15)
 
 

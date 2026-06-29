@@ -14,6 +14,8 @@ If the stick is smaller, flashing a single OS may still work, but you
 cannot cache all images simultaneously.
 """
 
+import re
+
 from mono_imager.flash_orchestrator import verbose
 
 USB_MIN_GB = 16
@@ -39,17 +41,26 @@ _PATTERNS = {
 }
 
 
+_SAFE_MOUNT_PATH = re.compile(r'[A-Za-z0-9/_.-]+')
+
+
 def check_usb_size(device, usb_mount: str) -> None:
     """
     Warn (non-fatal) if the mounted USB stick total capacity is below
     USB_MIN_GB.  A small stick may still work for a single OS image.
     """
+    if not _SAFE_MOUNT_PATH.fullmatch(usb_mount):
+        verbose(f"  ⚠ Unexpected mount path — skipping size check: {usb_mount!r}", "warning")
+        return
     try:
         out = device.run_script(
-            f"df -k {usb_mount} | awk 'NR==2 {{print $2}}'",
+            f'df -k "{usb_mount}" | awk \'NR==2 {{print $2}}\'',
             marker="usb_size_check", exec_timeout=5,
         ).strip()
-        kb = next(int(l) for l in out.splitlines() if l.strip().isdigit())
+        kb = next((int(l) for l in out.splitlines() if l.strip().isdigit()), None)
+        if kb is None:
+            verbose("  ⚠ Could not parse USB size from df output", "warning")
+            return
         gb = kb / (1024 * 1024)
         if kb < USB_MIN_KB:
             verbose(
@@ -77,6 +88,10 @@ def find_image_on_usb(device, usb_mount: str, os_name: str):
         verbose(f"  ⚠ No USB image patterns defined for '{os_name}'", "warning")
         return None, None
 
+    if not _SAFE_MOUNT_PATH.fullmatch(usb_mount):
+        verbose(f"  ⚠ Unexpected mount path: {usb_mount!r}", "warning")
+        return None, None
+
     # Build a POSIX sh case statement. Each matching clause prints
     # "TAG:FILEPATH" and sets found=1 to stop the for loop.
     clauses = "".join(
@@ -85,7 +100,7 @@ def find_image_on_usb(device, usb_mount: str, os_name: str):
     )
     script = (
         "found=0\n"
-        f"for f in {usb_mount}/*; do\n"
+        f'for f in "{usb_mount}"/*; do\n'
         '  [ -f "$f" ] || continue\n'
         "  b=$(basename \"$f\" | tr 'A-Z' 'a-z')\n"
         '  case "$b" in\n'

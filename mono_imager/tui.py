@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
@@ -33,18 +33,23 @@ from mono_imager.spinner import with_spinner, Spinner
 
 logger = logging.getLogger(__name__)
 
+_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
+
 def verbose(msg: str, level: str = "info"):
     """Print to console immediately AND log it"""
     print(msg, flush=True)
-    if level == "error":
-        logger.error(msg)
-    elif level == "warning":
-        logger.warning(msg)
-    elif level == "debug":
-        logger.debug(msg)
-    else:
-        logger.info(msg)
+    logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
+
+
+_UBOOT_FIELDS = [
+    ("SoC",        _RE_SOC,      lambda m: m.group(1).strip()),
+    ("Model",      _RE_MODEL,    lambda m: m.group(1).strip()),
+    ("DRAM",       _RE_DRAM,     lambda m: m.group(1).strip()),
+    ("Bus clock",  _RE_BUS_CLK,  lambda m: f"{m.group(1)} MHz"),
+    ("DDR clock",  _RE_DDR_CLK,  lambda m: f"{m.group(1)} MT/s"),
+    ("FMAN clock", _RE_FMAN_CLK, lambda m: f"{m.group(1)} MHz"),
+]
 
 
 def parse_uboot_identity(raw_output: str) -> dict:
@@ -65,19 +70,9 @@ def parse_uboot_identity(raw_output: str) -> dict:
     are simply absent, never guessed or defaulted.
     """
     result = {}
-
-    soc = _RE_SOC.search(raw_output)
-    if soc:
-        result["SoC"] = soc.group(1).strip()
-
-    model = _RE_MODEL.search(raw_output)
-    if model:
-        result["Model"] = model.group(1).strip()
-
-    dram = _RE_DRAM.search(raw_output)
-    if dram:
-        result["DRAM"] = dram.group(1).strip()
-
+    for label, pattern, fmt in _UBOOT_FIELDS:
+        if (m := pattern.search(raw_output)):
+            result[label] = fmt(m)
     cpu_clocks = _RE_CPU_CLK.findall(raw_output)
     if cpu_clocks:
         unique = sorted(set(cpu_clocks), key=int)
@@ -85,21 +80,10 @@ def parse_uboot_identity(raw_output: str) -> dict:
             result["CPU clock"] = f"{unique[0]} MHz (all cores)"
         else:
             result["CPU clock"] = ", ".join(f"{c} MHz" for c in cpu_clocks)
-
-    bus = _RE_BUS_CLK.search(raw_output)
-    if bus:
-        result["Bus clock"] = f"{bus.group(1)} MHz"
-
-    ddr = _RE_DDR_CLK.search(raw_output)
-    if ddr:
-        result["DDR clock"] = f"{ddr.group(1)} MT/s"
-
-    fman = _RE_FMAN_CLK.search(raw_output)
-    if fman:
-        result["FMAN clock"] = f"{fman.group(1)} MHz"
-
     return result
 
+
+_OK_PREFIX = "[ OK ]"
 
 def parse_uboot_self_test(raw_output: str) -> list:
     """
@@ -116,28 +100,15 @@ def parse_uboot_self_test(raw_output: str) -> list:
     Returns a list of (label, value) tuples in the order they appeared.
     value is "" if only the label is present with no value/detail.
     """
-    results = []
-    
-    for line in raw_output.split('\n'):
+    out = []
+    for line in raw_output.splitlines():
         line = line.strip()
-        if not line:
+        if not line.startswith(_OK_PREFIX):
             continue
-        
-        # Match [ OK ] Label    value
-        if line.startswith('[ OK ]'):
-            rest = line[6:].strip()  # Skip "[ OK ] "
-            
-            # Split on first run of whitespace
-            parts = rest.split(None, 1)
-            if parts:
-                label = parts[0]
-                value = parts[1] if len(parts) > 1 else ""
-                
-                # Skip summary line
-                if label.lower() != "self-test":
-                    results.append((label, value))
-    
-    return results
+        label, _, value = line[len(_OK_PREFIX):].strip().partition(" ")
+        if label.lower() != "self-test":
+            out.append((label, value.strip()))
+    return out
 
 
 
@@ -158,7 +129,7 @@ class MenuState(Enum):
 class MonoImager:
     """Main application controller"""
 
-    def __init__(self, log_file: Path = None):
+    def __init__(self, log_file: Optional[Path] = None):
         self.current_state   = MenuState.MAIN
         self.device          = None
         self.custom_fw_path  = None
@@ -173,8 +144,8 @@ class MonoImager:
         self.os_name         = None
 
     def clear_screen(self):
-        """Clear terminal"""
-        os.system('clear' if os.name == 'posix' else 'cls')
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
     
     def safe_input(self, prompt: str) -> Optional[str]:
         """
@@ -335,7 +306,7 @@ class MonoImager:
             print()
             print(f"  {len(all_ports) + 1}) Back")
 
-        enter_uses_last = allow_enter_last and bool(last_port) and last_port in [p.device for p in all_ports]
+        enter_uses_last = allow_enter_last and last_port and any(p.device == last_port for p in all_ports)
         if enter_uses_last:
             print()
             print(f"  [Enter] Use last port ({last_port})")
@@ -1336,7 +1307,8 @@ class MonoImager:
 
             if not self._check(results, "Host IP detected", bool(host_ip), host_ip or "could not detect"):
                 return
-            self._check(results, "Device IP", True, device_ip)
+            if not self._check(results, "Device IP", bool(device_ip), device_ip or "could not derive — use Manual mode"):
+                return
 
             # Step 4: auto-detect active ethernet port, assign IP, ping from host.
             # Recovery Linux boots with all eth ports DOWN — bring them all up first,
@@ -1388,8 +1360,9 @@ class MonoImager:
 
             # Step 5: HTTP server
             http_port = 18080
-            tmp = pathlib.Path(tempfile.mktemp(suffix=".bin"))
-            tmp.write_bytes(b"LAN_TEST")
+            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tf:
+                _tf.write(b"LAN_TEST")
+                tmp = pathlib.Path(_tf.name)
             server = start_http_server(host_ip, http_port, tmp)
             if not self._check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
                 tmp.unlink(missing_ok=True)

@@ -11,9 +11,6 @@ Files starting with _ are skipped (e.g. _common.py).
 """
 
 
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
-
 import importlib
 import pkgutil
 from pathlib import Path

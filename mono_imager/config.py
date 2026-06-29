@@ -3,7 +3,7 @@ mono-imager: Configuration manager
 Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
@@ -43,8 +43,7 @@ def load_config() -> dict:
     config_path = get_config_path()
     try:
         if config_path.exists():
-            with open(config_path) as f:
-                return json.load(f)
+            return json.loads(config_path.read_text())
     except (json.JSONDecodeError, IOError) as e:
         logger.warning(f"Config file is corrupt or unreadable — resetting to defaults: {e}")
     return {}
@@ -55,8 +54,7 @@ def save_config(config: dict):
     config_path = get_config_path()
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        config_path.write_text(json.dumps(config, indent=2))
         logger.debug(f"Config saved to {config_path}")
     except OSError as e:
         logger.warning(f"Could not save config to {config_path}: {e}")
@@ -91,8 +89,9 @@ def detect_serial_ports() -> tuple[list, list]:
         import serial.tools.list_ports
         all_ports = list(serial.tools.list_ports.comports())
         
-        known = [p for p in all_ports if is_known_uart(p.description or "")]
-        other = [p for p in all_ports if not is_known_uart(p.description or "")]
+        known, other = [], []
+        for p in all_ports:
+            (known if is_known_uart(p.description or "") else other).append(p)
         
         return known, other
         

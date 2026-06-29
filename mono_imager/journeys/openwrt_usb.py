@@ -21,9 +21,6 @@ Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
-
 import logging
 import re
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext

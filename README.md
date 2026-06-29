@@ -1,4 +1,4 @@
-# mono-imager
+# mono-imager v1.0.0
 
 Automated firmware flashing tool for Mono Gateway Routers and the Mono Development Kit.  
 Provides a guided, reliable flashing experience with serial console control, HTTP and USB firmware transfer, U‑Boot recovery handling, and full OPNsense eMMC re-imaging support.
@@ -44,7 +44,6 @@ Provides a guided, reliable flashing experience with serial console control, HTT
 
 ```
 pyserial>=3.5
-icmplib>=3.0
 ```
 
 ---

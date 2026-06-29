@@ -15,9 +15,6 @@ Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
-
 import logging
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
 from mono_imager.spinner import with_spinner, Spinner
@@ -176,8 +173,8 @@ def step_detect_mac(ctx: StepContext) -> bool:
     except Exception as e:
         verbose(f"⚠ MAC detection failed: {e}", "warning")
     ctx.set("device_mac_known", None)
-    step(0, "Device MAC detected", False, "will prompt at re-image step")
-    return True  # non-fatal
+    step(0, "Device MAC detection", True, "warning: detection failed — will prompt at re-image step")
+    return True
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")

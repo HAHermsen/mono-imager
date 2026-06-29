@@ -16,9 +16,6 @@ get_log_file() to find the path for its report footer.
 """
 
 
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
-
 import sys
 import logging
 from pathlib import Path

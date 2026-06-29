@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mono-imager: Step Registry (v.0.9.9 RC1)
+mono-imager: Step Registry (v1.0.0)
 
 Decorator-based step registry. Steps declare os=, transfer=,
 requires=, produces=. FlowRunner resolves the correct sequence
@@ -23,12 +23,9 @@ ADDING A JOURNEY:
     3. FlowRunner builds the sequence from requires/produces
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
-
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
 
 import logging
 from dataclasses import dataclass, field

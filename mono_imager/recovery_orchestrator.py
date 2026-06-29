@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
@@ -132,7 +132,7 @@ def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
         logger.warning(f"get_device_mac: run_script failed: {e}")
         return None
 
-    match = re.search(r'link/ether\s+([0-9a-fA-F:]{17})', output)
+    match = re.search(r'link/ether\s+((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})', output)
     if match:
         return match.group(1).lower()
     return None
@@ -491,6 +491,9 @@ def legacy_flash_emmc(d: SerialDevice, mac: str) -> bool:
     with the documented skip=1 seek=1 (skips the first 4KB / GPT
     region on both input and output, per the docs' own explanation).
     """
+    if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", mac):
+        logger.error(f"legacy_flash_emmc: invalid MAC address: {mac!r}")
+        return False
     cmd = (
         f"curl -u mono:{mac} -O {LEGACY_EMMC_URL} && "
         f"dd if=firmware-emmc-gateway-dk.bin of=/dev/mmcblk0 bs=4096 skip=1 seek=1; "
@@ -513,6 +516,9 @@ def legacy_flash_nor(d: SerialDevice, mac: str) -> bool:
     Legacy NOR flash exactly per the documented procedure: curl with
     mono:{MAC} basic auth, then flashcp to /dev/mtd0.
     """
+    if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", mac):
+        logger.error(f"legacy_flash_nor: invalid MAC address: {mac!r}")
+        return False
     cmd = (
         f"curl -u mono:{mac} -O {LEGACY_NOR_URL} && "
         f"flashcp -v firmware-qspi-gateway-dk.bin /dev/mtd0; "

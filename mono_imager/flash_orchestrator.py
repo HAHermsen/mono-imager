@@ -18,20 +18,23 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__  = "H.A. Hermsen"
 
-import sys
-import time
+import itertools
 import logging
+import os
 import platform
+import shutil
 import socket
 import subprocess
+import sys
 import threading
+import time
 
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -47,8 +50,7 @@ from mono_imager.spinner import with_spinner, Spinner
 _IS_WINDOWS = platform.system().lower() == "windows"
 
 # Set MONO_DEBUG=1 to restore full verbose output to console.
-import os as _os
-_DEBUG = _os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+_DEBUG = os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 # --- Logging setup -----------------------------------------------------------
 # Logging is initialised exactly once by tui.py/cli.py via
@@ -58,26 +60,16 @@ _DEBUG = _os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 from mono_imager.logging_setup import configure_logging, get_log_file
 
-# Ensure logging is available even when this module is used standalone
-# (e.g. test scripts that import flash_orchestrator directly without going
-# through the TUI). configure_logging() is a no-op if already called.
-configure_logging()
-
 logger = logging.getLogger(__name__)
 
+
+_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
 
 def verbose(msg: str, level: str = "info"):
     """Log always; print to console only in debug mode or for errors/warnings."""
     if _DEBUG or level in ("error", "warning"):
         print(msg, flush=True)
-    if level == "error":
-        logger.error(msg)
-    elif level == "warning":
-        logger.warning(msg)
-    elif level == "debug":
-        logger.debug(msg)
-    else:
-        logger.info(msg)
+    logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
 
 file_logger    = logger
@@ -87,8 +79,8 @@ console_logger = logging.getLogger("mono_imager.console")
 
 # --- Result tracker ----------------------------------------------------------
 
-results: list[tuple[int, str, bool, str]] = []
-_step_counter = [0]  # (step, description, passed, reason)
+results: list[tuple[int, str, bool, str]] = []  # (step, description, passed, reason)
+_step_seq = itertools.count(1)
 
 def reset_results():
     """
@@ -111,20 +103,21 @@ def reset_results():
     calls it automatically since that's the true entry point shared by
     every caller (auto, manual, and any future one).
     """
+    global _step_seq
     results.clear()
-    _step_counter[0] = 0
+    _step_seq = itertools.count(1)
 
 def step(num: int, description: str, passed: bool, reason: str = ""):
     if num == 0:
-        _step_counter[0] += 1
-        num = _step_counter[0]
+        num = next(_step_seq)
     mark = "✓" if passed else "✗"
 
     # File gets the full technical detail: step number, PASS/FAIL, reason.
     file_msg = f"Step {num:02d}: {'✓ PASS' if passed else '✗ FAIL'} — {description}"
     if reason:
         file_msg += f" ({reason})"
-    file_logger.info(file_msg) if passed else file_logger.error(file_msg)
+    log = file_logger.info if passed else file_logger.error
+    log(file_msg)
 
     # Console gets a short, plain line — no step numbers, no technical
     # reason strings (those are jargon like "wc -c returned unparseable
@@ -159,7 +152,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
     only ever used to LAUNCH a script on the device from this point
     on, never to receive its result.
     """
-    firmware_path: Path = None
+    firmware_path: Optional[Path] = None
 
     # Class-level, thread-safe store of reports received from the
     # device. The HTTP server runs its own background thread per
@@ -185,11 +178,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.end_headers()
         with open(self.firmware_path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+            shutil.copyfileobj(f, self.wfile, length=65536)
 
     def do_HEAD(self):
         """
@@ -342,8 +331,10 @@ def peek_report(step_id: str) -> Optional[str]:
 def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[HTTPServer]:
     """Start HTTP server in a daemon thread. Returns server or None on failure."""
     try:
+        with _FirmwareHandler._reports_lock:
+            _FirmwareHandler._reports.clear()
         handler = type("Handler", (_FirmwareHandler,), {"firmware_path": firmware_path})
-        server  = HTTPServer(("", port), handler)  # bind all interfaces
+        server  = HTTPServer((host_ip, port), handler)
         thread  = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         verbose(f"✓ HTTP server listening on http://{host_ip}:{port}/", "debug")
@@ -355,15 +346,15 @@ def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[
 # --- Network helpers ---------------------------------------------------------
 
 def detect_host_ip() -> str:
-    """Best-effort detection of the host's primary non-loopback IPv4 address."""
+    """Best-effort detection of the host's primary non-loopback IPv4 address.
+    Returns "" on failure — callers must handle this and fail loudly rather than
+    proceeding with a guessed IP (which wastes minutes before the real error surfaces)."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
-        return "192.168.1.1"
+        return ""
 
 
 def pick_device_ip(host_ip: str) -> Optional[str]:
@@ -407,14 +398,17 @@ def pick_device_ip(host_ip: str) -> Optional[str]:
 
 def ping(ip: str, count: int = 3) -> bool:
     """Ping an IP address. Returns True if reachable."""
-    flag = "-n" if _IS_WINDOWS else "-c"
+    if _IS_WINDOWS:
+        # -w: per-packet timeout in milliseconds
+        cmd = ["ping", "-n", str(count), "-w", "2000", ip]
+    elif sys.platform == "darwin":
+        # -W: per-packet timeout in milliseconds on macOS
+        cmd = ["ping", "-c", str(count), "-W", "2000", ip]
+    else:
+        # -W: per-packet timeout in seconds on Linux (-w is a total deadline, too tight)
+        cmd = ["ping", "-c", str(count), "-W", "2", ip]
     try:
-        result = subprocess.run(
-            ["ping", flag, str(count), "-w", "2000" if _IS_WINDOWS else "2", ip],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10
-        )
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         return result.returncode == 0
     except Exception:
         return False

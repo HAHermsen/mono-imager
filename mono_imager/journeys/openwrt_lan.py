@@ -26,9 +26,6 @@ Author:  H.A. Hermsen
 License: MIT
 """
 
-__version__ = "v.0.9.9 RC1"
-__author__  = "H.A. Hermsen"
-
 import gzip
 import io
 import logging
@@ -231,10 +228,21 @@ def _uboot_steps_openwrt_lan(device) -> bool:
 
                     if fit_size >= 5 * 1024 * 1024:
                         verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size/1024/1024:.1f} MB)")
-                        recovery_cmd = (
-                            f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                            f"bootm {LOAD_ADDR}"
-                        )
+                        if dtb_offset:
+                            # FIT has no embedded FDT — pair with the DTB found earlier.
+                            # fdt_high prevents U-Boot from relocating the FDT below the kernel.
+                            device.send_command("setenv fdt_high 0xffffffffffffffff", timeout=5)
+                            recovery_cmd = (
+                                f"sf probe 0;"
+                                f"sf read {DTB_ADDR} {dtb_offset} 0x20000;"
+                                f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
+                                f"bootm {LOAD_ADDR} - {DTB_ADDR}"
+                            )
+                        else:
+                            recovery_cmd = (
+                                f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
+                                f"bootm {LOAD_ADDR}"
+                            )
                         # fall through to save & return below
                     else:
                         # Small FDT: either raw DTB or external-FIT header —
@@ -319,12 +327,6 @@ def _extract_sysupgrade_rootfs(firmware_path: Path) -> tuple[Path, bool]:
     if not name.endswith(".bin.gz") and not name.endswith(".bin"):
         return firmware_path, False
 
-    try:
-        with gzip.open(firmware_path, "rb") as outer:
-            inner_bytes = outer.read()
-    except (OSError, gzip.BadGzipFile):
-        return firmware_path, False
-
     def _find_root_in_tar(tf: tarfile.TarFile) -> Path | None:
         for member in tf.getmembers():
             if member.name == "root" or member.name.endswith("/root"):
@@ -333,37 +335,56 @@ def _extract_sysupgrade_rootfs(firmware_path: Path) -> tuple[Path, bool]:
                     continue
                 tmp = tempfile.NamedTemporaryFile(
                     suffix=".ext4", delete=False,
-                    dir=firmware_path.parent,
+                    dir=None,  # system temp dir, not alongside firmware file
                 )
-                data = f.read()
-                if data[:2] == b'\x1f\x8b':
-                    # root member is gzip-compressed (LS1046A sysupgrade format:
-                    # gzip(tar(kernel, root_gz)) — the ext4 is compressed inside the tar)
-                    with gzip.open(io.BytesIO(data)) as gz:
-                        shutil.copyfileobj(gz, tmp)
-                else:
-                    tmp.write(data)
-                tmp.close()
-                return Path(tmp.name)
+                tmp_path = Path(tmp.name)
+                try:
+                    try:
+                        # Try gzip decompression first (LS1046A sysupgrade format:
+                        # gzip(tar(kernel, root_gz)) — ext4 is gzip-compressed inside tar)
+                        with gzip.open(f) as gz:
+                            shutil.copyfileobj(gz, tmp)
+                    except (gzip.BadGzipFile, OSError):
+                        f.seek(0)
+                        shutil.copyfileobj(f, tmp)
+                    # Validate ext4 superblock magic (offset 0x438, little-endian 0xEF53)
+                    tmp.seek(0x438)
+                    magic = tmp.read(2)
+                    if len(magic) < 2 or magic != b'\x53\xef':
+                        logger.warning(f"Extracted 'root' member failed ext4 magic check (got {magic!r})")
+                        tmp.close()
+                        tmp_path.unlink(missing_ok=True)
+                        return None
+                    tmp.close()
+                    return tmp_path
+                except Exception:
+                    tmp.close()
+                    tmp_path.unlink(missing_ok=True)
+                    raise
         return None
 
-    # The inner content is a tar.gz (sysupgrade-tar uses tar -czf)
+    # Stream outer.gz -> inner.gz -> tar without loading full image into RAM
     try:
-        with gzip.open(io.BytesIO(inner_bytes)) as inner_gz:
-            with tarfile.open(fileobj=inner_gz) as tf:
+        with gzip.open(firmware_path, "rb") as outer:
+            try:
+                with gzip.open(outer) as inner_gz:
+                    with tarfile.open(fileobj=inner_gz) as tf:
+                        result = _find_root_in_tar(tf)
+                        if result:
+                            return result, True
+            except (OSError, gzip.BadGzipFile, tarfile.TarError):
+                pass
+    except (OSError, gzip.BadGzipFile):
+        return firmware_path, False
+
+    # Fallback: outer.gz -> plain tar (unusual but possible)
+    try:
+        with gzip.open(firmware_path, "rb") as outer:
+            with tarfile.open(fileobj=outer) as tf:
                 result = _find_root_in_tar(tf)
                 if result:
                     return result, True
     except (OSError, gzip.BadGzipFile, tarfile.TarError):
-        pass
-
-    # Fallback: inner is a plain tar (unusual but possible)
-    try:
-        with tarfile.open(fileobj=io.BytesIO(inner_bytes)) as tf:
-            result = _find_root_in_tar(tf)
-            if result:
-                return result, True
-    except tarfile.TarError:
         pass
 
     return firmware_path, False
@@ -502,32 +523,38 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
         console_logger.info("Flashing OpenWRT — this takes several minutes...")
 
     try:
-        d.launch_script(flash_script, marker="step07_flash")
-    except Exception as e:
-        return step(0, "OpenWRT flash launched", False, str(e))
+        try:
+            d.launch_script(flash_script, marker="step07_flash")
+        except Exception as e:
+            return step(0, "OpenWRT flash launched", False, str(e))
 
-    raw, err = with_spinner(wait_for_report, "07", timeout=600.0, message="Flashing OpenWRT")
-    if err or raw is None:
-        return step(0, "OpenWRT flash (dd)", False,
-                    str(err) if err else "no report-back from device in 600s")
+        raw, err = with_spinner(wait_for_report, "07", timeout=600.0, message="Flashing OpenWRT")
+        if err or raw is None:
+            return step(0, "OpenWRT flash (dd)", False,
+                        str(err) if err else "no report-back from device in 600s")
 
-    # Count actual records written — "0+0 records out" still contains
-    # "records out" and used to pass the old check despite writing nothing.
-    m = re.search(r"(\d+)\+(\d+)\s+records out", raw)
-    if m:
-        full_records, partial_records = int(m.group(1)), int(m.group(2))
-        bytes_written = full_records * 4096 + partial_records  # approx
-    else:
-        full_records = partial_records = bytes_written = 0
+        # Count actual records written — "0+0 records out" still contains
+        # "records out" and used to pass the old check despite writing nothing.
+        m = re.search(r"(\d+)\+(\d+)\s+records out", raw)
+        if m:
+            full_records, partial_records = int(m.group(1)), int(m.group(2))
+            bytes_written = full_records * 4096 + partial_records  # approx
+        else:
+            full_records = partial_records = bytes_written = 0
 
-    has_real_data = bytes_written > 0
-    has_error = "error" in raw.lower() or "failed" in raw.lower() or "not in" in raw.lower()
+        has_real_data = bytes_written > 0
+        has_error = "error" in raw.lower() or "failed" in raw.lower() or "not in" in raw.lower()
 
-    step(0, "OpenWRT flash executed", True)
-    step(0, f"dd wrote data ({bytes_written // 1024} KB)", has_real_data,
-         raw[-200:] if not has_real_data else "")
-    step(0, "No errors", not has_error, raw[-200:] if has_error else "")
-    return has_real_data and not has_error
+        step(0, "OpenWRT flash executed", True)
+        step(0, f"dd wrote data ({bytes_written // 1024} KB)", has_real_data,
+             raw[-200:] if not has_real_data else "")
+        step(0, "No errors", not has_error, raw[-200:] if has_error else "")
+        return has_real_data and not has_error
+    finally:
+        if ctx.get("serve_raw_ext4"):
+            extracted = ctx.get("extracted_rootfs")
+            if extracted:
+                Path(extracted).unlink(missing_ok=True)
 
 
 @register_step(
@@ -602,7 +629,7 @@ def step_prepare_emmc_boot(ctx: StepContext) -> bool:
             verbose('    setenv bootcmd "ext4load mmc 0:1 0x82000000 /boot/kernel.itb; bootm 0x82000000#config-1"', "warning")
             verbose('    setenv bootargs "root=/dev/mmcblk0p1 rw rootwait earlycon"', "warning")
             verbose("    saveenv", "warning")
-            return step(0, "eMMC boot config (mount failed — see warning)", True)
+            return step(0, "eMMC boot config (mount failed — see warning)", False)
 
         check = d.send_command(
             f"test -f {MNT}/boot/extlinux/extlinux.conf && echo EXISTS || echo MISSING",
@@ -624,10 +651,10 @@ def step_prepare_emmc_boot(ctx: StepContext) -> bool:
     except Exception as e:
         try:
             d.send_command(f"umount {MNT} 2>/dev/null", timeout=10)
-        except Exception:
-            pass
+        except Exception as _umount_err:
+            verbose(f"  ⚠ umount {MNT} failed: {_umount_err}", "debug")
         verbose(f"  ⚠ eMMC boot config step: {e}", "warning")
-        return step(0, "eMMC boot config (warning — may need manual fix)", True)
+        return step(0, "eMMC boot config (warning — may need manual fix)", False)
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["boot_configured"], produces=["rebooted"], label="Reboot device")

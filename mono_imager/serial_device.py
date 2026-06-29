@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v.0.9.9 RC1
+Version: v1.0.0
 License: MIT
 """
 
@@ -24,18 +24,13 @@ logger = logging.getLogger(__name__)
 _DEBUG = os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 
+_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
+
 def verbose(msg: str, level: str = "info"):
     """Log always; print to console only in debug mode or for errors/warnings."""
     if _DEBUG or level in ("error", "warning"):
         print(msg, flush=True)
-    if level == "error":
-        logger.error(msg)
-    elif level == "warning":
-        logger.warning(msg)
-    elif level == "debug":
-        logger.debug(msg)
-    else:
-        logger.info(msg)
+    logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
 
 class SerialDevice:
@@ -96,7 +91,7 @@ class SerialDevice:
                 if response:
                     verbose(f"Response at {rate} baud: {response[:100]}", "debug")
 
-                if self._has_prompt(response) or len(response) > 0:
+                if self._has_prompt(response) or response:
                     self.baud_rate = rate
                     verbose(f"✓ Connected at {rate} baud")
                     return True
@@ -835,6 +830,21 @@ class SerialDevice:
                             poll_buf = b""
                             self.ser.write(b"boot\r\n")
                             continue
+                        if (b"cmdline Flattened Device Tree" in poll_buf or
+                                b"valid device tree" in poll_buf):
+                            # bootm succeeded in loading the FIT kernel but the FIT
+                            # has no embedded FDT. The DTB is stored separately in
+                            # NOR at 0x500000 (confirmed layout). Load it and retry.
+                            verbose("  bootm: no embedded FDT — loading DTB from NOR 0x500000 and retrying...", "warning")
+                            poll_buf = b""
+                            self.ser.write(
+                                b"setenv fdt_high 0xffffffffffffffff;"
+                                b"sf probe 0;"
+                                b"sf read 0x90000000 0x500000 0x20000;"
+                                b"sf read 0x82000000 0xa00000 0x2000000;"
+                                b"bootm 0x82000000 - 0x90000000\r\n"
+                            )
+                            continue
                         verbose("✗ bootm failed — U-Boot prompt returned", "error")
                         verbose(f"  Output: {tail[-500:]!r}", "error")
                         return False
@@ -1195,9 +1205,11 @@ class SerialProxy:
         try:
             return self._ser.in_waiting
         except Exception:
-            # auto‑reconnect
-            self._parent._attempt_reconnect()
-            return self._ser.in_waiting
+            try:
+                self._parent._attempt_reconnect()
+                return self._ser.in_waiting
+            except Exception:
+                return 0
 
     # Fallback: forward any unknown attribute to real serial object.
     # Guard against missing _ser to prevent infinite recursion:

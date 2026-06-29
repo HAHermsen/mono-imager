@@ -49,9 +49,9 @@ def run_test(script: Path, extra_args: list[str] = None) -> bool:
     """Run a single test script, stream its output, return True on exit 0."""
     cmd = [sys.executable, str(script)] + (extra_args or [])
 
-    print(f"\n{BOLD}{'─' * 60}{RESET}")
-    print(f"{BOLD}▶  {script.name}{RESET}")
-    print(f"{'─' * 60}")
+    print(f"\n{BOLD}{'-' * 60}{RESET}")
+    print(f"{BOLD}>  {script.name}{RESET}")
+    print(f"{'-' * 60}")
 
     start  = time.time()
     result = subprocess.run(cmd, cwd=ROOT.parent)
@@ -109,7 +109,7 @@ def main():
     print(f"{BOLD}{'=' * 60}{RESET}")
 
     for name, ok in results:
-        mark = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
+        mark = f"{GREEN}PASS{RESET}" if ok else f"{RED}FAIL{RESET}"
         print(f"  {mark}  {name}")
 
     print(f"\n  {passed}/{total} passed", end="")
