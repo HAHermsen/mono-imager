@@ -22,7 +22,7 @@ Design constraints:
 
 Author:  H.A. Hermsen
 Version: v1.0.0
-License: MIT
+License: GPLv3
 """
 
 import sys

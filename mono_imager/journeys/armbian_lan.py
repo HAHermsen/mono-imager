@@ -12,7 +12,7 @@ Steps:
   6. Configure U-Boot to boot Armbian (setenv bootcmd + saveenv)
 
 Author:  H.A. Hermsen
-License: MIT
+License: GPLv3
 """
 
 import logging

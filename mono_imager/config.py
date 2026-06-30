@@ -4,7 +4,7 @@ Persists user preferences (last used port, etc.) across sessions.
 
 Author:  H.A. Hermsen
 Version: v1.0.0
-License: MIT
+License: GPLv3
 """
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py

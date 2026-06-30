@@ -6,7 +6,7 @@ Dumps full console output to logs/serial_response_<timestamp>.log
 
 Author:  H.A. Hermsen
 Version: 0.3.0
-License: MIT
+License: GPLv3
 """
 
 __version__ = "0.3.0"

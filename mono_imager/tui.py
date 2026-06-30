@@ -5,7 +5,7 @@ Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
 Version: v1.0.0
-License: MIT
+License: GPLv3
 """
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
@@ -169,7 +169,7 @@ class MonoImager:
         """
         version_line = f"mono-imager {__version__}"
         subtitle      = "mono gateway firmware flash utility"
-        license_line  = f"written by {__author__}, MIT licensed"
+        license_line  = f"written by {__author__}, GPLv3 licensed"
 
         inner_width = max(len(version_line), len(subtitle), len(license_line)) + 2
 

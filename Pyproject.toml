@@ -10,7 +10,7 @@ dynamic = ["version"]
 description = "Automated firmware flashing for Mono Gateway Routers and Dev Kit"
 readme = "README.md"
 authors = [{name = "H.A. Hermsen"}]
-license = "MIT"
+license = "GPLv3"
 requires-python = ">=3.10"
 dependencies = [
     "pyserial>=3.5",

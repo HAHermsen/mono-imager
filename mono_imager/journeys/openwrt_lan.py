@@ -23,7 +23,7 @@ U-Boot pre-step:
   never touched by the flash step.
 
 Author:  H.A. Hermsen
-License: MIT
+License: GPLv3
 """
 
 import gzip

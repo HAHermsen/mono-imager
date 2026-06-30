@@ -14,7 +14,7 @@ Image detection: scans USB for armbian*.img.xz or armbian*.img (case-insensitive
 Original vendor filenames work directly — no renaming needed.
 
 Author:  H.A. Hermsen
-License: MIT
+License: GPLv3
 """
 
 import logging

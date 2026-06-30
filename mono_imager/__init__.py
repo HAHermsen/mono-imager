@@ -5,7 +5,7 @@
 # Pyproject.toml reads this via:  dynamic = ["version"]  +  [tool.setuptools.dynamic]
 __version__ = "1.0.0"
 __author__  = "H.A. Hermsen"
-__license__ = "MIT"
+__license__ = "GPLv3"
 
 from .serial_device import SerialDevice
 from .tui import MonoImager

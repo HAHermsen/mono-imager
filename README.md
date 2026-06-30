@@ -193,7 +193,7 @@ See [mono_imager/journeys/JOURNEYS.md](mono_imager/journeys/JOURNEYS.md) for the
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+GPLv3 — see [LICENSE](LICENSE) for details.
 
 **Built for the Mono community.**  
 Questions? Open an issue or join the [Mono Discord](https://discord.gg/mono).

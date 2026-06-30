@@ -12,7 +12,7 @@ Steps:
   8. Reboot into OPNsense (DIP stays RIGHT / NOR)
 
 Author:  H.A. Hermsen
-License: MIT
+License: GPLv3
 """
 
 import logging

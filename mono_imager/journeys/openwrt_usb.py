@@ -18,7 +18,7 @@ U-Boot pre-step:
   patches the eMMC U-Boot env so OpenWRT boots from DIP=LEFT.
 
 Author:  H.A. Hermsen
-License: MIT
+License: GPLv3
 """
 
 import logging
