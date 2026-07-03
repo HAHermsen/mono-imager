@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v1.0.0
+Version: v1.1.0
 License: GPLv3
 """
 
@@ -21,14 +21,25 @@ from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
-_DEBUG = os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+def _debug_enabled() -> bool:
+    """
+    Read MONO_DEBUG live rather than freezing it into a module-level
+    constant at import time. mono_imager/__init__.py imports this module
+    eagerly (as soon as anything imports the mono_imager package at all —
+    including the installed `mono-imager` console-script wrapper, which
+    does `from mono_imager.cli import main` before main() ever runs) —
+    so a constant computed once at import time would miss a --debug/
+    --verbose CLI flag that cli.py sets via os.environ just before
+    calling into the rest of the app.
+    """
+    return os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 
 _LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
 
 def verbose(msg: str, level: str = "info"):
     """Log always; print to console only in debug mode or for errors/warnings."""
-    if _DEBUG or level in ("error", "warning"):
+    if _debug_enabled() or level in ("error", "warning"):
         print(msg, flush=True)
     logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
@@ -57,6 +68,9 @@ class SerialDevice:
         self.timeout = timeout
         self.ser = None
         self.baud_rate = None
+        # U-Boot env snapshot from the last phase1_uboot() call — see
+        # flash_orchestrator.capture_uboot_env()/restore_uboot_env().
+        self.captured_uboot_env: Optional[dict] = None
     
     def connect(self, baud_rate: Optional[int] = None) -> bool:
         """
@@ -135,6 +149,54 @@ class SerialDevice:
             if prompt in response:
                 return True
         return False
+
+    def probe_uboot_prompt(self, timeout: float = 2.0) -> bool:
+        """
+        Check whether the device is ALREADY sitting at the U-Boot prompt
+        (autoboot already interrupted in a previous attempt this
+        session), so phase1_uboot() can skip the "POWER CYCLE NOW" wait
+        entirely instead of forcing a fresh power cycle every time.
+
+        Safe because it can only ever SKIP THE WAIT — every step after
+        it (journey-specific U-Boot commands, boot_recovery(),
+        login_recovery()) still runs exactly as before; nothing
+        downstream is skipped or altered by a True result here.
+
+        Sends a bare Enter and checks for the U-Boot prompt marker
+        ("=>") specifically, not any known prompt — a recovery Linux
+        shell prompt also matches the bare "# " in UBOOT_PROMPTS via
+        _has_prompt(), which would be a WRONG positive here (recovery
+        Linux is past U-Boot, not at it), so this checks the literal
+        "=>" bytes only.
+
+        Returns:
+            True if the U-Boot prompt is confirmed present right now,
+            False otherwise (including on any read error — caller
+            should fall back to the normal power-cycle wait, not
+            assume anything).
+        """
+        if not self.ser or not self.ser.is_open:
+            return False
+
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(b"\r\n")
+        except serial.SerialException:
+            return False
+
+        start = time.time()
+        response = b""
+        while time.time() - start < timeout:
+            try:
+                chunk = self.ser.read(64)
+                if chunk:
+                    response += chunk
+                    if b"=>" in response:
+                        return True
+            except serial.SerialException:
+                break
+
+        return b"=>" in response
 
     def verify_recovery_shell(self, timeout: float = 5.0) -> bool:
         """
@@ -284,16 +346,37 @@ class SerialDevice:
         # no fixed sleeps; serial.read() already blocks up to self.timeout
         response = b""
         start_time = time.time()
+        matched_prompt = False
         while time.time() - start_time < timeout:
             try:
                 chunk = self.ser.read(1024)
                 if chunk:
                     response += chunk
                     if wait_for_prompt and self._has_prompt(response):
+                        matched_prompt = True
                         break
             except serial.SerialException:
                 break
-        
+
+        # CONFIRMED BUG THIS GUARDS AGAINST: _has_prompt() matches as soon
+        # as a prompt-like substring appears ANYWHERE in the accumulated
+        # response — e.g. a bare "# " that happens to occur mid-dump in a
+        # long reply (a real-hardware printenv dump can contain "# " inside
+        # a script-style env var). That fires this loop's break while the
+        # device is still actively transmitting the rest of its reply
+        # (including its own real trailing prompt). Without draining that
+        # straggling output here, it sits in the OS serial buffer and
+        # bleeds into whatever the NEXT command reads — confirmed on real
+        # hardware: a leftover "...Environment size: .../8188 bytes\r\n=> "
+        # from a preceding printenv call landed in boot_recovery()'s read
+        # loop and was misread as "bootm failed — U-Boot prompt returned",
+        # when the device was still genuinely mid-boot. Same race class
+        # already fixed in run_script() via _wait_for_line_idle() — this
+        # was the one call site (send_command(), used by capture_uboot_env())
+        # still missing it.
+        if matched_prompt:
+            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+
         response_str = response.decode('utf-8', errors='replace').strip()
         
         # Strip command echo (device echoes back what we sent).
@@ -800,6 +883,30 @@ class SerialDevice:
 
         try:
             verbose("Sending 'run recovery' command...", "debug")
+            # Flush stale bytes before sending. Without this, leftover
+            # output from a previous command (e.g. capture_uboot_env()'s
+            # printenv, whose own trailing "=> " prompt can still be
+            # unread in the OS serial buffer if send_command() returned
+            # early on a false prompt match) gets swept into poll_buf
+            # below and falsely triggers the "bootm failed" check —
+            # confirmed on real hardware: the "failure" output was
+            # actually a stale printenv tail + old prompt, not a real
+            # bootm failure. Every other command-sending method in this
+            # class already does this (send_command, probe_uboot_prompt,
+            # verify_recovery_shell, _stream_command); this was the one
+            # missing it.
+            #
+            # BELT AND SUSPENDERS: reset_input_buffer() only discards bytes
+            # already sitting in the OS buffer at this instant — it cannot
+            # stop a still-transmitting previous command (e.g. printenv)
+            # from delivering MORE straggling bytes a moment later, which
+            # would land right back in poll_buf below. Confirm the line is
+            # genuinely silent first (same _wait_for_line_idle() pattern
+            # used elsewhere in this file for this exact race), then reset,
+            # so nothing still in flight can sneak in between the flush and
+            # the write.
+            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+            self.ser.reset_input_buffer()
             self.ser.write(b"run recovery\r\n")
 
             poll_start = time.time()
@@ -857,9 +964,26 @@ class SerialDevice:
                                 break
                         self.ser.write(b"root\r\n")
                         time.sleep(0.5)
-                        self.ser.write(b"\r\n")
-                        time.sleep(0.5)
-                        response = self.ser.read_all().decode("utf-8", errors="replace")
+                        self.ser.write(b"\r\n")  # blank password — recovery Linux root has none
+
+                        # Poll for the shell prompt instead of one fixed-sleep
+                        # read_all(). CONFIRMED BUG THIS GUARDS AGAINST: right
+                        # after boot, login spawning a shell and printing its
+                        # prompt can take longer than a sub-second window under
+                        # real-world jitter — a one-shot read after 0.5s raced
+                        # this and captured the login sequence still in flight
+                        # (e.g. just "root\r\nPassword: \r\n", before the shell
+                        # prompt had printed), misreading a slow-but-successful
+                        # blank-password login as a real password requirement.
+                        response = b""
+                        login_start = time.time()
+                        while time.time() - login_start < 5.0:
+                            chunk = self.ser.read(256)
+                            if chunk:
+                                response += chunk
+                                if b"root@" in response and b"#" in response:
+                                    break
+                        response = response.decode("utf-8", errors="replace")
                         if "root@" in response and "#" in response:
                             verbose("✓ Recovery Linux booted and logged in")
                             return True

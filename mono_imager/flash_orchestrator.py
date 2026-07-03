@@ -18,7 +18,7 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: v1.0.0
+Version: v1.1.0
 License: GPLv3
 """
 
@@ -28,11 +28,8 @@ __author__  = "H.A. Hermsen"
 import itertools
 import logging
 import os
-import platform
 import shutil
 import socket
-import subprocess
-import sys
 import threading
 import time
 
@@ -46,11 +43,14 @@ from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner, Spinner
 
-# OS detection — cached at module load; OS does not change mid-process
-_IS_WINDOWS = platform.system().lower() == "windows"
-
-# Set MONO_DEBUG=1 to restore full verbose output to console.
-_DEBUG = os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+# Set MONO_DEBUG=1 (or `mono-imager --debug`/`--verbose`) to restore full
+# verbose output to console. Read live in verbose() rather than frozen into
+# a constant at import time — see serial_device._debug_enabled() for why
+# that matters (this module happens to be lazily imported today, so a
+# frozen constant would work here too, but reading live keeps both
+# modules consistent and doesn't depend on that staying true).
+def _debug_enabled() -> bool:
+    return os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
 
 # --- Logging setup -----------------------------------------------------------
 # Logging is initialised exactly once by tui.py/cli.py via
@@ -67,7 +67,7 @@ _LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logg
 
 def verbose(msg: str, level: str = "info"):
     """Log always; print to console only in debug mode or for errors/warnings."""
-    if _DEBUG or level in ("error", "warning"):
+    if _debug_enabled() or level in ("error", "warning"):
         print(msg, flush=True)
     logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
@@ -357,61 +357,108 @@ def detect_host_ip() -> str:
         return ""
 
 
-def pick_device_ip(host_ip: str) -> Optional[str]:
+def parse_active_eth_iface(ip_link_output: str) -> Optional[str]:
     """
-    Derive a device IP on the SAME /24 subnet as the host, instead of
-    a hardcoded default that may sit on a different subnet (the bug
-    that caused Step 07 to fail with 192.168.1.10 on a 192.168.168.x
-    host — see test_verify_flash_auto.py history).
+    Parse `ip link show` output and return the first eth* interface
+    that reports LOWER_UP (has a live carrier — a cable is actually
+    plugged in), or None if none do.
 
-    Uses .222 on the host's subnet — high, rarely DHCP-assigned.
+    Auto-detects whichever physical port the cable is actually in
+    rather than assuming a specific jack — recovery Linux boots with
+    every eth port administratively DOWN, so callers must bring all
+    candidate ports up first before this can find anything.
+    """
+    for line in ip_link_output.split('\n'):
+        if 'LOWER_UP' in line and ': ' in line:
+            parts = line.split(': ')
+            if len(parts) >= 2:
+                iface_name = parts[1].split()[0]
+                if iface_name.startswith('eth'):
+                    return iface_name
+    return None
 
-    Returns None if host_ip can't be parsed as a normal dotted-quad
-    IPv4 address — callers MUST handle this explicitly and should fail
-    loudly rather than guess. A previous version of this function
-    fell back to a hardcoded "192.168.1.10" here, which is exactly the
-    same class of bug this function exists to fix: a fixed IP that may
-    not be anywhere near the actual host's subnet. Silently returning
-    a guess in the error path just relocates the original bug rather
-    than fixing it. If host_ip can't be parsed, the right move is to
-    tell the user to switch to Manual mode and supply IPs themselves
-    — not to guess on their behalf.
+# --- U-Boot env capture/restore -----------------------------------------------
+# This hardware's U-Boot env backend is MMC-primary (see opnsense_lan.py's
+# uboot step comment: "MMC env backend is primary, so we must write while
+# MMC is intact, then erase after") — a whole-disk `dd` to eMMC (Armbian,
+# OPNsense) can reset the env storage area to factory defaults along with
+# the OS. capture_uboot_env() snapshots printenv before that happens
+# (called from phase1_uboot(), before any journey-specific U-Boot commands
+# run); restore_uboot_env() re-applies it afterward, for journeys that
+# re-enter U-Boot post-flash.
 
-    Shared here (rather than duplicated per test script) since any
-    caller bringing up device networking needs this same derivation —
-    test_verify_flash_auto.py, test_diagnose_run_script.py, and
-    tui.py all rely on this.
+def parse_uboot_env(printenv_output: str) -> dict:
+    """
+    Parse `printenv` output into a dict of {var: value}. U-Boot prints
+    one "key=value" pair per line; the trailing "Environment size: X/Y
+    bytes" summary line is excluded. Lines that don't look like a
+    plain key=value pair (no "=", or a key containing whitespace —
+    which would indicate a wrapped/garbled line rather than a real
+    var) are skipped rather than guessed at.
+    """
+    env = {}
+    for line in printenv_output.splitlines():
+        if "=" not in line or line.strip().startswith("Environment size"):
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and " " not in key:
+            env[key] = value
+    return env
+
+
+def capture_uboot_env(d: SerialDevice) -> Optional[dict]:
+    """
+    Snapshot the device's current U-Boot environment via `printenv`.
+    Returns None on failure (no response, or nothing parseable) —
+    callers must treat that as "no backup available" and skip the
+    restore later, not fail the whole bootstrap over it; capturing a
+    backup is a nice-to-have, not a hard prerequisite for flashing.
     """
     try:
-        octets = host_ip.split(".")
-        if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
-            raise ValueError(f"unexpected host IP format: {host_ip}")
-        subnet = ".".join(octets[:3])
-        candidate = f"{subnet}.222"
-        if candidate.split(".")[3] == octets[3]:
-            candidate = f"{subnet}.223"
-        return candidate
+        output = d.send_command("printenv", timeout=10)
     except Exception as e:
-        verbose(f"Could not derive device IP from host IP ({e}) — no safe fallback exists, caller must handle", "warning")
+        verbose(f"capture_uboot_env: printenv failed: {e}", "warning")
         return None
 
+    env = parse_uboot_env(output)
+    if not env:
+        verbose("capture_uboot_env: printenv returned no parseable vars", "warning")
+        return None
+    verbose(f"✓ Captured {len(env)} U-Boot env var(s) for post-flash restore", "debug")
+    return env
 
-def ping(ip: str, count: int = 3) -> bool:
-    """Ping an IP address. Returns True if reachable."""
-    if _IS_WINDOWS:
-        # -w: per-packet timeout in milliseconds
-        cmd = ["ping", "-n", str(count), "-w", "2000", ip]
-    elif sys.platform == "darwin":
-        # -W: per-packet timeout in milliseconds on macOS
-        cmd = ["ping", "-c", str(count), "-W", "2000", ip]
-    else:
-        # -W: per-packet timeout in seconds on Linux (-w is a total deadline, too tight)
-        cmd = ["ping", "-c", str(count), "-W", "2", ip]
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        return result.returncode == 0
-    except Exception:
-        return False
+
+def restore_uboot_env(d: SerialDevice, backup: Optional[dict]) -> int:
+    """
+    Re-apply a previously captured U-Boot environment snapshot (see
+    capture_uboot_env()) — used after a whole-disk flash to eMMC that
+    may have reset the env storage area to factory defaults.
+
+    Restores every captured var unconditionally, with no diffing
+    against the device's current env. This is safe as long as callers
+    restore BEFORE making their own intentional env changes (e.g.
+    setting bootcmd to boot the freshly-flashed OS) — U-Boot env is
+    last-write-wins, so those explicit setenv calls simply run after
+    this and take precedence; nothing intentional gets clobbered.
+
+    Caller is responsible for the final `saveenv` — batched together
+    with any of its own changes rather than saving twice here.
+
+    Returns the number of variables restored (0 if backup is falsy).
+    """
+    if not backup:
+        return 0
+    restored = 0
+    for key, value in backup.items():
+        try:
+            d.send_command(f'setenv {key} "{value}"', timeout=5)
+            restored += 1
+        except Exception as e:
+            verbose(f"restore_uboot_env: failed to restore {key}: {e}", "warning")
+    if restored:
+        verbose(f"✓ Restored {restored} U-Boot env var(s) from pre-flash snapshot")
+    return restored
 
 # --- Phase implementations ---------------------------------------------------
 # Unchanged from the proven test_flash_verify.py run (5/5 bootstrap on
@@ -425,6 +472,18 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     and interrupts U-Boot autoboot. Returns the device at the U-Boot
     prompt — ready for the caller to run any U-Boot commands before
     handing off to phase1_recovery().
+
+    If the device is already sitting at the U-Boot prompt (e.g. a
+    retry within the same session), the power-cycle wait is skipped —
+    see SerialDevice.probe_uboot_prompt(). This never skips anything
+    else; journey-specific U-Boot commands and phase1_recovery() still
+    run identically either way.
+
+    Also snapshots the current U-Boot environment (printenv) before
+    returning, so a later whole-disk flash to eMMC — which can reset
+    this hardware's env storage area to factory defaults, since its
+    U-Boot env backend is MMC-primary — has something to restore from.
+    See capture_uboot_env()/restore_uboot_env() below.
 
     No OS awareness. No eMMC erase. No bootcmd changes.
     Those belong in journey files.
@@ -454,21 +513,32 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     if not step(2, f"Connect at {baud} baud", connected):
         return None
 
-    # Step 3: Interrupt U-Boot
-    print()
-    print("=" * 60)
-    print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
-    print("=" * 60)
-    print()
-    interrupted, _autoboot_err = with_spinner(
-        d.wait_for_autoboot, timeout=60,
-        message="Waiting for U-Boot autoboot interrupt..."
-    )
-    if _autoboot_err:
-        interrupted = False
-    if not step(3, "U-Boot autoboot interrupted", interrupted):
+    # Step 3: Interrupt U-Boot — skip the wait if we're already there.
+    already_at_prompt = d.probe_uboot_prompt(timeout=2.0)
+    if already_at_prompt:
+        verbose("✓ Device already at U-Boot prompt — skipping power-cycle wait")
+        interrupted = True
+    else:
+        print()
+        print("=" * 60)
+        print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
+        print("=" * 60)
+        print()
+        interrupted, _autoboot_err = with_spinner(
+            d.wait_for_autoboot, timeout=60,
+            message="Waiting for U-Boot autoboot interrupt..."
+        )
+        if _autoboot_err:
+            interrupted = False
+    if not step(3, "U-Boot autoboot interrupted", interrupted,
+                "already at prompt — power cycle skipped" if already_at_prompt else ""):
         d.disconnect()
         return None
+
+    # Snapshot the env now, before any journey-specific U-Boot commands
+    # run — see capture_uboot_env() below. Failure is non-fatal here;
+    # it just leaves nothing to restore later.
+    d.captured_uboot_env = capture_uboot_env(d)
 
     return d
 
@@ -537,68 +607,6 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     if d is None:
         return None
     return phase1_recovery(d)
-
-
-def phase2_network(d: SerialDevice, host_ip: str, device_ip: str, port: int, firmware_path: Path):
-    """
-    Phase 2: Network prep — bring up active Ethernet port, assign IP, ping check, start HTTP server.
-    Auto-detects which port has carrier (LOWER_UP) instead of hardcoding eth0.
-    Returns HTTPServer on success, None on failure.
-    """
-    verbose("=" * 60)
-    verbose("Phase 2 — Network prep (TCP)")
-    verbose("=" * 60)
-    console_logger.info("Setting up network...")
-
-    # Step 6a: Auto-detect and bring up active Ethernet port
-    # Bring up all eth* ports to allow them to acquire carrier,
-    # then detect which one has LOWER_UP. Recovery Linux doesn't persist
-    # network config across boots, so ports start DOWN.
-    try:
-        ip_output = ""
-        with Spinner("Detecting active Ethernet port..."):
-            for port_num in range(5):
-                try:
-                    d.send_command(f"ip link set eth{port_num} up", timeout=5)
-                except Exception:
-                    pass  # Port might not exist, that's ok
-            ip_output = d.send_command("ip link show", timeout=5)
-        active_iface = None
-        for line in ip_output.split('\n'):
-            if 'LOWER_UP' in line and ': ' in line:
-                parts = line.split(': ')
-                if len(parts) >= 2:
-                    iface_name = parts[1].split()[0]
-                    if iface_name.startswith('eth'):
-                        active_iface = iface_name
-                        break
-        if not active_iface:
-            verbose("No active Ethernet port detected (no LOWER_UP on any eth port)", "error")
-            return None
-        iface = active_iface
-        verbose(f"Auto-detected active Ethernet port: {iface}")
-    except Exception as e:
-        verbose(f"Failed to detect Ethernet port: {e}", "error")
-        return None
-
-    # Step 6: Assign IP to the active interface (it's already up from Step 6a)
-    r = d.send_command(f"ip addr add {device_ip}/24 dev {iface}", timeout=5)
-    up = "error" not in r.lower() or "exists" in r.lower()
-    if not step(6, f"{iface} up, device IP {device_ip} assigned", up, r if not up else ""):
-        return None
-
-    # Step 7: Ping check
-    reachable = ping(device_ip)
-    if not step(7, f"Device {device_ip} reachable from host", reachable,
-                "check host NIC is on same subnet" if not reachable else ""):
-        return None
-
-    # Step 8: HTTP server
-    server = start_http_server(host_ip, port, firmware_path)
-    if not step(8, f"HTTP server up on {host_ip}:{port}", server is not None):
-        return None
-
-    return server
 
 
 def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
@@ -671,9 +679,9 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     # alongside do_GET above), since BaseHTTPRequestHandler returns 501
     # for HEAD by default.
     check_script = (
-        f"curl -s -I -o /dev/null -w '%{{http_code}}' {url} "
+        f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
         f"> /tmp/mono_imager_step09_code.txt; "
-        f"curl -s -X POST --data-binary @/tmp/mono_imager_step09_code.txt "
+        f"curl -sk -X POST --data-binary @/tmp/mono_imager_step09_code.txt "
         f"\"http://{host_ip}:{port}/report?step=09\" >/dev/null 2>&1"
     )
     # Every isolated test of this exact script (test_run_script_reliability.py
@@ -781,7 +789,7 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
             "warning"
         )
         flash_script = (
-            f"curl -s {url} 2>/tmp/mono_imager_step10_flash.log | "
+            f"curl -sk {url} 2>/tmp/mono_imager_step10_flash.log | "
             f"dd of={flash_target} bs=1M "
             f">> /tmp/mono_imager_step10_flash.log 2>&1; "
             f"cat /tmp/mono_imager_step10_flash.log"
@@ -789,7 +797,7 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     else:
         local_fw_path = "/tmp/mono_imager_firmware.img"
         flash_script = (
-            f"curl -s -o {local_fw_path} {url} "
+            f"curl -sk -o {local_fw_path} {url} "
             f"> /tmp/mono_imager_step10_flash.log 2>&1; "
             f"dd if={local_fw_path} of={flash_target} bs=4096 "
             f">> /tmp/mono_imager_step10_flash.log 2>&1; "

@@ -19,9 +19,9 @@ The resolved sequences for all current journeys:
 
 ```
 OPNsense + lan   →  8 steps
-OPNsense + usb   →  8 steps
+OPNsense + usb   →  9 steps
 OpenWRT  + lan   →  8 steps
-OpenWRT  + usb   →  8 steps
+OpenWRT  + usb   →  9 steps
 Armbian  + lan   →  6 steps
 Armbian  + usb   →  5 steps
 ```
@@ -38,6 +38,7 @@ You never write that sequence by hand. It falls out of the `requires`/`produces`
 | `mono_imager/journeys/__init__.py` | Auto-discovery, `get_journey()`, `discovered_journeys()`, flash targets |
 | `mono_imager/journeys/<os>_<transfer>.py` | Step implementations — one file per OS/transfer pair |
 | `mono_imager/journeys/usb_utils.py` | Shared USB file detection helpers |
+| `mono_imager/journeys/_common.py` | Shared steps reused across journeys (e.g. "Device network ready") — leading `_` means it's not auto-discovered; a journey file must explicitly `import` it to trigger its `@register_step` calls |
 
 To add or modify journey steps, edit or create the appropriate `journeys/<os>_<transfer>.py` file. Everything else (`flash_orchestrator.py`, `tui.py`, etc.) is infrastructure you don't touch when adding journeys.
 
@@ -64,9 +65,15 @@ class StepContext:
 
     # Network journeys
     host_ip:       str            # host PC IP address
-    device_ip:     str            # IP to assign to device
+    device_ip:     str            # device's own IP (mirrors device_net["ip"])
     http_port:     int            # port for firmware HTTP server
     device_mac:    str            # device MAC (for firmware auth)
+    device_net:    dict | None    # {"ip","prefix","gateway","dns","iface","source"} —
+                                   # resolved once by MonoImager._setup_recovery_network()
+                                   # (DHCP-first, verified, manual fallback) before the
+                                   # journey starts. Steps that need the network declare
+                                   # requires=["network_up"], produced by _common.py's
+                                   # shared "Device network ready" step.
 
     # Firmware
     firmware_path: Path           # path to firmware image on host
@@ -198,14 +205,15 @@ for i, label in enumerate(steps, 1):
 
 Output:
 ```
-  1. Confirm DIP switch is RIGHT (NOR)
-  2. Mount USB stick
-  3. Detect firmware file on USB
-  4. Flash OPNsense image (bzip2 | dd)
-  5. Unmount USB stick
-  6. Detect device MAC address
-  7. Re-image eMMC firmware (firmware update)
-  8. Reboot into OPNsense
+  1. Device network ready
+  2. Confirm DIP switch is RIGHT (NOR)
+  3. Mount USB stick
+  4. Detect firmware file on USB
+  5. Flash OPNsense image (bzip2 | dd)
+  6. Unmount USB stick
+  7. Detect device MAC address
+  8. Re-image eMMC firmware (firmware update)
+  9. Reboot into OPNsense
 ```
 
 ---

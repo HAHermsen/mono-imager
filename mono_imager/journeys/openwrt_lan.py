@@ -2,7 +2,7 @@
 mono-imager journey: OpenWRT via LAN
 
 Steps:
-  1. Network setup (eth0)
+  1. Device network ready
   2. Start HTTP server
   3. Verify firmware reachable
   4. Flash OpenWRT image (dd bs=4096)
@@ -37,7 +37,10 @@ from pathlib import Path
 
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
 from mono_imager.spinner import with_spinner, Spinner
-from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
+from mono_imager.flash_orchestrator import (
+    step, verbose, console_logger, start_http_server, wait_for_report,
+)
+from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
 logger = logging.getLogger(__name__)
 
@@ -390,18 +393,6 @@ def _extract_sysupgrade_rootfs(firmware_path: Path) -> tuple[Path, bool]:
     return firmware_path, False
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["network_up"], label="Network setup (eth0)")
-def step_network_setup(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Network setup"); verbose("=" * 60)
-    d = ctx.device
-    try:
-        d.send_command("ip link set eth0 up", timeout=10)
-        d.send_command(f"ip addr add {ctx.device_ip}/24 dev eth0", timeout=10)
-        return step(0, f"Network up ({ctx.device_ip})", True)
-    except Exception as e:
-        return step(0, "Network up", False, str(e))
-
-
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["http_server_up"], label="Start HTTP server")
 def step_http_server_start(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
@@ -429,9 +420,9 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
     url = f"http://{ctx.host_ip}:{ctx.http_port}/firmware.img"
     ctx.set("firmware_source", url)
     check_script = (
-        f"curl -s -I -o /dev/null -w '%{{http_code}}' {url} "
+        f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
         f"> /tmp/mono_imager_step06_code.txt; "
-        f"curl -s -X POST --data-binary @/tmp/mono_imager_step06_code.txt "
+        f"curl -sk -X POST --data-binary @/tmp/mono_imager_step06_code.txt "
         f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=06\" >/dev/null 2>&1"
     )
     try:
@@ -488,35 +479,35 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     if serve_raw:
         # Raw ext4 served directly — stream into dd, no gunzip
         flash_script = (
-            f"{{ curl -s {source} | "
+            f"{{ curl -sk {source} | "
             f"dd of={ctx.flash_target} bs=4096; }} "
             f"> /tmp/mono_imager_step07_flash.log 2>&1; "
             f"sync; "
-            f"curl -s -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
+            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
             f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
             f">/dev/null 2>&1"
         )
         console_logger.info("Flashing OpenWRT (raw ext4) — this takes several minutes...")
     elif str(ctx.firmware_path).lower().endswith(".gz"):
         flash_script = (
-            f"{{ curl -s {source} | gunzip -c | "
+            f"{{ curl -sk {source} | gunzip -c | "
             f"dd of={ctx.flash_target} bs=4096; }} "
             f"> /tmp/mono_imager_step07_flash.log 2>&1; "
             f"sync; "
-            f"curl -s -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
+            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
             f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
             f">/dev/null 2>&1"
         )
         console_logger.info("Flashing OpenWRT (gz streaming) — this takes several minutes...")
     else:
         flash_script = (
-            f"curl -s -o /tmp/mono_imager_firmware.img {source} "
+            f"curl -sk -o /tmp/mono_imager_firmware.img {source} "
             f"> /tmp/mono_imager_step07_flash.log 2>&1; "
             f"dd if=/tmp/mono_imager_firmware.img of={ctx.flash_target} bs=4096 "
             f">> /tmp/mono_imager_step07_flash.log 2>&1; "
             f"sync; "
             f"rm -f /tmp/mono_imager_firmware.img; "
-            f"curl -s -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
+            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
             f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
             f">/dev/null 2>&1"
         )
@@ -559,23 +550,13 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
 
 @register_step(
     os=[OS], transfer=["lan", "usb"],
-    requires=["os_flashed"], produces=["firmware_updated"],
+    requires=["os_flashed", "network_up"], produces=["firmware_updated"],
     label="Firmware update (eMMC bootloader)"
 )
 def step_firmware_update(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Firmware update"); verbose("=" * 60)
     d = ctx.device
     try:
-        if ctx.transfer == "lan" and ctx.host_ip:
-            d.send_command(
-                f"ip route add default via {ctx.host_ip} 2>/dev/null || true",
-                timeout=10
-            )
-        else:
-            d.send_command(
-                "ip link set eth0 up 2>/dev/null; udhcpc -i eth0 -n -q 2>/dev/null || true",
-                timeout=25
-            )
         response, _fw_err = with_spinner(
             d.send_command,
             "printf 'yes\\n' | firmware update 2>&1; echo RC=$?",

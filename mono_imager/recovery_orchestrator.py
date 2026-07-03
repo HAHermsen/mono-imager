@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.0.0
+Version: v1.1.0
 License: GPLv3
 """
 
@@ -47,7 +47,15 @@ from typing import Optional, Callable
 from mono_imager.serial_device import SerialDevice
 
 logger = logging.getLogger(__name__)
-console_logger = logging.getLogger(__name__ + ".console")
+# Must match logging_setup.py's "mono_imager.console" exactly — that's the
+# only logger name with a stdout handler attached (see configure_logging()).
+# This used to be __name__ + ".console" ("mono_imager.recovery_orchestrator
+# .console"), a different, unconfigured logger with no stdout handler — every
+# console_logger.info() call in this module was silently going to the
+# file-only root logger and never reaching the terminal. flash_orchestrator.py
+# already uses the correct fixed name; this brings recovery_orchestrator.py
+# in line with it.
+console_logger = logging.getLogger("mono_imager.console")
 
 # --- Result tracker (ISOLATED from flash_orchestrator.results — see
 #     module docstring for why) -----------------------------------------
@@ -110,10 +118,19 @@ def detect_modern_firmware_tool(d: SerialDevice) -> Optional[bool]:
         cmdline = ""
 
     if "boot_medium=" not in cmdline:
-        logger.info(
+        reason = (
             "'firmware' command present but boot_medium= absent from kernel cmdline "
             "(old U-Boot) — falling back to legacy path"
         )
+        logger.info(reason)
+        # Also on-screen, not just the log file: without this, "legacy
+        # firmware tool detected" alone reads like a mis-detection —
+        # the modern binary genuinely is there, so seeing why it's being
+        # skipped (an old U-Boot never sets boot_medium=, a device-side
+        # gap this tool can't fix) matters more here than for the plain
+        # "no firmware command at all" case just above, which is
+        # self-explanatory without extra detail.
+        console_logger.info(f"  ({reason})")
         return False
 
     return True
@@ -169,13 +186,17 @@ def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
                 marker="check_gateway", exec_timeout=timeout,
             )
         except RuntimeError as e:
-            logger.warning(f"check_internet_reachable: gateway ping failed to run: {e}")
+            msg = f"Could not run the gateway ping check at all: {e}"
+            logger.warning(f"check_internet_reachable: {msg}")
+            console_logger.info(f"  ⚠ {msg}")
             return False
         if "RC=0" not in gw_output:
-            logger.error(
+            msg = (
                 f"Gateway {gateway} is not reachable from the device — "
                 "check the cable and which physical port is actually in use."
             )
+            logger.error(msg)
+            console_logger.info(f"  ⚠ {msg}")
             return False
 
     try:
@@ -184,17 +205,76 @@ def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
             marker="check_internet_host", exec_timeout=timeout,
         )
     except RuntimeError as e:
-        logger.warning(f"check_internet_reachable: host ping failed to run: {e}")
+        msg = f"Could not run the internet-host ping check at all: {e}"
+        logger.warning(f"check_internet_reachable: {msg}")
+        console_logger.info(f"  ⚠ {msg}")
         return False
 
     if "RC=0" not in host_output:
-        logger.error(
+        msg = (
             f"{host} is not reachable from the device — gateway responds but "
             "there's no real path to the internet (DNS, routing, or upstream issue)."
         )
+        logger.error(msg)
+        console_logger.info(f"  ⚠ {msg}")
         return False
 
     return True
+
+
+def try_dhcp(d: SerialDevice, iface: str = "eth0", timeout: int = 12) -> Optional[dict]:
+    """
+    Bring up `iface` and request a lease via udhcpc, then read back
+    whatever the lease actually produced (IP/prefix, default gateway,
+    DNS) instead of assuming success.
+
+    Single run_script() round trip — same "one round trip beats many"
+    reasoning as tui.py's _setup_recovery_network eth-up sequence:
+    each round trip on this link costs real seconds, so the lease
+    request and the three read-back commands are combined into one
+    script body.
+
+    -t 3 -T 2 caps udhcpc's own retry/backoff schedule (BusyBox's
+    default is ~3 attempts with increasing per-attempt timeouts,
+    ~20+ real seconds before giving up with no responder) — a real
+    DHCP server answers the first discover in well under a second
+    regardless of these flags, so this only speeds up the FAILURE
+    path (no server on this network) and falls back to manual entry
+    much sooner; it does not affect the success path at all.
+
+    Returns {"ip", "prefix", "gateway", "dns"} on a lease that produced
+    both an address and a default route. Returns None if udhcpc got no
+    lease, or the output couldn't be parsed — callers must treat that
+    as "DHCP failed" and fall back to manual entry, not guess.
+    """
+    try:
+        output = d.run_script(
+            f"ip link set {iface} up 2>/dev/null; "
+            f"udhcpc -i {iface} -n -q -t 3 -T 2 2>/dev/null; "
+            f"ip -4 addr show {iface}; "
+            f"echo ---ROUTE---; ip route show default; "
+            f"echo ---DNS---; cat /etc/resolv.conf 2>/dev/null",
+            marker="try_dhcp", exec_timeout=timeout,
+        )
+    except RuntimeError as e:
+        logger.warning(f"try_dhcp: run_script failed: {e}")
+        return None
+
+    ip_match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", output)
+    gw_match = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", output)
+    if not ip_match or not gw_match:
+        logger.info("try_dhcp: no lease obtained (no address and/or no default route)")
+        return None
+
+    dns_match = re.search(r"nameserver\s+(\S+)", output)
+
+    return {
+        "ip": ip_match.group(1),
+        "prefix": ip_match.group(2),
+        "gateway": gw_match.group(1),
+        "dns": dns_match.group(1) if dns_match else "",
+        "iface": iface,
+    }
 
 
 # --- Modern path: `firmware update` -------------------------------------
@@ -355,8 +435,13 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     # appears regardless. auto_confirm_text/auto_confirm_response
     # were already built into _stream_command() for exactly this,
     # just never passed in at this call site. Wiring them up here.
+    #
+    # --preserve-env is always passed (not user-configurable): without
+    # it, the device's own env restore is skipped and U-Boot vars this
+    # tool doesn't separately back up can be lost. Always preserving is
+    # strictly safer than the previous default of not preserving.
     output = _stream_command(
-        d, "firmware update",
+        d, "firmware update --preserve-env",
         idle_timeout=idle_timeout, max_total=max_total,
         auto_confirm_response="yes",
         on_output=on_output,
@@ -494,8 +579,16 @@ def legacy_flash_emmc(d: SerialDevice, mac: str) -> bool:
     if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", mac):
         logger.error(f"legacy_flash_emmc: invalid MAC address: {mac!r}")
         return False
+    # -z <file>: curl only re-downloads if the server's copy is newer
+    # than the local file's mtime (compares Last-Modified), instead of
+    # unconditionally re-fetching tens of MB every single run even when
+    # a previous attempt already left the exact same file sitting there
+    # (confirmed on real hardware: firmware-emmc-gateway-dk.bin survives
+    # between recovery-shell boots on the same eMMC/NOR image). Safer
+    # than skipping on bare filename presence, which would silently
+    # flash a stale image if firmware.mono.si ever published an update.
     cmd = (
-        f"curl -u mono:{mac} -O {LEGACY_EMMC_URL} && "
+        f"curl -k -u mono:{mac} -z firmware-emmc-gateway-dk.bin -O {LEGACY_EMMC_URL} && "
         f"dd if=firmware-emmc-gateway-dk.bin of=/dev/mmcblk0 bs=4096 skip=1 seek=1; "
         f"echo RC=$?"
     )
@@ -519,8 +612,10 @@ def legacy_flash_nor(d: SerialDevice, mac: str) -> bool:
     if not re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", mac):
         logger.error(f"legacy_flash_nor: invalid MAC address: {mac!r}")
         return False
+    # -z: see legacy_flash_emmc() above — skip re-download only when the
+    # server's copy isn't newer than what's already sitting on the device.
     cmd = (
-        f"curl -u mono:{mac} -O {LEGACY_NOR_URL} && "
+        f"curl -k -u mono:{mac} -z firmware-qspi-gateway-dk.bin -O {LEGACY_NOR_URL} && "
         f"flashcp -v firmware-qspi-gateway-dk.bin /dev/mtd0; "
         f"echo RC=$?"
     )

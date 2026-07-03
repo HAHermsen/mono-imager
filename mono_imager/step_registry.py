@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mono-imager: Step Registry (v1.0.0)
+mono-imager: Step Registry (v1.1.0)
 
 Decorator-based step registry. Steps declare os=, transfer=,
 requires=, produces=. FlowRunner resolves the correct sequence
@@ -23,7 +23,7 @@ ADDING A JOURNEY:
     3. FlowRunner builds the sequence from requires/produces
 
 Author:  H.A. Hermsen
-Version: v1.0.0
+Version: v1.1.0
 License: GPLv3
 """
 
@@ -61,6 +61,13 @@ class StepContext:
     device_ip:     str            = ""
     http_port:     int            = 8080
     device_mac:    str            = ""
+
+    # Device's own recovery-shell network (DHCP or manual), resolved once
+    # per session by MonoImager._setup_recovery_network() / startup network
+    # detection and forwarded to every journey regardless of OS/transfer.
+    # {"ip", "prefix", "gateway", "dns", "source"} or None if unresolved.
+    # Whether a given journey actually uses this is up to that journey.
+    device_net:    Optional[dict] = None
 
     # Firmware source
     firmware_path: Optional[Path] = None   # local path (network: served; usb: on stick)

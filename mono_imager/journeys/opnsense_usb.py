@@ -2,14 +2,15 @@
 mono-imager journey: OPNsense via USB
 
 Steps:
-  1. Confirm DIP switch is RIGHT (NOR)
-  2. Mount USB stick
-  3. Verify firmware file on USB
-  4. Flash OPNsense image (bzip2 -dck | dd bs=1M)
-  5. Unmount USB stick
-  6. Detect device MAC address
-  7. Re-image eMMC firmware (firmware update)
-  8. Reboot into OPNsense (DIP stays RIGHT / NOR)
+  1. Device network ready
+  2. Confirm DIP switch is RIGHT (NOR)
+  3. Mount USB stick
+  4. Verify firmware file on USB
+  5. Flash OPNsense image (bzip2 -dck | dd bs=1M)
+  6. Unmount USB stick
+  7. Detect device MAC address
+  8. Re-image eMMC firmware (firmware update)
+  9. Reboot into OPNsense (DIP stays RIGHT / NOR)
 
 Author:  H.A. Hermsen
 License: GPLv3
@@ -21,6 +22,7 @@ from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size
 from mono_imager.journeys.opnsense_lan import _uboot_steps_opnsense_lan
+from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +123,12 @@ def step_unmount_usb(ctx: StepContext) -> bool:
         return step(0, "USB unmount", True)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["device_mac_known"], label="Detect device MAC address")
+@register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["device_mac_known"], label="Detect device MAC address")
 def step_detect_mac(ctx: StepContext) -> bool:
     d = ctx.device
+    iface = (ctx.device_net or {}).get("iface", "eth0")
     try:
-        result = d.run_script("cat /sys/class/net/eth0/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=5)
+        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=5)
         mac = result.strip()
         if mac and mac != "unknown" and ":" in mac:
             ctx.device_mac = mac
@@ -140,7 +143,7 @@ def step_detect_mac(ctx: StepContext) -> bool:
     return True
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")
+@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known", "network_up"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")
 def step_reimage_emmc_firmware(ctx: StepContext) -> bool:
     from mono_imager.recovery_orchestrator import run_firmware_update
     d = ctx.device

@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: v1.0.0
+Version: v1.1.0
 License: GPLv3
 """
 

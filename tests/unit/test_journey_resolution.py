@@ -49,8 +49,8 @@ def check(label, condition):
 
 EXPECTED = {
     ("OPNsense", "lan"): [
+        "Device network ready",
         "Confirm DIP switch is RIGHT (NOR)",
-        "Network setup (eth0)",
         "Start HTTP server",
         "Verify firmware reachable",
         "Flash OPNsense image (bzip2 | dd)",
@@ -59,6 +59,7 @@ EXPECTED = {
         "Reboot into OPNsense",
     ],
     ("OPNsense", "usb"): [
+        "Device network ready",
         "Confirm DIP switch is RIGHT (NOR)",
         "Mount USB stick",
         "Detect firmware file on USB",
@@ -69,7 +70,7 @@ EXPECTED = {
         "Reboot into OPNsense",
     ],
     ("OpenWRT", "lan"): [
-        "Network setup (eth0)",
+        "Device network ready",
         "Start HTTP server",
         "Verify firmware reachable",
         "Partition eMMC (fdisk)",
@@ -79,6 +80,7 @@ EXPECTED = {
         "Reboot device",
     ],
     ("OpenWRT", "usb"): [
+        "Device network ready",
         "Partition eMMC (fdisk)",
         "Mount USB stick",
         "Detect firmware file on USB",
@@ -89,7 +91,7 @@ EXPECTED = {
         "Reboot device",
     ],
     ("Armbian", "lan"): [
-        "Network setup (eth0)",
+        "Device network ready",
         "Start HTTP server",
         "Verify firmware reachable",
         "Flash Armbian image (dd bs=1M)",
@@ -185,7 +187,7 @@ print("=" * 60)
 print("Transfer isolation — lan vs USB steps")
 print("=" * 60)
 
-LAN_ONLY = ["Network setup (eth0)", "Start HTTP server", "Verify firmware reachable"]
+LAN_ONLY = ["Start HTTP server", "Verify firmware reachable"]
 USB_ONLY = ["Mount USB stick", "Detect firmware file on USB", "Unmount USB stick"]
 
 for os_name in SUPPORTED_OS:
@@ -195,6 +197,21 @@ for os_name in SUPPORTED_OS:
         check(f"'{s}' absent from {os_name} + usb", s not in usb_steps)
     for s in USB_ONLY:
         check(f"'{s}' absent from {os_name} + lan", s not in lan_steps)
+
+# "Device network ready" is present in every LAN journey (needed for the
+# HTTP flash transfer) and in the USB journeys whose post-flash step needs
+# real internet access (OpenWRT/OPNsense's firmware update) — but NOT in
+# Armbian-via-USB, which never touches the network at all.
+for os_name in SUPPORTED_OS:
+    check(f"'Device network ready' present in {os_name} + lan",
+          "Device network ready" in list_journey(os_name, "lan"))
+
+check("'Device network ready' present in OpenWRT + usb",
+      "Device network ready" in list_journey("OpenWRT", "usb"))
+check("'Device network ready' present in OPNsense + usb",
+      "Device network ready" in list_journey("OPNsense", "usb"))
+check("'Device network ready' absent from Armbian + usb",
+      "Device network ready" not in list_journey("Armbian", "usb"))
 
 
 # ============================================================================

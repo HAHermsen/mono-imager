@@ -1,4 +1,4 @@
-# mono-imager v1.0.0
+# mono-imager v1.1.0
 
 Automated firmware flashing tool for Mono Gateway Routers and the Mono Development Kit.  
 Provides a guided, reliable flashing experience with serial console control, HTTP and USB firmware transfer, U‑Boot recovery handling, and full OPNsense eMMC re-imaging support.
@@ -109,9 +109,9 @@ Matching is case-insensitive. A **16 GB minimum** stick is recommended to cache 
 | OS | Transfer | Steps |
 |----|----------|-------|
 | OPNsense | LAN (HTTP server) | 8 |
-| OPNsense | USB stick | 8 |
+| OPNsense | USB stick | 9 |
 | OpenWRT | LAN (HTTP server) | 8 |
-| OpenWRT | USB stick | 8 |
+| OpenWRT | USB stick | 9 |
 | Armbian | LAN (HTTP server) | 6 |
 | Armbian | USB stick | 5 |
 
@@ -151,13 +151,20 @@ mono_imager/
 
 **Bootstrap timeout** — Power cycle the device manually when prompted. If U-Boot autoboot is too fast, the tool may miss the interrupt window.
 
-**Network step fails** — Ensure the Ethernet cable is in the rightmost RJ-45 port (eth0 / `fm1-mac2`). Other ports may not be active in recovery.
+**Network step fails** — Any RJ-45 port works; the active one is auto-detected and the device's IP is resolved via DHCP automatically. If no DHCP response comes back, you'll be prompted to enter the device IP, subnet mask, gateway, and DNS server manually.
 
 **OPNsense auth error (401)** — The MAC address provided does not match the firmware server's records. Check the label on the device or the U-Boot output for the correct MAC.
 
 **Flash takes a long time** — Normal. OPNsense LAN flash typically completes in ~5–6 minutes over a local gigabit connection.
 
-**Need full serial trace output** — Set `MONO_DEBUG=1` before launching to restore verbose console output including all serial commands sent and received:
+**Need full serial trace output** — Pass `--debug` (or its alias `--verbose`) to restore verbose console output including all serial commands sent and received:
+
+```bash
+mono-imager --debug
+mono-imager --verbose   # same thing, either spelling
+```
+
+Equivalent to setting the `MONO_DEBUG=1` environment variable before launching, which still works too:
 
 ```bash
 # Windows
@@ -167,7 +174,7 @@ set MONO_DEBUG=1 && mono-imager
 MONO_DEBUG=1 mono-imager
 ```
 
-All serial I/O is always written to the log file regardless of this setting.
+Quiet console output is the default either way — all serial I/O is always written to the log file regardless of this setting.
 
 For more help, open an issue on GitHub or join the [Mono Discord](https://discord.gg/mono).
 

@@ -2,12 +2,13 @@
 mono-imager journey: OpenWRT via USB
 
 Steps:
-  1. Mount USB stick
-  2. Detect firmware file on USB
-  3. Flash OpenWRT image (dd)
-  4. Unmount USB stick
-  5. Firmware update (eMMC bootloader)
-  6. Reboot device
+  1. Device network ready
+  2. Mount USB stick
+  3. Detect firmware file on USB
+  4. Flash OpenWRT image (dd)
+  5. Unmount USB stick
+  6. Firmware update (eMMC bootloader)
+  7. Reboot device
 
 Image detection: scans USB for openwrt*.bin.gz / openwrt*.bin / openwrt*.img (case-insensitive).
 Sysupgrade .bin.gz format is handled on-device: extracts the 'root' ext4 member from the
@@ -28,6 +29,7 @@ from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
 from mono_imager.journeys.openwrt_lan import _uboot_steps_openwrt_lan
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size
+from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
 logger = logging.getLogger(__name__)
 

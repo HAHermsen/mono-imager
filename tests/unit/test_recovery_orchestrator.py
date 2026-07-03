@@ -127,7 +127,7 @@ check("success detected", rec.run_firmware_update(d, idle_timeout=0.3, max_total
 # but the device never sees it trigger (harmless). We only check it was NOT triggered
 # as a confirmation, not that no bytes were written.
 sent = b"".join(d.ser.written)
-check("firmware update command was sent to device", b"firmware update\r\n" in sent)
+check("firmware update command was sent to device", b"firmware update --preserve-env\r\n" in sent)
 
 d = MagicMock()
 d.ser = FakeSerial(b"curl: connection refused\n")
@@ -199,6 +199,61 @@ d = MagicMock()
 d.run_script.side_effect = RuntimeError("serial broke")
 check("run_script raising -> False (no crash)",
       rec.check_internet_reachable(d, gateway="192.168.1.1") is False)
+
+
+# ============================================================================
+# try_dhcp()
+# ============================================================================
+
+print()
+print("=" * 60)
+print("try_dhcp()")
+print("=" * 60)
+
+d = MagicMock()
+d.run_script.return_value = (
+    "udhcpc: lease obtained\n"
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "    inet 10.0.0.69/24 scope global eth0\n"
+    "---ROUTE---\n"
+    "default via 10.0.0.1 dev eth0\n"
+    "---DNS---\n"
+    "nameserver 10.0.0.1\n"
+    "nameserver 8.8.8.8\n"
+)
+lease = rec.try_dhcp(d)
+check("lease IP parsed",      lease is not None and lease["ip"] == "10.0.0.69")
+check("lease prefix parsed",  lease is not None and lease["prefix"] == "24")
+check("lease gateway parsed", lease is not None and lease["gateway"] == "10.0.0.1")
+check("first DNS parsed",     lease is not None and lease["dns"] == "10.0.0.1")
+
+d = MagicMock()
+d.run_script.return_value = "udhcpc: sending discover\nudhcpc: no lease, forking to background\n"
+check("no lease -> None", rec.try_dhcp(d) is None)
+
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "    inet 10.0.0.69/24 scope global eth0\n"
+    "---ROUTE---\n"
+    "---DNS---\n"
+)
+check("address but no default route -> None", rec.try_dhcp(d) is None)
+
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "    inet 10.0.0.69/24 scope global eth0\n"
+    "---ROUTE---\n"
+    "default via 10.0.0.1 dev eth0\n"
+    "---DNS---\n"
+)
+check("no resolv.conf entries -> dns is empty string (not an error)",
+      rec.try_dhcp(d) == {"ip": "10.0.0.69", "prefix": "24", "gateway": "10.0.0.1", "dns": "", "iface": "eth0"})
+
+d = MagicMock()
+d.run_script.side_effect = RuntimeError("serial broke")
+check("run_script raising -> None (no crash)", rec.try_dhcp(d) is None)
 
 
 # ============================================================================

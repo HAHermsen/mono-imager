@@ -79,10 +79,16 @@ def get_journey(
     flash_target:  str  = "",
     usb_device:    str  = "/dev/sda",
     usb_mount:     str  = "/mnt/usb",
+    device_net           = None,
 ):
     """
     Build a FlowRunner for the given OS + transfer method.
     Call .run() on the returned object to execute the journey.
+
+    device_net carries the session's resolved device network (DHCP or
+    manual — see MonoImager.device_net) and is forwarded to every
+    journey unconditionally. Whether a given journey's steps actually
+    read it is up to that journey.
     """
     from mono_imager.step_registry import FlowRunner, StepContext
 
@@ -98,5 +104,6 @@ def get_journey(
         flash_target  = flash_target or _FLASH_TARGETS.get(os_name, "/dev/mmcblk0"),
         usb_device    = usb_device,
         usb_mount     = usb_mount,
+        device_net    = device_net,
     )
     return FlowRunner(os_name, transfer, ctx)
