@@ -27,7 +27,6 @@ License: GPLv3
 """
 
 import gzip
-import io
 import logging
 import re
 import shutil
@@ -193,7 +192,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     # booti command.  Also try external-FIT (bootm) as fallback in the
     # same 'recovery' variable so U-Boot tries both automatically.
     # Only print lines when something non-trivial is found.
-    print(f"  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
+    print("  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
 
     FIT_MAGIC  = "d0 0d fe ed"
     UIMG_MAGIC = "27 05 19 56"

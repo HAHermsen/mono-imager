@@ -1,4 +1,4 @@
-﻿"""
+"""
 mono-imager journey: OPNsense via LAN
 
 Steps:

@@ -1,4 +1,4 @@
-﻿"""
+"""
 mono-imager journey: OpenWRT via USB
 
 Steps:

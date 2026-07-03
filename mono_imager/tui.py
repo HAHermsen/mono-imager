@@ -12,24 +12,15 @@ from mono_imager import __version__  # single source of truth: mono_imager/__ini
 __author__ = "H.A. Hermsen"
 
 import sys
-import os
-import re
-
-# U-Boot output regexes — compiled once at module load, not per call.
-_RE_SOC       = re.compile(r'^SoC:\s+(.+)$',              re.MULTILINE)
-_RE_MODEL     = re.compile(r'^Model:\s+(.+)$',            re.MULTILINE)
-_RE_DRAM      = re.compile(r'^DRAM:\s+(.+)$',             re.MULTILINE)
-_RE_CPU_CLK   = re.compile(r'CPU\d+\([^)]*\):(\d+)\s*MHz')
-_RE_BUS_CLK   = re.compile(r'Bus:\s+(\d+)\s*MHz')
-_RE_DDR_CLK   = re.compile(r'DDR:\s+(\d+)\s*MT/s')
-_RE_FMAN_CLK  = re.compile(r'FMAN:\s+(\d+)\s*MHz')
 import time
 import logging
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 from mono_imager.spinner import with_spinner, Spinner
+from mono_imager import console
+from mono_imager.device_net import RecoveryNetwork
+from mono_imager.uboot_parse import parse_uboot_identity, parse_uboot_self_test
 
 logger = logging.getLogger(__name__)
 
@@ -42,98 +33,12 @@ def verbose(msg: str, level: str = "info"):
 
 
 def _netmask_to_prefix(value: str) -> Optional[str]:
-    """
-    Accept either a dotted subnet mask (255.255.255.0) or a bare CIDR
-    prefix length (24) from manual entry, and return the CIDR prefix
-    string `ip addr add` needs. Returns None on anything unparseable
-    or a non-contiguous mask, so the caller can re-prompt rather than
-    silently apply a nonsense value.
-    """
-    value = value.strip()
-    if not value:
-        return None
-    if "." not in value:
-        return value if value.isdigit() and 0 <= int(value) <= 32 else None
-    try:
-        octets = [int(o) for o in value.split(".")]
-    except ValueError:
-        return None
-    if len(octets) != 4 or any(not 0 <= o <= 255 for o in octets):
-        return None
-    bits = "".join(f"{o:08b}" for o in octets)
-    if "01" in bits:  # a 0 followed by a 1 means the mask isn't contiguous
-        return None
-    return str(bits.count("1"))
+    # Moved to mono_imager.device_net.netmask_to_prefix; kept as a
+    # re-export so any external caller importing it from here still works.
+    from mono_imager.device_net import netmask_to_prefix
+    return netmask_to_prefix(value)
 
 
-
-_UBOOT_FIELDS = [
-    ("SoC",        _RE_SOC,      lambda m: m.group(1).strip()),
-    ("Model",      _RE_MODEL,    lambda m: m.group(1).strip()),
-    ("DRAM",       _RE_DRAM,     lambda m: m.group(1).strip()),
-    ("Bus clock",  _RE_BUS_CLK,  lambda m: f"{m.group(1)} MHz"),
-    ("DDR clock",  _RE_DDR_CLK,  lambda m: f"{m.group(1)} MT/s"),
-    ("FMAN clock", _RE_FMAN_CLK, lambda m: f"{m.group(1)} MHz"),
-]
-
-
-def parse_uboot_identity(raw_output: str) -> dict:
-    """
-    Parse SoC/board identity and clock configuration from raw U-Boot
-    boot output. Patterns validated against a real capture on this
-    hardware (LS1046A / Mono Gateway Development Kit):
-
-        SoC:  LS1046AE Rev1.0 (0x87070010)
-        Clock Configuration:
-               CPU0(A72):1600 MHz  CPU1(A72):1600 MHz  CPU2(A72):1600 MHz
-               CPU3(A72):1600 MHz
-               Bus:      600  MHz  DDR:      2100 MT/s  FMAN:     700  MHz
-        Model: Mono Gateway Development Kit
-        DRAM:  7.9 GiB (DDR4, 64-bit, CL=16, ECC on)
-
-    Returns a dict of only the fields actually found — missing fields
-    are simply absent, never guessed or defaulted.
-    """
-    result = {}
-    for label, pattern, fmt in _UBOOT_FIELDS:
-        if (m := pattern.search(raw_output)):
-            result[label] = fmt(m)
-    cpu_clocks = _RE_CPU_CLK.findall(raw_output)
-    if cpu_clocks:
-        unique = sorted(set(cpu_clocks), key=int)
-        if len(unique) == 1:
-            result["CPU clock"] = f"{unique[0]} MHz (all cores)"
-        else:
-            result["CPU clock"] = ", ".join(f"{c} MHz" for c in cpu_clocks)
-    return result
-
-
-_OK_PREFIX = "[ OK ]"
-
-def parse_uboot_self_test(raw_output: str) -> list:
-    """
-    Parse the power-on self-test block from raw U-Boot boot output.
-    Matches lines of the form "[ OK ] Label            value",
-    e.g.:
-
-        [ OK ] DDR4 Memory          Bank0: 1982 MB, Bank1: 6144 MB
-        [ OK ] USB PD controller    ID 0x25
-        [ OK ] Temperatures         CPU 51 °C, Board 46 °C
-
-    Only matches [ OK ] lines — failures are not captured.
-
-    Returns a list of (label, value) tuples in the order they appeared.
-    value is "" if only the label is present with no value/detail.
-    """
-    out = []
-    for line in raw_output.splitlines():
-        line = line.strip()
-        if not line.startswith(_OK_PREFIX):
-            continue
-        label, _, value = line[len(_OK_PREFIX):].strip().partition(" ")
-        if label.lower() != "self-test":
-            out.append((label, value.strip()))
-    return out
 
 
 
@@ -167,83 +72,45 @@ class MonoImager:
         self.net_http_port   = 8080
         self.net_flash_target = None
         self.os_name         = None
-        # Device's own recovery-shell network (DHCP or manual) — resolved
-        # once per session by _setup_recovery_network() and reused by every
-        # later eMMC/NOR operation rather than re-detected/re-asked.
-        # {"ip", "prefix", "gateway", "dns", "source": "dhcp"|"manual"}
-        self.device_net       = None
-        # True once real internet reachability (not just local config)
-        # has been proven for self.device_net at least once this session.
-        # Recovery Linux forgets its network config every reboot, so
-        # _setup_recovery_network() still has to re-apply the IP each
-        # time — but the path itself (cable, switch, gateway, upstream
-        # route) doesn't change between reboots of the same device in
-        # the same session, so once it's proven reachable there's no
-        # need to pay for a fresh ping-based re-verification (several
-        # seconds of serial round trips) on every subsequent recovery
-        # boot. Reset to False whenever device_net itself is invalidated
-        # and re-resolved (see _setup_recovery_network()).
-        self.device_net_verified = False
+        # Device's own recovery-shell network (DHCP or manual). The
+        # session cache (config + verified) lives in RecoveryNetwork;
+        # MonoImager exposes it via the device_net / device_net_verified
+        # properties below so existing readers stay unchanged.
+        self._net = RecoveryNetwork()
+
+    @property
+    def device_net(self):
+        return self._net.config
+
+    @device_net.setter
+    def device_net(self, value):
+        self._net.config = value
+
+    @property
+    def device_net_verified(self):
+        return self._net.verified
+
+    @device_net_verified.setter
+    def device_net_verified(self, value):
+        self._net.verified = value
 
     def clear_screen(self):
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
-    
+        console.clear_screen()
+
     def safe_input(self, prompt: str) -> Optional[str]:
         """
-        Wrapper around input() that checks for 'exit!' escape sequence.
-        If user types 'exit!', return None and set state to FLASH_AUTO_OR_MANUAL.
-        Otherwise return the user's input.
+        Wrapper around console.read_line() that owns the escape-to-menu
+        state transition. Rendering/reading lives in console; the
+        MenuState side-effect stays here where menu state belongs.
         """
-        user_input = input(prompt).strip()
-        if user_input.lower() == "exit!":
-            print("\n  ⚠️  Escaping to main menu...")
+        value = console.read_line(prompt)
+        if value is console.ESCAPE:
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
             return None
-        return user_input
+        return value
 
     def print_header(self):
-        """
-        Print application header. Box width is computed from the
-        actual content rather than hardcoded, so it stays correctly
-        aligned regardless of version string length (e.g. "0.5.0" vs
-        a future "0.10.0") instead of needing manual padding upkeep.
-        """
-        version_line = f"mono-imager {__version__}"
-        subtitle      = "mono gateway firmware flash utility"
-        license_line  = f"written by {__author__}, GPLv3 licensed"
-
-        net = self.device_net
-        if net:
-            dns_note = f" (DNS {net['dns']})" if net.get("dns") else ""
-            network_line = (
-                f"Device network: {net['ip']}/{net['prefix']} via {net['gateway']}"
-                f"{dns_note} - {net['source']}"
-            )
-        else:
-            network_line = "Device network: not yet detected"
-
-        inner_width = max(len(version_line), len(subtitle), len(license_line), len(network_line)) + 2
-
-        # Plain ASCII box-drawing, not Unicode (+/-/| instead of the
-        # box-drawing block). CONFIRMED BUG THIS AVOIDS: on a stock
-        # Windows console (not in UTF-8 codepage — the default), Unicode
-        # box-drawing characters and the em dash render as mismatched
-        # widths, making the border drift out of alignment even though
-        # every line here is the same computed length. Plain ASCII is
-        # always exactly one column wide everywhere, so it can't drift.
-        def left_aligned(text):
-            pad = inner_width - len(text) - 1
-            return "| " + text + " " * pad + "|"
-
-        print("+" + "-" * inner_width + "+")
-        print(left_aligned(version_line))
-        print(left_aligned(subtitle))
-        print(left_aligned(license_line))
-        print(left_aligned(""))
-        print(left_aligned(network_line))
-        print("+" + "-" * inner_width + "+")
-        print()
+        console.print_header(__version__, __author__, self.device_net)
 
     # Minimum plausible firmware size. This is a sanity check against
     # obviously wrong paths (a README, a 0-byte placeholder, a text
@@ -439,13 +306,7 @@ class MonoImager:
             return None
 
     def _check(self, results: list, label: str, passed: bool, detail: str = "") -> bool:
-        """Record pass/fail in results and print a status line."""
-        mark = "✓" if passed else "✗"
-        print(f"  {mark}  {label}")
-        if detail:
-            print(f"     {detail}")
-        results.append(passed)
-        return passed
+        return console.check(results, label, passed, detail)
 
     def _show_flash_confirmation(
         self,
@@ -458,46 +319,17 @@ class MonoImager:
         device_ip: str,
     ) -> Optional[bool]:
         """
-        Print the pre-flash summary and NOR/eMMC diagram, then prompt.
-        Returns True (confirmed), False (declined), or None (exit! escape).
+        Delegate rendering to console; map its ESCAPE sentinel to the
+        None-plus-state-transition contract the callers here expect.
         """
-        print()
-        print("  About to flash:")
-        print(f"    OS:          {os_name}")
-        print(f"    Port:        {port}")
-        print(f"    Firmware:    {firmware_path}")
-        print(f"    Target:      {flash_target}")
-        print(f"    Host IP:     {host_ip}:8080  (auto-detected)")
-        print(f"    Device IP:   {device_ip}")
-        print()
-        print("  +--------------------------------------------------+")
-        print("  | This writes to eMMC, the device's main storage   |")
-        print("  | (32 GB). It does NOT touch NOR flash (64 MB -    |")
-        print("  | the bootloader + recovery tool).                 |")
-        print("  |                                                  |")
-        print("  |    NOR (64 MB)          eMMC (32 GB)             |")
-        print("  |   +-------------+      +-------------------+     |")
-        print("  |   | Bootloader  |      |  Your OS goes      |    |")
-        print("  |   | + Recovery  |      |  here - this is    |    |")
-        print("  |   | (untouched) |      |  what gets         |    |")
-        print("  |   +-------------+      |  flashed now [OK]  |    |")
-        print("  |                        +-------------------+     |")
-        print("  |                                                  |")
-        print("  | After flashing, the DIP switch picks which one   |")
-        print("  | the board actually boots:                        |")
-        print("  |   LEFT  = eMMC  (your new OS boots)              |")
-        print("  |   RIGHT = NOR   (boots recovery instead)         |")
-        print("  +--------------------------------------------------+")
-        print()
-        print("  This tool is well tested, but writing firmware is never")
-        print("  without risk. Do not unplug power or disconnect the cable")
-        print("  while flashing — an interrupted write can leave the")
-        print("  device unbootable.")
-        print()
-        confirm = self.safe_input("  This writes to the device. Proceed? [y/N]: ")
-        if confirm is None:
+        result = console.show_flash_confirmation(
+            os_name=os_name, port=port, firmware_path=firmware_path,
+            flash_target=flash_target, host_ip=host_ip, device_ip=device_ip,
+        )
+        if result is console.ESCAPE:
+            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
             return None
-        return confirm.lower() == "y"
+        return result
 
     def _recovery_finish(self, success: bool) -> None:
         """Set flash result, wait for Enter, and return to main menu."""
@@ -506,10 +338,7 @@ class MonoImager:
         self.current_state = MenuState.MAIN
 
     def _show_firmware_output(self, chunk: str) -> None:
-        """Print live firmware-update output; log raw bytes to file for post-mortem."""
-        clean = re.sub(r'\x1b\[[0-9;:]*[mGKHF]', '', chunk)
-        print(clean, end="", flush=True)
-        logger.debug("[firmware update] %r", chunk)
+        console.show_firmware_output(chunk)
 
     # ------------------------------------------------------------------ #
     #  1. MAIN MENU                                                        #
@@ -676,7 +505,7 @@ class MonoImager:
         print()
         if transfer == "usb":
             print("  Image will be auto-detected from USB stick.")
-            print(f"  Recommended: 16 GB minimum (holds all three OS images simultaneously).")
+            print("  Recommended: 16 GB minimum (holds all three OS images simultaneously).")
             print()
             firmware_path     = Path(".")
             firmware_display  = "auto-detected from USB stick (16 GB min. recommended)"
@@ -883,237 +712,13 @@ class MonoImager:
     # ------------------------------------------------------------------ #
     def _setup_recovery_network(self, d) -> bool:
         """
-        Prompt for and configure networking on the device's current
-        recovery shell session, then VERIFY it actually works.
-
-        BUG THIS FIXES (part 1): both the modern 'firmware update'
-        command and the legacy curl-based path require real internet
-        access on the device (documented hard prerequisite) — but
-        recovery Linux has no DHCP and nothing was ever configuring
-        an IP before attempting either. Confirmed on real hardware:
-        without it, 'firmware update' prints its confirmation prompt
-        then aborts itself within seconds (no internet to reach) —
-        faster than recovery_orchestrator's auto-confirm could land,
-        so the late-arriving 'yes' got typed into the now-idle shell
-        as a literal command instead.
-
-        BUG THIS FIXES (part 2): local 'ip addr'/'ip route' commands
-        reporting RC=0 only proves the LOCAL config was accepted, not
-        that the device can actually reach anything — confirmed on
-        real hardware: a run reported network setup success, then
-        'firmware update' still failed within seconds, because the
-        physical port in use had no real path to the internet. This
-        now calls recovery_orchestrator.check_internet_reachable()
-        afterward to catch that before ever touching 'firmware update'.
-
-        Recovery Linux also doesn't persist config across a reboot,
-        so this must be called again after every fresh boot into a
-        recovery shell, not just once at the start.
-
-        DHCP is tried automatically first. Manual entry (IP, subnet
-        mask, gateway, DNS) is only used as a fallback when DHCP fails
-        or the lease it gets isn't actually reachable, and re-prompts
-        on failure rather than aborting the whole operation. Whatever
-        is resolved (DHCP or manual) is cached on self.device_net for
-        the rest of the session — later calls in the same run just
-        re-apply the known values instead of prompting again.
+        Resolve+verify the recovery shell's network. DHCP-first,
+        real-reachability-verified, manual fallback; caches on the
+        session RecoveryNetwork and re-applies (not re-prompts) on
+        each fresh recovery boot. See mono_imager.device_net for the
+        full rationale and the hardware bugs this guards against.
         """
-        from mono_imager import recovery_orchestrator as rec
-        from mono_imager import flash_orchestrator as core
-
-        print()
-        print("  Network setup — REQUIRED before 'firmware update' will work.")
-        print("  'firmware update' needs the device to reach the internet directly.")
-        print()
-
-        # Bring up every eth* port, then auto-detect which one actually
-        # has a cable (LOWER_UP) instead of assuming one specific
-        # physical jack. Recovery Linux boots with all eth ports
-        # administratively DOWN, so LOWER_UP is never set until each
-        # candidate port has been brought up first. Uses
-        # flash_orchestrator.parse_active_eth_iface().
-        #
-        # SPEEDUP: bring-up for all candidate ports is combined into a
-        # single run_script() round trip rather than one call per port
-        # — each round trip on this device/link costs real seconds
-        # (write+verify+exec, waiting for the line to settle).
-        try:
-            bring_up_cmd = "; ".join(f"ip link set eth{n} up 2>/dev/null" for n in range(5))
-            d.run_script(bring_up_cmd, marker="recovery_eth_up", exec_timeout=10)
-        except Exception as e:
-            print(f"  ❌ Failed to bring up Ethernet ports: {e}")
-            return False
-
-        try:
-            # SPEEDUP: was a blind "sleep 2" before every single check —
-            # a fixed 2s tax paid even when the cable/switch raises
-            # carrier almost immediately (the common case). Poll for
-            # LOWER_UP instead, returning as soon as it appears; still
-            # caps out at 2s total for a genuinely slow link (e.g. a
-            # managed switch's port negotiation), so the worst case is
-            # unchanged — only the common case gets faster.
-            ip_output, _eth_err = with_spinner(
-                d.run_script,
-                "for i in 1 2 3 4; do ip link show | grep -q LOWER_UP && break; sleep 0.5; done; ip link show",
-                marker="recovery_eth_check", exec_timeout=10,
-                message="Detecting active Ethernet port..."
-            )
-            if _eth_err:
-                raise _eth_err
-            iface = core.parse_active_eth_iface(ip_output)
-            if iface is None:
-                print("  ❌ No Ethernet port has a cable plugged in.")
-                print("     Plug an Ethernet cable into any RJ-45 jack (not the SFP+ cages).")
-                print()
-                input("  Press Enter once the cable is plugged in...")
-                ip_output = d.run_script("ip link show", marker="recovery_eth_check_retry", exec_timeout=5)
-                iface = core.parse_active_eth_iface(ip_output)
-                if iface is None:
-                    print("  ❌ Still no Ethernet port with a cable detected.")
-                    return False
-            print(f"  ✓ {iface} is ready.")
-        except Exception as e:
-            print(f"  ❌ Failed to check Ethernet carrier: {e}")
-            return False
-
-        # Already resolved earlier this session. Recovery Linux doesn't
-        # persist config across a reboot, so the known values still have
-        # to be re-applied on this fresh shell — but we don't ask again.
-        if self.device_net:
-            net = self.device_net
-            print(f"  Re-applying known network config: {net['ip']}/{net['prefix']} via {net['gateway']}...")
-            if self._apply_device_network(d, iface, net):
-                # The path itself (cable, switch, gateway, upstream route)
-                # already proved reachable once this session — re-running
-                # the several-second ping-based check on every subsequent
-                # recovery boot re-verifies something that hasn't changed.
-                # Only pay for it again if it's never been proven yet.
-                reachable = True
-                if not self.device_net_verified:
-                    reachable = self._verify_device_network(d, net["gateway"])
-                    self.device_net_verified = reachable
-                if reachable:
-                    print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                    # Refresh iface in case port enumeration differs on this boot
-                    # (same cable, but not guaranteed to be identical every time).
-                    self.device_net = {**net, "iface": iface}
-                    return True
-            print("  ⚠ Previously-working network config is no longer reachable — re-resolving...")
-            self.device_net = None
-            self.device_net_verified = False
-
-        # First time this session — try DHCP before ever asking the user.
-        lease, _dhcp_err = with_spinner(
-            rec.try_dhcp, d, iface,
-            message="Attempting DHCP..."
-        )
-        if _dhcp_err:
-            lease = None
-
-        if lease:
-            dns_note = f", DNS {lease['dns']}" if lease["dns"] else ""
-            print(f"  DHCP lease: {lease['ip']}/{lease['prefix']} via {lease['gateway']}{dns_note}")
-            if self._verify_device_network(d, lease["gateway"]):
-                print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                self.device_net = {**lease, "source": "dhcp"}
-                self.device_net_verified = True
-                return True
-            print("  ❌ DHCP lease obtained but the internet is not reachable through it.")
-        else:
-            print("  ❌ No DHCP response.")
-
-        print()
-        print("  Falling back to manual network entry.")
-
-        while True:
-            net = self._prompt_manual_network()
-            if net is None:
-                return False
-
-            print(f"  Configuring {iface} = {net['ip']}/{net['prefix']}, gateway {net['gateway']}...")
-            if self._apply_device_network(d, iface, net):
-                print("  ✓ Local network config applied.", end=" ", flush=True)
-                if self._verify_device_network(d, net["gateway"]):
-                    print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                    self.device_net = {**net, "source": "manual", "iface": iface}
-                    self.device_net_verified = True
-                    return True
-                print(f"  ❌ {iface} has link but could not reach the internet.")
-                print("     Check the gateway IP, cable, and network configuration.")
-
-            retry = input("  Try entering the network settings again? [Y/n]: ").strip().lower()
-            if retry == "n":
-                return False
-
-    def _apply_device_network(self, d, iface: str, net: dict) -> bool:
-        """
-        Statically (re-)apply a known ip/prefix/gateway/dns to iface.
-        Used for cache-reuse (config lost on reboot) and manual entry —
-        NOT for a fresh DHCP lease, which udhcpc's own bound script
-        already applies as part of obtaining it. Flushes any existing
-        address/route first so this is safe to call again in the same
-        boot after a failed attempt (retry loop), not just once.
-        """
-        dns_cmd = f" && echo nameserver {net['dns']} > /etc/resolv.conf" if net.get("dns") else ""
-        net_cmd = (
-            f"ip addr flush dev {iface} 2>/dev/null; "
-            f"ip link set {iface} up && "
-            f"ip addr add {net['ip']}/{net['prefix']} dev {iface} && "
-            f"ip route replace default via {net['gateway']} dev {iface}"
-            f"{dns_cmd}; echo RC=$?"
-        )
-        try:
-            output = d.run_script(net_cmd, marker="recovery_net_setup", exec_timeout=20)
-        except RuntimeError as e:
-            print(f"  ❌ Network setup failed on {iface}: {e}")
-            return False
-
-        if "RC=0" not in output:
-            print(f"  ❌ Network setup did not report success on {iface}.")
-            return False
-        return True
-
-    def _verify_device_network(self, d, gateway: str) -> bool:
-        from mono_imager import recovery_orchestrator as rec
-        result, error = with_spinner(
-            rec.check_internet_reachable, d, gateway=gateway,
-            message="Verifying real connectivity..."
-        )
-        if error is not None:
-            return False
-        return bool(result)
-
-    def _prompt_manual_network(self) -> Optional[dict]:
-        """
-        Prompt for Device IP, subnet mask, gateway, and DNS. Returns
-        None (caller should abort) if the user leaves a required field
-        blank — DNS is optional since some networks resolve fine
-        without one being explicitly set.
-        """
-        device_ip = input(
-            "  Pick an unused IP address for the device on that same network "
-            "(e.g. 192.168.1.50). Check your own machine's network adapter "
-            "settings first if you're unsure of the IP/subnet/gateway on that "
-            "network.\n  Device IP to assign: "
-        ).strip()
-        if not device_ip:
-            print("  ❌ Device IP is required.")
-            return None
-
-        mask_raw = input("  Subnet mask (e.g. 255.255.255.0) [255.255.255.0]: ").strip() or "255.255.255.0"
-        prefix = _netmask_to_prefix(mask_raw)
-        if prefix is None:
-            print(f"  ❌ Invalid subnet mask: {mask_raw}")
-            return None
-
-        gateway = input("  Gateway (your router's IP on that network, e.g. 192.168.1.1): ").strip()
-        if not gateway:
-            print("  ❌ Gateway is required.")
-            return None
-
-        dns = input("  DNS server [8.8.8.8]: ").strip() or "8.8.8.8"
-
-        return {"ip": device_ip, "prefix": prefix, "gateway": gateway, "dns": dns}
+        return self._net.resolve(d)
 
     def menu_update_emmc(self):
         """
@@ -1156,7 +761,7 @@ class MonoImager:
         d = None
         try:
             self._soft_reboot_if_possible(port)
-            d = core.phase1_bootstrap(port, 115200)
+            d = core.phase1_bootstrap(port, 115200, boot_medium="qspi")
             if d is None:
                 print()
                 print("  ❌ Could not bootstrap into the recovery shell.")
@@ -1269,7 +874,7 @@ class MonoImager:
         d = None
         try:
             self._soft_reboot_if_possible(port)
-            d = core.phase1_bootstrap(port, 115200)
+            d = core.phase1_bootstrap(port, 115200, boot_medium="emmc")
             if d is None:
                 print()
                 print("  ❌ Could not bootstrap into the recovery shell.")
@@ -1373,7 +978,7 @@ class MonoImager:
 
         print()
         print(f"  Port:  {port}")
-        print(f"  Baud:  115200")
+        print("  Baud:  115200")
         print()
 
         results = []
@@ -1480,7 +1085,8 @@ class MonoImager:
             phase1_bootstrap, detect_host_ip,
             start_http_server, wait_for_report
         )
-        import tempfile, pathlib, socket
+        import tempfile
+        import pathlib
 
         self.clear_screen()
         self.print_header()
@@ -1816,7 +1422,8 @@ class MonoImager:
         reader_thread.start()
 
         try:
-            import tty, termios
+            import tty
+            import termios
             fd = sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
             tty.setraw(fd)
@@ -1911,33 +1518,11 @@ class MonoImager:
         self.current_state = MenuState.MAIN
 
     def _display_device_stats(self, raw_output: str):
-        """Parse and display U-Boot boot-time diagnostics."""
-        identity  = parse_uboot_identity(raw_output)
-        self_test = parse_uboot_self_test(raw_output)
-
-        if not identity and not self_test:
-            print()
-            print("  ⚠️  No recognizable U-Boot diagnostic output found.")
-            return
-
-        if identity:
-            print()
-            print("  " + "─" * 56)
-            print("  BOARD IDENTITY")
-            print("  " + "─" * 56)
-            for label, value in identity.items():
-                print(f"    {label:<22} {value}")
-
-        if self_test:
-            print()
-            print("  " + "─" * 56)
-            print("  SELF-TEST")
-            print("  " + "─" * 56)
-            for label, value in self_test:
-                detail = f"  {value}" if value else ""
-                print(f"    ✓  {label}{detail}")
-
-        print()
+        """Parse U-Boot boot-time diagnostics (domain), render via console."""
+        console.show_device_stats(
+            parse_uboot_identity(raw_output),
+            parse_uboot_self_test(raw_output),
+        )
 
 
 

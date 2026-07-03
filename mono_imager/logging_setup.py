@@ -16,12 +16,42 @@ get_log_file() to find the path for its report footer.
 """
 
 
+import os
 import sys
 import logging
 from pathlib import Path
 from datetime import datetime
 
 _log_file: Path = None
+
+_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
+
+
+def debug_enabled() -> bool:
+    """
+    Read MONO_DEBUG live rather than freezing it into a module-level
+    constant at import time. mono_imager/__init__.py imports serial_device
+    eagerly (the installed `mono-imager` console-script does
+    `from mono_imager.cli import main` before main() ever runs), so a
+    constant computed once at import time would miss a --debug/--verbose
+    CLI flag that cli.py sets via os.environ just before calling into the
+    rest of the app.
+    """
+    return os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+def make_verbose(logger):
+    """
+    Build a module's verbose() bound to its own logger, so log records
+    keep the calling module's %(name)s instead of collapsing to one
+    shared logger. Single implementation, per-module identity preserved.
+    Logs always; prints to console only in debug mode or for errors/warnings.
+    """
+    def verbose(msg: str, level: str = "info"):
+        if debug_enabled() or level in ("error", "warning"):
+            print(msg, flush=True)
+        logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
+    return verbose
 
 
 def configure_logging(log_dir: Path = None) -> Path:

@@ -37,9 +37,13 @@ def main():
         os.environ["MONO_DEBUG"] = "1"
 
     from mono_imager.tui import MonoImager
+    from mono_imager.logging_setup import configure_logging
+    from pathlib import Path
+
+    log_file = configure_logging(Path(__file__).parent.parent / "logs")
 
     try:
-        app = MonoImager()
+        app = MonoImager(log_file)
         app.run()
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")

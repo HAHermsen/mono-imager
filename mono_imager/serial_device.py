@@ -9,39 +9,17 @@ Version: v1.1.0
 License: GPLv3
 """
 
-from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
-import os
 import serial
 import time
 import logging
-import sys
-from typing import Optional, List
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-def _debug_enabled() -> bool:
-    """
-    Read MONO_DEBUG live rather than freezing it into a module-level
-    constant at import time. mono_imager/__init__.py imports this module
-    eagerly (as soon as anything imports the mono_imager package at all —
-    including the installed `mono-imager` console-script wrapper, which
-    does `from mono_imager.cli import main` before main() ever runs) —
-    so a constant computed once at import time would miss a --debug/
-    --verbose CLI flag that cli.py sets via os.environ just before
-    calling into the rest of the app.
-    """
-    return os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
-
-
-_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
-
-def verbose(msg: str, level: str = "info"):
-    """Log always; print to console only in debug mode or for errors/warnings."""
-    if _debug_enabled() or level in ("error", "warning"):
-        print(msg, flush=True)
-    logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
+from mono_imager.logging_setup import make_verbose, debug_enabled as _debug_enabled  # noqa: F401
+verbose = make_verbose(logger)
 
 
 class SerialDevice:
@@ -869,12 +847,21 @@ class SerialDevice:
         verbose("Failed to interrupt autoboot", "warning")
         return False
     
-    def boot_recovery(self) -> bool:
+    def boot_recovery(self, boot_medium: Optional[str] = None) -> bool:
         """
         Boot into recovery Linux from U-Boot and auto-login as root (no password).
 
         Accepts any Linux login prompt and any root shell — the recovery Linux
         hostname may differ from "recovery" depending on the firmware build.
+
+        boot_medium: if set ("nor" or "emmc"), the kernel is booted with
+            boot_medium=<value> appended to bootargs. The device's modern
+            `firmware update` tool reads this to know which medium it booted
+            from (and flashes the OTHER one); without it the tool aborts with
+            "Cannot detect boot medium" because this board's `recovery` U-Boot
+            command sets no bootargs of its own. Confirmed on real hardware
+            (U-Boot 2025.04). Default None keeps the original behaviour for
+            every other caller (OS flash, LAN test, etc.) unchanged.
 
         Returns:
             True if a root shell was reached, False otherwise
@@ -907,6 +894,49 @@ class SerialDevice:
             # the write.
             self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
             self.ser.reset_input_buffer()
+
+            # PRIME THE PROMPT before sending the real command. CONFIRMED
+            # ON HARDWARE: immediately after autoboot is interrupted, U-Boot
+            # eats the first byte(s) written to it while it's still settling
+            # the prompt — "run recovery" arrived as "un recovery" -> Unknown
+            # command 'un'. Sending a bare newline first absorbs that dropped
+            # leading character on an empty line (a stray newline at "=> "
+            # just yields another "=> ", harmless), then we flush and send
+            # the actual command onto a confirmed-clean prompt. Doesn't
+            # affect the already-at-prompt path — an extra newline there is
+            # a no-op.
+            self.ser.write(b"\r\n")
+            prime_start = time.time()
+            prime_buf = b""
+            while time.time() - prime_start < 2.0:
+                chunk = self.ser.read(64)
+                if chunk:
+                    prime_buf += chunk
+                    if b"=> " in prime_buf:
+                        break
+                elif prime_buf:
+                    break
+            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+            self.ser.reset_input_buffer()
+
+            # If a boot_medium was requested, set bootargs so the kernel
+            # cmdline carries boot_medium=<value>. This board's `recovery`
+            # U-Boot command boots without setting any bootargs, so the
+            # modern `firmware update` tool (which reads boot_medium= off
+            # /proc/cmdline) otherwise aborts with "Cannot detect boot
+            # medium". Base cmdline confirmed on real hardware (U-Boot
+            # 2025.04). The prompt was just primed+flushed above, so this
+            # lands on a clean "=> ".
+            if boot_medium:
+                bootargs = (
+                    "console=ttyS0,115200 root=/dev/ram0 "
+                    "earlycon=uart8250,mmio,0x21c0500 "
+                    f"boot_medium={boot_medium}"
+                )
+                self.ser.write(f'setenv bootargs "{bootargs}"\r\n'.encode())
+                self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+                self.ser.reset_input_buffer()
+
             self.ser.write(b"run recovery\r\n")
 
             poll_start = time.time()

@@ -1,4 +1,4 @@
-﻿"""
+"""
 mono-imager journey: Armbian via USB
 
 DIP switch: RIGHT (NOR) throughout — NOR U-Boot loads Armbian from eMMC via extlinux.

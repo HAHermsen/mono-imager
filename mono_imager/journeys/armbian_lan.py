@@ -1,4 +1,4 @@
-﻿"""
+"""
 mono-imager journey: Armbian via LAN
 
 DIP switch: RIGHT (NOR) throughout — NOR U-Boot loads Armbian from eMMC via extlinux.
@@ -17,7 +17,7 @@ License: GPLv3
 
 import logging
 from mono_imager.step_registry import register_step, StepContext
-from mono_imager.spinner import with_spinner, Spinner
+from mono_imager.spinner import with_spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
 from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 

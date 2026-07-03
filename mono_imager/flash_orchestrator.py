@@ -22,18 +22,15 @@ Version: v1.1.0
 License: GPLv3
 """
 
-from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__  = "H.A. Hermsen"
 
 import itertools
 import logging
-import os
 import shutil
 import socket
 import threading
 import time
 
-from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -41,16 +38,12 @@ from typing import Optional
 
 from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
-from mono_imager.spinner import with_spinner, Spinner
+from mono_imager.spinner import with_spinner
 
 # Set MONO_DEBUG=1 (or `mono-imager --debug`/`--verbose`) to restore full
-# verbose output to console. Read live in verbose() rather than frozen into
-# a constant at import time — see serial_device._debug_enabled() for why
-# that matters (this module happens to be lazily imported today, so a
-# frozen constant would work here too, but reading live keeps both
-# modules consistent and doesn't depend on that staying true).
-def _debug_enabled() -> bool:
-    return os.environ.get("MONO_DEBUG", "").lower() in ("1", "true", "yes")
+# verbose output to console. debug_enabled() reads MONO_DEBUG live rather
+# than freezing it at import time — see logging_setup.debug_enabled().
+
 
 # --- Logging setup -----------------------------------------------------------
 # Logging is initialised exactly once by tui.py/cli.py via
@@ -58,18 +51,11 @@ def _debug_enabled() -> bool:
 # basicConfig — doing so at import time caused mutual destruction when tui.py
 # also called it, silently dropping handlers depending on import order.
 
-from mono_imager.logging_setup import configure_logging, get_log_file
+from mono_imager.logging_setup import get_log_file, make_verbose, debug_enabled as _debug_enabled  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-
-_LOG_LEVELS = {"error": logging.ERROR, "warning": logging.WARNING, "debug": logging.DEBUG}
-
-def verbose(msg: str, level: str = "info"):
-    """Log always; print to console only in debug mode or for errors/warnings."""
-    if _debug_enabled() or level in ("error", "warning"):
-        print(msg, flush=True)
-    logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
+verbose = make_verbose(logger)
 
 
 file_logger    = logger
@@ -545,7 +531,8 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
 
 def phase1_recovery(d: SerialDevice,
                      boot_method: str = "boot_recovery",
-                     login_method: str = "login_recovery") -> Optional[SerialDevice]:
+                     login_method: str = "login_recovery",
+                     boot_medium: Optional[str] = None) -> Optional[SerialDevice]:
     """
     Phase 1b: Boot staging Linux and log in.
 
@@ -559,6 +546,10 @@ def phase1_recovery(d: SerialDevice,
     'recovery' U-Boot variable has been lost) register alternative methods
     via step_registry.register_staging_boot() and tui.py passes them here.
 
+    boot_medium: forwarded to boot_recovery() (only when that's the boot
+    method) so the modern firmware tool can detect the medium. Default
+    None leaves every existing caller unchanged.
+
     Returns the same SerialDevice now at the staging shell, or None on failure.
     """
     boot_fn  = getattr(d, boot_method)
@@ -571,7 +562,8 @@ def phase1_recovery(d: SerialDevice,
 
     # Step 4: Boot
     boot_msg = "Booting recovery Linux..." if boot_method == "boot_recovery" else "Booting staging Linux..."
-    booted, _boot_err = with_spinner(boot_fn, message=boot_msg)
+    boot_args = {"boot_medium": boot_medium} if (boot_method == "boot_recovery" and boot_medium) else {}
+    booted, _boot_err = with_spinner(boot_fn, message=boot_msg, **boot_args)
     if _boot_err:
         booted = False
     if not step(4, boot_label, booted):
@@ -590,7 +582,8 @@ def phase1_recovery(d: SerialDevice,
     return d
 
 
-def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
+def phase1_bootstrap(port: str, baud: int = 115200,
+                     boot_medium: Optional[str] = None) -> Optional[SerialDevice]:
     """
     Phase 1: Full bootstrap — U-Boot interrupt + recovery boot + login.
 
@@ -601,12 +594,16 @@ def phase1_bootstrap(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     For OS flash journeys, call phase1_uboot() and phase1_recovery()
     separately so the journey can run its U-Boot steps in between.
 
+    boot_medium: forwarded to phase1_recovery() so the modern firmware
+    tool can detect the medium. Default None leaves existing callers
+    unchanged.
+
     Returns SerialDevice at recovery shell on success, None on failure.
     """
     d = phase1_uboot(port, baud)
     if d is None:
         return None
-    return phase1_recovery(d)
+    return phase1_recovery(d, boot_medium=boot_medium)
 
 
 def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,

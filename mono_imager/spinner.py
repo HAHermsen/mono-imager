@@ -32,7 +32,6 @@ import threading
 from itertools import cycle
 from typing import Any, Callable, Tuple, Optional
 
-from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 
 
 def _try_enable_windows_vt_processing() -> bool:

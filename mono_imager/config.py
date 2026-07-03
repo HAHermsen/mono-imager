@@ -7,7 +7,6 @@ Version: v1.1.0
 License: GPLv3
 """
 
-from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
 __author__ = "H.A. Hermsen"
 
 import json
