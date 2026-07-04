@@ -1,144 +1,109 @@
-# mono-imager tests
+# mono-imager
 
-Tests are organised into four folders by what they need and what they risk.
+Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — no manual `dd`/`tftp` fiddling required.
+
+Version: **1.2.0** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
+
+---
+
+## What it does
+
+mono-imager automates the full flashing procedure for the Mono Gateway hardware:
+
+- Detects the serial port, connects, and interrupts U-Boot autoboot automatically.
+- Boots the device into its NOR or eMMC recovery Linux shell and logs in.
+- Resolves the device's own network (DHCP first, verified for real internet reachability, falling back to manual IP/subnet/gateway/DNS entry) — done once per session and reused everywhere.
+- Flashes a full OS image over LAN (via a local HTTP server + `curl`/`dd` on the device) or from a USB stick plugged into the device itself.
+- Refreshes eMMC/NOR firmware regions where the flashing procedure requires it, following each OS's documented official procedure.
+- Falls back to a legacy `curl`+`dd`/`flashcp` path automatically on older devices that don't have the modern `firmware update` tool.
+- Prints a step-by-step pass/fail report for every operation, plus a full log file.
+
+Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each available via **LAN** or **USB** transfer.
+
+## Requirements
+
+- Python 3.10+
+- A USB-to-UART serial adapter connected to the Mono Gateway device
+- Packages: `pyserial>=3.5`, `icmplib>=3.0` (see `requirements.txt`)
+
+## Install
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+This registers the `mono-imager` command via the `[project.scripts]` entry point in `pyproject.toml`. Alternatively, run it straight from the repo without installing:
+
+```bash
+python -m mono_imager.cli
+```
+
+## Usage
+
+```bash
+mono-imager [--debug | --verbose]
+```
+
+| Argument | Description |
+|---|---|
+| `--debug`, `--verbose` | Print verbose console output — every serial command sent and received. Quiet by default; the log file always captures full detail regardless of this flag. Equivalent to setting the environment variable `MONO_DEBUG=1` before launch. |
+
+There are no other CLI arguments — everything else (which OS, which port, which firmware file, network settings) is driven interactively through the menu once the tool starts.
+
+### On launch
+
+Before showing any menu, mono-imager connects to the device and resolves its network once (DHCP first, manual fallback if needed). This can take a minute or two and only happens once per session — every menu afterward reuses the result.
+
+### Main menu
 
 ```
+1) Flash OS                  — flash OpenWRT / Armbian / OPNsense via LAN or USB
+2) Update eMMC firmware       — re-flash eMMC firmware only (DIP switch → NOR)
+3) Update NOR firmware        — re-flash NOR firmware only (DIP switch → eMMC)
+4) CLI only (serial)          — raw interactive serial console pass-through
+5) Test Serial connection     — connect, interrupt U-Boot, confirm recovery login
+6) Test LAN connection        — full network resolve + reach the host HTTP server
+7) Test USB stick             — confirm a USB stick mounts and has usable images
+8) Show Device Stats          — read and display U-Boot boot diagnostics
+9) Exit
+```
+
+Flashing an OS (option 1) walks through: pick the serial port, pick the OS + transfer method (LAN or USB), point it at a firmware file (or let it auto-detect one from a plugged-in USB stick), confirm a pre-flash summary, then watch the flash run with live progress and a final pass/fail report.
+
+## Project layout
+
+```
+mono_imager/
+  cli.py                    entry point (argument parsing, logging setup)
+  tui.py                    menu-driven application controller
+  flash_orchestrator.py     bootstrap phases + LAN/USB flash-journey execution
+  recovery_orchestrator.py  eMMC/NOR-only firmware update flows, modern/legacy detection
+  step_registry.py          declarative @register_step journey system
+  serial_device.py          serial I/O, U-Boot automation, recovery boot/login
+  device_net.py             device network resolution (DHCP/manual/verify)
+  console.py                terminal rendering (pure presentation layer)
+  uboot_parse.py            U-Boot boot-output parsing (identity + self-test)
+  diagnostics.py            Test Serial / Test LAN / Test USB menu logic
+  journeys/                 one file per OS+transfer flashing journey
+    JOURNEYS.md              journey system docs + how to add a new journey
+    FIRMWARE_VS_OS_IMAGE.md  eMMC firmware-region-vs-OS-image offset explainer
 tests/
-  unit/          No hardware. Fast. Run on every commit.
-  hardware/      Real device required. Non-destructive. Safe to run anytime.
-  destructive/   Real device required. Writes to hardware. Run deliberately.
-  archive/       Historical investigation scripts. Not maintained.
+  README.md                 full test suite breakdown (unit/hardware/destructive/archive)
 ```
 
----
+## Testing
 
-## unit/
+See [`tests/README.md`](tests/README.md) for the full breakdown. Quick start:
 
-No hardware required. All device interactions are mocked.
-
-```
-python tests/unit/test_recovery_orchestrator.py
-python tests/unit/test_journey_resolution.py
-python tests/unit/test_device_network.py
-python tests/unit/test_usb_mount.py
-python tests/unit/test_uboot_env.py
-python tests/unit/test_flash_orchestrator.py
-python tests/unit/test_step_registry.py
-python tests/unit/test_config.py
-python tests/unit/test_journeys_common.py
-```
-
-| File | What it tests |
-|------|--------------|
-| `test_recovery_orchestrator.py` | `recovery_orchestrator.py` pure-logic functions: `detect_modern_firmware_tool`, `get_device_mac`, `run_firmware_update`, `_stream_command`, `check_internet_reachable`, `try_dhcp`, `legacy_flash_emmc/nor`, `verify_boot_source` |
-| `test_uboot_env.py` | `parse_uboot_env`/`capture_uboot_env`/`restore_uboot_env` (issue #8) and `SerialDevice.probe_uboot_prompt()` already-at-prompt detection (issue #12) |
-| `test_flash_orchestrator.py` | `flash_orchestrator.py` phase implementations and helpers: result tracking (`step`/`reset_results`/`print_report`), `parse_active_eth_iface`, the `/report` store (`wait_for_report`/`peek_report`), `start_http_server`, `phase1_uboot`/`phase1_recovery`/`phase1_bootstrap` gating, `phase3_flash` step09-12 gating and buffered-vs-streaming script selection at `FLASH_SIZE_CAP`, `phase4_postflash` |
-| `test_step_registry.py` | `FlowRunner.run()` execution engine: success path + ordering, missing-requires abort, exception-in-step handling, produces-marking (default vs. explicit), stop-on-first-failure; `register_uboot_steps`/`run_uboot_steps`; `register_staging_boot`/`get_staging_boot_methods` |
-| `test_config.py` | `config.py`: `load_config`/`save_config` roundtrip, corrupt-JSON recovery, OSError-on-write handling, `save_last_port`/`get_last_port`, `is_known_uart` |
-| `test_journeys_common.py` | `journeys/_common.py`'s `_step_network_ready()`: fails when `device_net` unresolved/empty, forwards `device_ip` from `device_net` without clobbering an already-set value |
-| `test_journey_resolution.py` | Step registry: all 6 journeys resolve to the correct step sequence, OS/transfer isolation, dependency ordering, no circular dependencies |
-| `test_device_network.py` | `MonoImager._setup_recovery_network()` (issue #9): DHCP-first, manual fallback (IP/mask/gateway/DNS), session-cache reuse across calls, stale-cache re-resolution, manual-entry retry loop |
-| `test_usb_mount.py` | `MonoImager.menu_test_usb_mount()`: partitioned-device mount, bare-device fallback, mount failure, three-way OS image scan (pass/fail), unmount-always, serial port persistence |
-
-Run all unit tests:
 ```bash
-for f in tests/unit/test_*.py; do python $f; done
-```
+# No hardware required
+for f in tests/unit/test_*.py; do python "$f"; done
 
----
-
-## hardware/
-
-Requires a Mono Gateway connected via USB-to-UART. Nothing is written.
-
-DIP switch should be on **NOR** for all tests unless noted.
-
-```
+# Requires a connected Mono Gateway (non-destructive)
 python tests/hardware/test_serial_connect.py --port COM5
-python tests/hardware/test_serial_hotplug.py --port COM5 --mode simulated
-python tests/hardware/test_serial_hotplug.py --port COM5 --mode interactive
-python tests/hardware/test_uboot_dump.py --port COM5
-python tests/hardware/test_uboot_dump.py --port COM5 --section printenv
-python tests/hardware/test_emmc_inspect.py --port COM5
-python tests/hardware/test_emmc_inspect.py --port COM5 --firmware-region
-python tests/hardware/test_recovery_detect.py --port COM5
-python tests/hardware/test_recovery_dryrun.py --port COM5
 ```
 
-| File | What it tests | Manual action required |
-|------|--------------|----------------------|
-| `test_serial_connect.py` | Serial detection, connection, U-Boot interrupt, recovery boot | None — soft reboot via serial |
-| `test_serial_hotplug.py` | USB disconnect/reconnect resilience | `--mode interactive` requires physical unplug/replug |
-| `test_uboot_dump.py` | Full U-Boot environment dump: version, printenv, mmc info, bdinfo, i2c probe, boot source | None — soft reboot via serial |
-| `test_emmc_inspect.py` | eMMC partition table, filesystem signatures, first 512 bytes | None — soft reboot via serial |
-| `test_recovery_detect.py` | `detect_modern_firmware_tool()` and device MAC address | None — soft reboot via serial |
-| `test_recovery_dryrun.py` | Full recovery sequence flow and timing | Two DIP switch flips (physical — cannot be automated) |
+## License
 
-Run before a flash session as a pre-flight check:
-```bash
-python tests/hardware/test_serial_connect.py --port COM5
-python tests/hardware/test_recovery_detect.py --port COM5
-```
-
----
-
-## destructive/
-
-Requires a real device. **Writes to hardware.** Run deliberately, not as part of CI.
-
-```
-python tests/destructive/test_firmware_update.py --port COM5
-```
-
-| File | What it writes | Notes |
-|------|---------------|-------|
-| `test_firmware_update.py` | eMMC firmware region (first 32MB) | Runs real `firmware update` command. Does not touch OS partition. |
-
-Each destructive test requires explicit confirmation (`Type 'yes' to proceed`) before anything is sent to the device.
-
----
-
-## archive/
-
-Historical investigation scripts from development. Kept for reference — they answered specific questions that are now resolved and baked into the main codebase.
-
-Not maintained. May require adjustment to run against current code.
-
-| File | Original question it answered |
-|------|------------------------------|
-| `test_probe_fdisk.py` | What are the exact BusyBox fdisk prompt strings on this device? |
-| `test_probe_step6_emmc_recovery.py` | Does `run recovery` succeed from eMMC before a firmware update? |
-| `test_check_current_device_state.py` | What is the device's current state (passive read-only)? |
-
-**Key findings from these investigations** (now in the codebase):
-- `run_script()` + `launch_script()` fire-and-forget + TCP/IP report-back is 100% reliable
-- Direct serial stdout capture of curl output is intermittently unreliable (~50% failure rate)
-- BusyBox dd does not support `status=progress` (use SIGUSR1 for progress, or skip)
-- Recovery shell on NOR does NOT have a `firmware update` command on older devices
-
----
-
-## Logs
-
-All tests write timestamped logs to `logs/` at the project root.
-
-```
-logs/
-  test_serial_connect_20260625_184201.log
-  test_recovery_detect_20260625_184312.log
-  test_firmware_update_20260625_185001.log
-  ...
-```
-
----
-
-## Adding a test
-
-**Unit test for a new journey step:**
-Add assertions to `tests/unit/test_journey_resolution.py` — update `EXPECTED` with the new step label and add isolation checks if the step is OS- or transfer-specific.
-
-**Unit test for new orchestrator logic:**
-Add `check()` calls to `tests/unit/test_recovery_orchestrator.py` following the same pattern. Use `MagicMock` for the device.
-
-**Hardware test for a new feature:**
-Add to `tests/hardware/`. Follow the pattern: `phase1_bootstrap()` to get to recovery shell, run read-only checks, `d.disconnect()`.
+GPLv3. See the `LICENSE` file for the full text.
