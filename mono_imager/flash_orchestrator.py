@@ -34,7 +34,7 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
@@ -840,6 +840,144 @@ def phase4_postflash(d: SerialDevice) -> bool:
     verbose("Flash complete. Reboot sent.")
     console_logger.info("Rebooting device...")
     return True
+
+# --- Full journey orchestration ------------------------------------------
+#
+# run_flash_journey() is the single entry point tui.py calls for the
+# "Flash OS" menu — restores the get_journey()+.run() contract
+# JOURNEYS.md documents ("tui.py calls get_journey() and runner.run(),
+# nothing else"). menu_network_flashing() used to violate that by
+# driving phase1_uboot/phase1_recovery/network-setup inline itself;
+# that ~90-line sequence now lives here once.
+#
+# get_device_net/setup_network are passed in rather than imported —
+# both are session-scoped on MonoImager (the cached device network
+# used by every other caller: eMMC/NOR updates, Test LAN, startup).
+#
+# Returns None if the journey never got far enough to run
+# (bootstrap/U-Boot-steps/network-setup failure) — callers must NOT
+# overwrite their own flash_success in that case, matching the
+# original menu_network_flashing()'s behavior of leaving flash_success
+# untouched on those early failures. Returns a bool (this module's own
+# print_report() verdict) once the journey actually ran.
+
+def run_flash_journey(
+    port: str,
+    os_name: str,
+    transfer: str,
+    host_ip: str,
+    http_port: int,
+    firmware_path,
+    get_device_net: Callable[[], Optional[dict]],
+    setup_network: Callable[[SerialDevice], bool],
+) -> Optional[bool]:
+    from mono_imager.journeys import get_journey
+    from mono_imager.step_registry import get_staging_boot_methods, list_journey
+
+    d = None
+    journey = None
+    try:
+        print()
+        print("=" * 60)
+        print("PHASE 1: Bootstrap (Serial Connection)")
+        print("=" * 60)
+        print(f"Port: {port}")
+        print()
+
+        # Step 1: Connect and interrupt U-Boot — no OS awareness
+        d = phase1_uboot(port, 115200)
+        if d is None:
+            print("❌ Bootstrap FAILED")
+            return None
+
+        # Step 2: Journey-specific U-Boot commands (eMMC erase, bootcmd, etc.)
+        # Delegated entirely to the journey file via run_uboot_steps()
+        print()
+        print("  Configuring U-Boot...")
+        journey = get_journey(
+            os_name       = os_name,
+            transfer      = transfer,
+            device        = d,
+            host_ip       = host_ip,
+            device_ip     = (get_device_net() or {}).get("ip", ""),
+            firmware_path = Path(firmware_path),
+            http_port     = http_port,
+            device_net    = get_device_net(),
+        )
+        if not journey.run_uboot_steps():
+            print("❌ U-Boot setup FAILED")
+            return None
+
+        # Step 3: Boot staging Linux (recovery or alternative, per journey)
+        staging = get_staging_boot_methods(os_name, transfer)
+        d = phase1_recovery(d, **staging)
+        if d is None:
+            print("❌ Bootstrap FAILED")
+            return None
+
+        print("✓ Bootstrap successful")
+        print()
+
+        # Step 3b: resolve the device's own network — same DHCP-first,
+        # verified, manual-fallback mechanism used everywhere else.
+        # Only needed by journeys whose step list actually depends on
+        # it (LAN transfer, or a post-flash internet-requiring step
+        # like OpenWRT/OPNsense's firmware update) — skip it otherwise
+        # so e.g. Armbian-via-USB never prompts for network settings
+        # it will never use.
+        needs_network = "Device network ready" in list_journey(os_name, transfer)
+        if needs_network:
+            if not setup_network(d):
+                print("❌ Device network setup FAILED — cannot continue without it.")
+                return None
+            # get_journey() was called earlier (before recovery boot,
+            # for run_uboot_steps()) with a placeholder device_net —
+            # now that it's actually resolved, forward it into the
+            # already-built ctx rather than rebuilding the journey.
+            device_net = get_device_net()
+            journey.ctx.device_net = device_net
+            journey.ctx.device_ip  = device_net["ip"]
+
+        print()
+        print("=" * 60)
+        print("PHASE 2+: Flashing Firmware")
+        print("=" * 60)
+        fw_display = "auto-detected from USB" if Path(firmware_path) == Path(".") else str(firmware_path)
+        print(f"OS:          {os_name}")
+        print(f"Firmware:    {fw_display}")
+        print(f"Host IP:     {host_ip}:{http_port}")
+        print(f"Device IP:   {journey.ctx.device_ip or '(not needed for this journey)'}")
+        print()
+
+        ok = journey.run()
+
+        if not ok:
+            print("❌ Flashing did not complete successfully")
+        else:
+            print("✓ Flashing completed successfully")
+        print()
+
+    finally:
+        server = None
+        if journey is not None:
+            try:
+                server = journey.ctx.get("http_server")
+            except Exception:
+                pass
+            try:
+                extracted = journey.ctx.get("extracted_rootfs")
+                if extracted:
+                    Path(extracted).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if server:
+            server.shutdown()
+            verbose("HTTP server stopped")
+        if d:
+            d.disconnect()
+
+    return print_report()
+
 
 # --- Report ------------------------------------------------------------------
 

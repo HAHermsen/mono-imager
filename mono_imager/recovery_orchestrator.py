@@ -44,6 +44,7 @@ import logging
 from typing import Optional, Callable
 
 from mono_imager.serial_device import SerialDevice
+from mono_imager.spinner import with_spinner
 
 logger = logging.getLogger(__name__)
 # Must match logging_setup.py's "mono_imager.console" exactly — that's the
@@ -306,7 +307,7 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
     # If auto_confirm_response is provided, pipe it to avoid interactive issues
     if auto_confirm_response:
         command = f"echo {auto_confirm_response} | {command}"
-    
+
     d.ser.reset_input_buffer()
     d.ser.write((command + "\r\n").encode())
 
@@ -513,7 +514,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
         raise ValueError(f"verify_boot_source: expected must be 'EMMC' or 'NOR', got {expected!r}")
 
     logger.info(f"Initiating reboot to verify boot source ({marker_text!r})...")
-    
+
     # CRITICAL: Send reboot command NOW. Device is at recovery shell
     # prompt (silent). Without this command, the byte-reading loop below
     # listens to empty serial → timeout → false failure 100% of the time.
@@ -521,7 +522,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
         d.send_command("reboot", wait_for_prompt=False)
     except Exception as e:
         logger.warning(f"reboot command exception (expected — device disconnects): {e}")
-    
+
     # HARDENING (v0.9.5): After reboot is issued, the device emits
     # shutdown noise (/etc/init.d/rcK, umount messages, etc.) before
     # U-Boot starts. We need to skip this garbage and listen only for
@@ -530,18 +531,18 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
     # Strategy: Watch for "U-Boot" string (appears early in U-Boot output),
     # then switch to looking for the boot source marker. This skips the
     # shutdown chatter and syncs us to the real boot output.
-    
+
     import time
     start = time.time()
     buffer = b""
     uboot_found = False
-    
+
     while time.time() - start < timeout:
         try:
             byte = d.ser.read(1)
             if byte:
                 buffer += byte
-                
+
                 # First: sync to U-Boot output (skip shutdown noise)
                 if not uboot_found:
                     if b"U-Boot" in buffer:
@@ -549,7 +550,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
                         logger.debug("U-Boot output detected — now watching for boot marker")
                         buffer = b""  # reset to fresh buffer
                     continue
-                
+
                 # Second: look for boot source marker in U-Boot output
                 if marker_text.encode() in buffer:
                     logger.info(f"✓ Boot source confirmed: {marker_text}")
@@ -557,7 +558,7 @@ def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> b
         except Exception as e:
             logger.debug(f"Serial read exception: {e}")
             break
-    
+
     # Timeout without finding marker
     if not uboot_found:
         logger.warning(f"Did not detect U-Boot output within {timeout}s — device may not have rebooted")
@@ -712,6 +713,191 @@ def phase_legacy_flash_nor(d: SerialDevice) -> bool:
     return ok
 
 
+# --- Top-level update flows ----------------------------------------------
+#
+# run_emmc_update() / run_nor_update() are the single entry points
+# tui.py calls for menu options 2/3 — same "one call, own your report"
+# shape as a flash journey's get_journey()+.run(), and the same
+# "domain module owns its full flow, including any physical-action
+# pause + prompt" convention flash_orchestrator.phase1_uboot() and
+# device_net.RecoveryNetwork.resolve() already use elsewhere in this
+# codebase. Previously this ~120-line bootstrap/detect/flash/fallback
+# sequence was duplicated almost verbatim between tui.py's
+# menu_update_emmc() and menu_update_nor(); it now lives here once.
+#
+# soft_reboot / setup_network are passed in rather than imported —
+# both are session-scoped on MonoImager (soft-reboot is a serial-only
+# best-effort nudge; setup_network shares the single cached
+# device-network resolution used by every other caller: journeys,
+# Test LAN, startup). Passing them in keeps this module with no
+# dependency on tui.py at all, same pattern as diagnostics.py.
+
+def run_emmc_update(
+    port: str,
+    soft_reboot: Callable[[str], None],
+    setup_network: Callable[[SerialDevice], bool],
+    on_output: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """
+    Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT)
+    — bootstraps into it, detects modern vs. legacy firmware tool,
+    resolves the device network, then flashes eMMC via the modern
+    `firmware update` (falling back to legacy curl+dd if that fails or
+    isn't available). Prints its own step-by-step report before
+    returning.
+
+    Returns True on overall success.
+    """
+    from mono_imager import flash_orchestrator as core
+
+    d = None
+    try:
+        soft_reboot(port)
+        d = core.phase1_bootstrap(port, 115200, boot_medium="qspi")
+        if d is None:
+            console_logger.info("")
+            console_logger.info("  ❌ Could not bootstrap into the recovery shell.")
+            return core.print_report()
+
+        reset_results()
+        is_modern, _fw_err = with_spinner(
+            detect_modern_firmware_tool, d,
+            message="Detecting firmware tool type..."
+        )
+        if _fw_err:
+            is_modern = None
+
+        if is_modern is None:
+            console_logger.info("")
+            console_logger.info("  ❌ Could not determine the device's firmware tool type.")
+            return print_report()
+
+        if not setup_network(d):
+            return print_report()
+
+        if is_modern:
+            console_logger.info("")
+            console_logger.info("  Modern firmware tool detected.")
+            console_logger.info("")
+            emmc_ok = phase_modern_flash_emmc(d, on_output=on_output)
+            if not emmc_ok:
+                console_logger.info("")
+                console_logger.info("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+dd...")
+                emmc_ok, _leg_err = with_spinner(
+                    phase_legacy_flash_emmc, d,
+                    message="Flashing eMMC (legacy curl+dd)..."
+                )
+                if _leg_err:
+                    emmc_ok = False
+                if not emmc_ok:
+                    console_logger.info("  ❌ Legacy fallback also failed for eMMC.")
+                    return print_report()
+                console_logger.info("  ✓ Legacy fallback succeeded.")
+        else:
+            console_logger.info("")
+            console_logger.info("  Legacy firmware tool detected — using curl+dd directly.")
+            console_logger.info("")
+            emmc_ok, _leg_err = with_spinner(
+                phase_legacy_flash_emmc, d,
+                message="Flashing eMMC (legacy curl+dd)..."
+            )
+            if _leg_err:
+                emmc_ok = False
+            if not emmc_ok:
+                return print_report()
+
+    finally:
+        if d:
+            d.disconnect()
+
+    return print_report()
+
+
+def run_nor_update(
+    port: str,
+    soft_reboot: Callable[[str], None],
+    setup_network: Callable[[SerialDevice], bool],
+    on_output: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """
+    Flash NOR firmware only. Device must be in eMMC recovery (DIP LEFT)
+    — bootstraps into it, detects modern vs. legacy firmware tool,
+    resolves the device network, then flashes NOR via the modern
+    `firmware update` (falling back to legacy curl+flashcp if that
+    fails or isn't available). Does not prompt for a DIP-switch flip
+    back to NOR or verify the resulting boot — the caller is
+    responsible for that if/when they want it (see
+    phase_modern_verify_nor_boot() below, still available but no
+    longer called from here). Prints its own step-by-step report
+    before returning.
+
+    Returns True on overall success.
+    """
+    from mono_imager import flash_orchestrator as core
+
+    d = None
+    try:
+        soft_reboot(port)
+        d = core.phase1_bootstrap(port, 115200, boot_medium="emmc")
+        if d is None:
+            console_logger.info("")
+            console_logger.info("  ❌ Could not bootstrap into the recovery shell.")
+            return core.print_report()
+
+        reset_results()
+        is_modern, _fw_err = with_spinner(
+            detect_modern_firmware_tool, d,
+            message="Detecting firmware tool type..."
+        )
+        if _fw_err:
+            is_modern = None
+
+        if is_modern is None:
+            console_logger.info("")
+            console_logger.info("  ❌ Could not determine the device's firmware tool type.")
+            return print_report()
+
+        if not setup_network(d):
+            return print_report()
+
+        if is_modern:
+            console_logger.info("")
+            console_logger.info("  Modern firmware tool detected.")
+            console_logger.info("")
+            nor_ok = phase_modern_flash_nor(d, on_output=on_output)
+            if not nor_ok:
+                console_logger.info("")
+                console_logger.info("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+flashcp...")
+                nor_ok, _leg_err = with_spinner(
+                    phase_legacy_flash_nor, d,
+                    message="Flashing NOR (legacy curl+flashcp)..."
+                )
+                if _leg_err:
+                    nor_ok = False
+                if not nor_ok:
+                    console_logger.info("  ❌ Legacy fallback also failed for NOR.")
+                    return print_report()
+                console_logger.info("  ✓ Legacy fallback succeeded.")
+
+        else:
+            console_logger.info("")
+            console_logger.info("  Legacy firmware tool detected — using curl+flashcp directly.")
+            console_logger.info("  (No DIP-switch flip needed for this path.)")
+            console_logger.info("")
+            nor_ok, _leg_err = with_spinner(
+                phase_legacy_flash_nor, d,
+                message="Flashing NOR (legacy curl+flashcp)..."
+            )
+            if _leg_err:
+                nor_ok = False
+
+    finally:
+        if d:
+            d.disconnect()
+
+    return print_report()
+
+
 def print_report() -> bool:
     """
     Summarize the recovery attempt's results — same OK/NOK verdict
@@ -745,4 +931,3 @@ def print_report() -> bool:
             console_logger.info(f"  - {desc}")
 
     return verdict == "OK"
-

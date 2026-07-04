@@ -17,7 +17,7 @@ import logging
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from mono_imager.spinner import with_spinner, Spinner
+from mono_imager.spinner import with_spinner
 from mono_imager import console
 from mono_imager.device_net import RecoveryNetwork
 from mono_imager.uboot_parse import parse_uboot_identity, parse_uboot_self_test
@@ -305,9 +305,6 @@ class MonoImager:
             input("  Press Enter to continue...")
             return None
 
-    def _check(self, results: list, label: str, passed: bool, detail: str = "") -> bool:
-        return console.check(results, label, passed, detail)
-
     def _show_flash_confirmation(
         self,
         *,
@@ -574,133 +571,35 @@ class MonoImager:
     # ------------------------------------------------------------------ #
     def menu_network_flashing(self):
         """
-        Run the actual flash via flash_orchestrator.py — the same
-        proven functions used by tests/test_verify_flash_auto.py and
-        tests/test_verify_flash_manual.py, confirmed working on real
-        hardware (12/12 steps, both auto and manual paths).
+        Run the actual flash journey. Bootstrap, U-Boot steps, recovery
+        boot, network setup, and journey.run() all live in
+        flash_orchestrator.run_flash_journey() now — this method only
+        calls it and updates flash_success/current_state, restoring
+        the get_journey()+.run() contract JOURNEYS.md documents for
+        tui.py.
+
+        flash_success is only touched when run_flash_journey() returns
+        non-None (i.e. it got far enough to actually call
+        print_report()) — matching the original's behavior of leaving
+        flash_success at its previous value on an early bootstrap/
+        U-Boot-steps/network-setup failure.
         """
         # DON'T clear screen here — keep all output visible for debugging
 
-        from mono_imager.flash_orchestrator import phase1_uboot, phase1_recovery
         from mono_imager import flash_orchestrator as core
-        from mono_imager.journeys import get_journey
-        from mono_imager.step_registry import get_staging_boot_methods
 
-        d = None
-        journey = None
-        try:
-            print()
-            print("=" * 60)
-            print("PHASE 1: Bootstrap (Serial Connection)")
-            print("=" * 60)
-            print(f"Port: {self.serial_port}")
-            print()
-
-            # Step 1: Connect and interrupt U-Boot — no OS awareness
-            d = phase1_uboot(self.serial_port, 115200)
-            if d is None:
-                print("❌ Bootstrap FAILED")
-                self.current_state = MenuState.DONE
-                return
-
-            # Step 2: Journey-specific U-Boot commands (eMMC erase, bootcmd, etc.)
-            # Delegated entirely to the journey file via run_uboot_steps()
-            print()
-            print("  Configuring U-Boot...")
-            journey = get_journey(
-                os_name       = self.os_name,
-                transfer      = getattr(self, "transfer_method", "lan"),
-                device        = d,
-                host_ip       = self.net_host_ip,
-                device_ip     = (self.device_net or {}).get("ip", ""),
-                firmware_path = Path(self.custom_fw_path),
-                http_port     = self.net_http_port,
-                device_net    = self.device_net,
-            )
-            if not journey.run_uboot_steps():
-                print("❌ U-Boot setup FAILED")
-                d.disconnect()
-                self.current_state = MenuState.DONE
-                return
-
-            # Step 3: Boot staging Linux (recovery or alternative, per journey)
-            staging = get_staging_boot_methods(
-                self.os_name, getattr(self, "transfer_method", "lan")
-            )
-            d = phase1_recovery(d, **staging)
-            if d is None:
-                print("❌ Bootstrap FAILED")
-                self.current_state = MenuState.DONE
-                return
-
-            print("✓ Bootstrap successful")
-            print()
-
-            # Step 3b: resolve the device's own network — same DHCP-first,
-            # verified, manual-fallback mechanism used everywhere else
-            # (self.device_net). Only needed by journeys whose step list
-            # actually depends on it (LAN transfer, or a post-flash
-            # internet-requiring step like OpenWRT/OPNsense's firmware
-            # update) — skip it otherwise so e.g. Armbian-via-USB never
-            # prompts for network settings it will never use.
-            from mono_imager.step_registry import list_journey
-            needs_network = "Device network ready" in list_journey(
-                self.os_name, getattr(self, "transfer_method", "lan")
-            )
-            if needs_network:
-                if not self._setup_recovery_network(d):
-                    print("❌ Device network setup FAILED — cannot continue without it.")
-                    d.disconnect()
-                    self.current_state = MenuState.DONE
-                    return
-                # get_journey() was called earlier (before recovery boot,
-                # for run_uboot_steps()) with a placeholder device_net —
-                # now that it's actually resolved, forward it into the
-                # already-built ctx rather than rebuilding the journey.
-                journey.ctx.device_net = self.device_net
-                journey.ctx.device_ip  = self.device_net["ip"]
-
-            print()
-            print("=" * 60)
-            print("PHASE 2+: Flashing Firmware")
-            print("=" * 60)
-            fw_display = "auto-detected from USB" if self.custom_fw_path == Path(".") else str(self.custom_fw_path)
-            print(f"OS:          {self.os_name}")
-            print(f"Firmware:    {fw_display}")
-            print(f"Host IP:     {self.net_host_ip}:{self.net_http_port}")
-            print(f"Device IP:   {journey.ctx.device_ip or '(not needed for this journey)'}")
-            print()
-
-            ok = journey.run()
-
-            if not ok:
-                print("❌ Flashing did not complete successfully")
-            else:
-                print("✓ Flashing completed successfully")
-
-            self.flash_success = ok
-            print()
-
-        finally:
-            server = None
-            if journey is not None:
-                try:
-                    server = journey.ctx.get("http_server")
-                except Exception:
-                    pass
-                try:
-                    extracted = journey.ctx.get("extracted_rootfs")
-                    if extracted:
-                        Path(extracted).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if server:
-                server.shutdown()
-                core.verbose("HTTP server stopped")
-            if d:
-                d.disconnect()
-
-        self.flash_success = core.print_report()
+        result = core.run_flash_journey(
+            self.serial_port,
+            self.os_name,
+            getattr(self, "transfer_method", "lan"),
+            self.net_host_ip,
+            self.net_http_port,
+            self.custom_fw_path,
+            lambda: self.device_net,
+            self._setup_recovery_network,
+        )
+        if result is not None:
+            self.flash_success = result
         self.current_state = MenuState.DONE
 
     # ------------------------------------------------------------------ #
@@ -723,10 +622,14 @@ class MonoImager:
     def menu_update_emmc(self):
         """
         Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT).
-        The 'firmware update' command auto-targets eMMC when booted from NOR.
-        Falls back to legacy curl+dd if the modern tool is unavailable.
+
+        Bootstrap, modern/legacy detection, flashing, and legacy
+        fallback all live in recovery_orchestrator.run_emmc_update()
+        now (it used to be duplicated almost verbatim here and in
+        menu_update_nor()). This method only owns the menu chrome
+        (instructions, port selection, confirmation) and the
+        MenuState/flash_success bookkeeping via _recovery_finish().
         """
-        from mono_imager import flash_orchestrator as core
         from mono_imager import recovery_orchestrator as rec
 
         self.clear_screen()
@@ -758,70 +661,10 @@ class MonoImager:
             self.current_state = MenuState.MAIN
             return
 
-        d = None
-        try:
-            self._soft_reboot_if_possible(port)
-            d = core.phase1_bootstrap(port, 115200, boot_medium="qspi")
-            if d is None:
-                print()
-                print("  ❌ Could not bootstrap into the recovery shell.")
-                self._recovery_finish(core.print_report())
-                return
-
-            rec.reset_results()
-            is_modern, _fw_err = with_spinner(
-                rec.detect_modern_firmware_tool, d,
-                message="Detecting firmware tool type..."
-            )
-            if _fw_err:
-                is_modern = None
-
-            if is_modern is None:
-                print()
-                print("  ❌ Could not determine the device's firmware tool type.")
-                self._recovery_finish(rec.print_report())
-                return
-
-            if not self._setup_recovery_network(d):
-                self._recovery_finish(rec.print_report())
-                return
-
-            if is_modern:
-                print()
-                print("  Modern firmware tool detected.")
-                print()
-                emmc_ok = rec.phase_modern_flash_emmc(d, on_output=self._show_firmware_output)
-                if not emmc_ok:
-                    print()
-                    print("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+dd...")
-                    emmc_ok, _leg_err = with_spinner(
-                        rec.phase_legacy_flash_emmc, d,
-                        message="Flashing eMMC (legacy curl+dd)..."
-                    )
-                    if _leg_err:
-                        emmc_ok = False
-                    if not emmc_ok:
-                        print("  ❌ Legacy fallback also failed for eMMC.")
-                        self._recovery_finish(rec.print_report())
-                        return
-                    print("  ✓ Legacy fallback succeeded.")
-            else:
-                print()
-                print("  Legacy firmware tool detected — using curl+dd directly.")
-                print()
-                emmc_ok, _leg_err = with_spinner(
-                    rec.phase_legacy_flash_emmc, d,
-                    message="Flashing eMMC (legacy curl+dd)..."
-                )
-                if _leg_err:
-                    emmc_ok = False
-                if not emmc_ok:
-                    self._recovery_finish(rec.print_report())
-                    return
-
-        finally:
-            if d:
-                d.disconnect()
+        rec.run_emmc_update(
+            port, self._soft_reboot_if_possible, self._setup_recovery_network,
+            on_output=self._show_firmware_output,
+        )
 
         success = rec.print_report()
         if success:
@@ -835,11 +678,15 @@ class MonoImager:
     def menu_update_nor(self):
         """
         Flash NOR firmware only. Device must be in eMMC recovery (DIP LEFT).
-        The 'firmware update' command auto-targets NOR when booted from eMMC.
-        Falls back to legacy curl+flashcp if the modern tool is unavailable.
         Requires eMMC to already have the official Mono firmware with recovery.
+
+        Bootstrap, modern/legacy detection, flashing, and legacy
+        fallback all live in recovery_orchestrator.run_nor_update()
+        now. This method only owns the menu chrome and MenuState/
+        flash_success bookkeeping. No DIP-flip-back or boot
+        verification is prompted after flashing — the tool leaves the
+        device as-is once the write is confirmed.
         """
-        from mono_imager import flash_orchestrator as core
         from mono_imager import recovery_orchestrator as rec
 
         self.clear_screen()
@@ -871,77 +718,10 @@ class MonoImager:
             self.current_state = MenuState.MAIN
             return
 
-        d = None
-        try:
-            self._soft_reboot_if_possible(port)
-            d = core.phase1_bootstrap(port, 115200, boot_medium="emmc")
-            if d is None:
-                print()
-                print("  ❌ Could not bootstrap into the recovery shell.")
-                self._recovery_finish(core.print_report())
-                return
-
-            rec.reset_results()
-            is_modern, _fw_err = with_spinner(
-                rec.detect_modern_firmware_tool, d,
-                message="Detecting firmware tool type..."
-            )
-            if _fw_err:
-                is_modern = None
-
-            if is_modern is None:
-                print()
-                print("  ❌ Could not determine the device's firmware tool type.")
-                self._recovery_finish(rec.print_report())
-                return
-
-            if not self._setup_recovery_network(d):
-                self._recovery_finish(rec.print_report())
-                return
-
-            if is_modern:
-                print()
-                print("  Modern firmware tool detected.")
-                print()
-                nor_ok = rec.phase_modern_flash_nor(d, on_output=self._show_firmware_output)
-                if not nor_ok:
-                    print()
-                    print("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+flashcp...")
-                    nor_ok, _leg_err = with_spinner(
-                        rec.phase_legacy_flash_nor, d,
-                        message="Flashing NOR (legacy curl+flashcp)..."
-                    )
-                    if _leg_err:
-                        nor_ok = False
-                    if not nor_ok:
-                        print("  ❌ Legacy fallback also failed for NOR.")
-                        self._recovery_finish(rec.print_report())
-                        return
-                    print("  ✓ Legacy fallback succeeded.")
-
-                print()
-                print("=" * 60)
-                print("  ⚡ FLIP THE DIP SWITCH BACK TO NOR (RIGHT), THEN POWER-CYCLE ⚡")
-                print("=" * 60)
-                input("  Press Enter once you've done that...")
-
-                rec.phase_modern_verify_nor_boot(d)
-
-            else:
-                print()
-                print("  Legacy firmware tool detected — using curl+flashcp directly.")
-                print("  (No DIP-switch flip needed for this path.)")
-                print()
-                nor_ok, _leg_err = with_spinner(
-                    rec.phase_legacy_flash_nor, d,
-                    message="Flashing NOR (legacy curl+flashcp)..."
-                )
-                if _leg_err:
-                    nor_ok = False
-
-        finally:
-            if d:
-                d.disconnect()
+        rec.run_nor_update(
+            port, self._soft_reboot_if_possible, self._setup_recovery_network,
+            on_output=self._show_firmware_output,
+        )
 
         self._recovery_finish(rec.print_report())
 
@@ -950,17 +730,16 @@ class MonoImager:
     # ------------------------------------------------------------------ #
     def menu_test_serial(self):
         """
-        Run the serial connection test inline.
-
-        Reuses test logic from tests/hardware/test_serial_connect.py
-        directly — same steps, same pass/fail output, no subprocess.
+        Run the serial connection test. Hardware interaction, live
+        progress, and the pass/fail summary all live in
+        diagnostics.test_serial() now; this method only resolves the
+        port (a menu-navigation decision) and drives MenuState.
 
         If self.serial_port is already set (user connected earlier in
         this session), it is used automatically. Otherwise the user is
         prompted to pick a port first.
         """
-        from mono_imager.serial_device import SerialDevice
-        import time
+        from mono_imager import diagnostics
 
         self.clear_screen()
         self.print_header()
@@ -976,90 +755,9 @@ class MonoImager:
                 self.current_state = MenuState.MAIN
                 return
 
-        print()
-        print(f"  Port:  {port}")
-        print("  Baud:  115200")
-        print()
-
-        results = []
-
-        # Step 1: connect
-        d = SerialDevice(port, timeout=5)
-        if not self._check(results, "Connect at 115200 baud", d.connect(115200)):
-            input("\n  Press Enter to return to main menu...")
-            self.current_state = MenuState.MAIN
-            return
-
-        try:
-            # Step 2: interrupt U-Boot
-            print()
-            print("  " + "─" * 56)
-            print("  ⚡  POWER CYCLE YOUR DEVICE NOW  ⚡")
-            print("  " + "─" * 56)
-            print()
-            _autoboot_ok, _autoboot_err = with_spinner(
-                d.wait_for_autoboot, timeout=60,
-                message="Waiting for U-Boot autoboot interrupt..."
-            )
-            if _autoboot_err:
-                _autoboot_ok = False
-            self._check(results, "U-Boot autoboot interrupted", bool(_autoboot_ok))
-            if not results[-1]:
-                input("\n  Press Enter to return to main menu...")
-                self.current_state = MenuState.MAIN
-                return
-
-            # Step 3: U-Boot responds to a command
-            response = d.send_command("printenv ethact", timeout=5)
-            self._check(results, "U-Boot responds to commands",
-                        bool(response.strip()),
-                        response.strip() if response.strip() else "no response")
-
-            # Step 4: boot recovery
-            booted = False
-            buffer = b""
-            with Spinner("Booting recovery Linux..."):
-                d.send_command("run recovery", wait_for_prompt=False, timeout=3)
-                start = time.time()
-                while time.time() - start < 60:
-                    byte = d.ser.read(1)
-                    if byte:
-                        buffer += byte
-                        if b"root@recovery" in buffer or b"login:" in buffer:
-                            if b"login:" in buffer and b"root@recovery" not in buffer:
-                                d.ser.write(b"root\r\n")
-                                time.sleep(1)
-                            booted = True
-                            break
-            self._check(results, "Recovery Linux booted", booted)
-
-            # Step 5: login confirmed
-            if booted:
-                d.ser.write(b"\r\n")
-                time.sleep(0.5)
-                waiting  = d.ser.in_waiting
-                response = d.ser.read(waiting) if waiting else b""
-                at_shell = b"root@recovery" in buffer or b"root@recovery" in response
-                self._check(results, "Logged into recovery shell", at_shell)
-
-        finally:
-            d.disconnect()
-
-        # Summary
-        print()
-        print("  " + "─" * 56)
-        total  = len(results)
-        passed = sum(results)
-        if passed == total:
-            print(f"  ✓  All {total} checks passed — serial connection is healthy.")
-        else:
-            print(f"  ✗  {total - passed}/{total} checks failed.")
-
-        # Remember the working port for subsequent operations
-        if results and results[0]:  # connected successfully
+        if diagnostics.test_serial(port):
             self.serial_port = port
 
-        input("\n  Press Enter to return to main menu...")
         self.current_state = MenuState.MAIN
 
 
@@ -1069,34 +767,20 @@ class MonoImager:
     def menu_test_lan(self):
         """
         Full end-to-end LAN test — boots device into recovery, sets up
-        networking, and confirms the device can reach the host HTTP server.
-
-        Steps:
-          1. Resolve serial port (use known port or auto-detect)
-          2. Bootstrap device via serial (soft reboot → U-Boot → recovery)
-          3. Detect host IP
-          4. Resolve the device's own network (DHCP-first, verified,
-             manual fallback — same mechanism as everywhere else, and
-             reused rather than re-implemented here)
-          5. Start HTTP server on host
-          6. Device curls the server and reports back — confirms full path
+        networking, and confirms the device can reach the host HTTP
+        server. Hardware interaction, live progress, and the summary
+        all live in diagnostics.test_lan(); this method only resolves
+        the port (menu-navigation), passes through the session-scoped
+        callables (soft reboot, device-network resolve/read — both
+        owned by MonoImager so every caller shares the same cache),
+        and persists whatever diagnostics.test_lan() says is safe to
+        keep.
         """
-        from mono_imager.flash_orchestrator import (
-            phase1_bootstrap, detect_host_ip,
-            start_http_server, wait_for_report
-        )
-        import tempfile
-        import pathlib
+        from mono_imager import diagnostics
 
         self.clear_screen()
         self.print_header()
-        print("  Test LAN Connection")
-        print("  " + "─" * 56)
-        print()
 
-        results = []
-
-        # Step 1: resolve serial port
         port = self.serial_port
         if not port:
             port = self._select_port(auto_select_single=True, allow_back=False)
@@ -1104,102 +788,18 @@ class MonoImager:
                 self.current_state = MenuState.MAIN
                 return
 
-        print()
+        saved = diagnostics.test_lan(
+            port,
+            self.net_host_ip,
+            self._soft_reboot_if_possible,
+            self._setup_recovery_network,
+            lambda: self.device_net,
+        )
+        if saved:
+            self.serial_port   = saved["serial_port"]
+            self.net_host_ip   = saved["host_ip"]
+            self.net_device_ip = saved["device_ip"]
 
-        # Step 2: soft reboot then bootstrap into recovery
-        print("  Rebooting device into recovery Linux...")
-        self._soft_reboot_if_possible(port)
-
-        d = phase1_bootstrap(port, 115200)
-        if not self._check(results, "Device in recovery shell", d is not None):
-            input("\n  Press Enter to return to main menu...")
-            self.current_state = MenuState.MAIN
-            return
-
-        try:
-            # Step 3: host IP (still detected/derived — separate concern
-            # from the device's own network, since this is the address
-            # the device will curl toward, not the address it configures
-            # on itself).
-            host_ip = self.net_host_ip or detect_host_ip()
-            if not self._check(results, "Host IP detected", bool(host_ip), host_ip or "could not detect"):
-                return
-
-            # Step 4: device network — reuses the same DHCP-first, verified,
-            # manual-fallback resolution as everywhere else (self.device_net),
-            # instead of re-implementing ethernet-port detection and a bare
-            # `ip addr add` here. Replaces the old ICMP ping-from-device
-            # check too: that check was non-fatal and unused by anything
-            # (informational only), while _setup_recovery_network() already
-            # does a real reachability check as part of resolving the
-            # network, and the curl-based check in step 6 below is the
-            # actually meaningful "can the device reach the host" test.
-            if not self._check(results, "Device network ready", self._setup_recovery_network(d)):
-                input("\n  Press Enter to return to main menu...")
-                return
-            device_ip = self.device_net["ip"]
-
-            # Step 5: HTTP server
-            http_port = 18080
-            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tf:
-                _tf.write(b"LAN_TEST")
-                tmp = pathlib.Path(_tf.name)
-            server = start_http_server(host_ip, http_port, tmp)
-            if not self._check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
-                tmp.unlink(missing_ok=True)
-                input("\n  Press Enter to return to main menu...")
-                self.current_state = MenuState.MAIN
-                return
-
-            # Step 6: device curls the server and reports back
-            url = f"http://{host_ip}:{http_port}/firmware.img"
-            check_script = (
-                f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
-                f"> /tmp/lantest_code.txt; "
-                f"curl -sk -X POST --data-binary @/tmp/lantest_code.txt "
-                f"\"http://{host_ip}:{http_port}/report?step=lantest\" >/dev/null 2>&1"
-            )
-            try:
-                d.launch_script(check_script, marker="lantest")
-                report, _rep_err = with_spinner(
-                    wait_for_report, "lantest", timeout=15.0,
-                    message="Waiting for device HTTP report..."
-                )
-                device_sees_host = report is not None and "200" in report
-            except Exception as e:
-                device_sees_host = False
-            finally:
-                server.shutdown()
-                tmp.unlink(missing_ok=True)
-
-            _curl_detail = (
-                "" if device_sees_host else
-                "device's network is up but can't reach the host — either port 18080 is "
-                "blocked (allow Python.exe through Windows Defender Firewall) or the cable "
-                "doesn't connect to the SAME router/switch as the host"
-            )
-            self._check(results, "Device can reach host HTTP server", device_sees_host, _curl_detail)
-
-            # Save working config
-            self.serial_port   = port
-            self.net_host_ip   = host_ip
-            self.net_device_ip = device_ip
-
-        finally:
-            if d:
-                d.disconnect()
-
-        # Summary
-        print()
-        print("  " + "─" * 56)
-        passed_count = sum(results)
-        total        = len(results)
-        if passed_count == total:
-            print("  ✓  LAN path confirmed end-to-end.")
-        else:
-            print(f"  ✗  {total - passed_count}/{total} checks failed.")
-
-        input("\n  Press Enter to return to main menu...")
         self.current_state = MenuState.MAIN
 
 
@@ -1210,31 +810,16 @@ class MonoImager:
         """
         Verify a USB stick is connected, mountable, and (optionally)
         already staged with recognizable OS images — before starting a
-        real USB flash journey. Same standalone-diagnostic principle as
-        menu_test_lan(): boot into recovery, exercise the exact path a
-        real journey would use, report pass/fail, return to the main menu.
-
-        Mount attempt mirrors the real USB journeys' step_mount_usb
-        (usb_device + "1" first, falling back to the bare usb_device for
-        unpartitioned sticks) — same reasoning, not reinvented here.
-
-        Unlike a real journey (which only looks for the one OS you
-        picked), this scans for all three known image patterns and
-        reports what's actually present, since a 16 GB+ stick is meant
-        to hold all three simultaneously.
+        real USB flash journey. Hardware interaction, live progress, and
+        the summary all live in diagnostics.test_usb(); this method
+        only resolves the port (menu-navigation) and persists it once
+        the mount is proven.
         """
-        from mono_imager.flash_orchestrator import phase1_bootstrap
-        from mono_imager.journeys.usb_utils import check_usb_size, find_image_on_usb
+        from mono_imager import diagnostics
 
         self.clear_screen()
         self.print_header()
-        print("  Test USB Stick")
-        print("  " + "─" * 56)
-        print()
 
-        results = []
-
-        # Step 1: resolve serial port
         port = self.serial_port
         if not port:
             port = self._select_port(auto_select_single=True, allow_back=False)
@@ -1242,79 +827,9 @@ class MonoImager:
                 self.current_state = MenuState.MAIN
                 return
 
-        print()
+        if diagnostics.test_usb(port):
+            self.serial_port = port
 
-        # Step 2: bootstrap into recovery
-        d = phase1_bootstrap(port, 115200)
-        if not self._check(results, "Device in recovery shell", d is not None):
-            input("\n  Press Enter to return to main menu...")
-            self.current_state = MenuState.MAIN
-            return
-
-        usb_device = "/dev/sda"
-        usb_mount  = "/mnt/usb"
-
-        try:
-            # Step 3: mount (partition first, bare device as fallback)
-            try:
-                d.send_command(f"mkdir -p {usb_mount}", timeout=5)
-                response, _mnt_err = with_spinner(
-                    d.send_command, f"mount {usb_device}1 {usb_mount} 2>&1; echo RC=$?",
-                    timeout=15, message="Mounting USB stick..."
-                )
-                if _mnt_err:
-                    raise _mnt_err
-                mounted = "RC=0" in response
-                if not mounted:
-                    response = d.send_command(f"mount {usb_device} {usb_mount} 2>&1; echo RC=$?", timeout=15)
-                    mounted = "RC=0" in response
-            except Exception as e:
-                mounted, response = False, str(e)
-
-            if not self._check(results, f"USB mounted ({usb_device} -> {usb_mount})", mounted,
-                                "" if mounted else "no USB stick detected, or it's not FAT32/exFAT formatted"):
-                input("\n  Press Enter to return to main menu...")
-                return
-
-            # Step 4: capacity (informational — warns below 16 GB, doesn't fail the test)
-            check_usb_size(d, usb_mount)
-
-            # Step 5: scan for all three known OS image patterns
-            print()
-            found = {}
-            for os_name in ["OPNsense", "OpenWRT", "Armbian"]:
-                path, _fmt = find_image_on_usb(d, usb_mount, os_name)
-                found[os_name] = path
-                mark = "✓" if path else "·"
-                detail = f" — {Path(path).name}" if path else " (not found)"
-                print(f"  {mark}  {os_name} image{detail}")
-
-            any_found = any(found.values())
-            self._check(results, "At least one recognizable OS image on stick", any_found,
-                        "" if any_found else "stick mounts fine but no armbian*/openwrt*/opnsense* "
-                                              "image found — see README for expected filenames")
-
-        finally:
-            # Step 6: unmount
-            try:
-                d.send_command(f"umount {usb_mount} 2>&1; sync", timeout=15)
-            except Exception as e:
-                verbose(f"⚠ USB unmount warning: {e}", "warning")
-            d.disconnect()
-
-        # Summary
-        print()
-        print("  " + "─" * 56)
-        passed_count = sum(results)
-        total        = len(results)
-        if passed_count == total:
-            print("  ✓  USB stick mounted and verified.")
-        else:
-            print(f"  ✗  {total - passed_count}/{total} checks failed.")
-
-        self.serial_port = port
-
-        input("\n  Press Enter to return to main menu...")
         self.current_state = MenuState.MAIN
 
 
