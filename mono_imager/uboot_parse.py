@@ -61,30 +61,50 @@ def parse_uboot_identity(raw_output: str) -> dict:
     return result
 
 
-_OK_PREFIX = "[ OK ]"
+_STATUS_PREFIXES = {
+    "[ OK ]": True,
+    "[FAIL]": False,
+}
 
 
 def parse_uboot_self_test(raw_output: str) -> list:
     """
     Parse the power-on self-test block from raw U-Boot boot output.
-    Matches lines of the form "[ OK ] Label            value",
-    e.g.:
+    Matches lines of the form "[ OK ] Label            value" or
+    "[FAIL] Label            value", e.g.:
 
         [ OK ] DDR4 Memory          Bank0: 1982 MB, Bank1: 6144 MB
         [ OK ] USB PD controller    ID 0x25
-        [ OK ] Temperatures         CPU 51 °C, Board 46 °C
+        [FAIL] Temperatures         CPU sensor not responding
 
-    Only matches [ OK ] lines — failures are not captured.
+    Both statuses are captured — a failed self-test item (bad DDR, a
+    dead temperature sensor, etc.) used to be silently dropped here,
+    which meant a real hardware fault would just show up as a shorter
+    list instead of a visible failure. console.show_device_stats()
+    renders the two differently.
 
-    Returns a list of (label, value) tuples in the order they appeared.
-    value is "" if only the label is present with no value/detail.
+    Label/value are split on the first run of 2+ spaces, not the
+    first single space — labels are frequently multiple words
+    ("DDR4 Memory", "USB PD controller"), and splitting on the first
+    single space cut those in half, silently misparsing every
+    multi-word label since this function was first written.
+
+    Returns a list of (label, value, passed) tuples in the order they
+    appeared. value is "" if only the label is present with no
+    value/detail. passed is True for "[ OK ]", False for "[FAIL]".
     """
     out = []
     for line in raw_output.splitlines():
         line = line.strip()
-        if not line.startswith(_OK_PREFIX):
+        prefix = next((p for p in _STATUS_PREFIXES if line.startswith(p)), None)
+        if prefix is None:
             continue
-        label, _, value = line[len(_OK_PREFIX):].strip().partition(" ")
-        if label.lower() != "self-test":
-            out.append((label, value.strip()))
+        passed = _STATUS_PREFIXES[prefix]
+        rest = line[len(prefix):].strip()
+        parts = re.split(r'\s{2,}', rest, maxsplit=1)
+        label = parts[0].strip()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if label.lower().startswith("self-test"):
+            continue
+        out.append((label, value, passed))
     return out

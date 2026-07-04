@@ -1,14 +1,17 @@
 """
 mono-imager journey: Armbian via USB
 
-DIP switch: RIGHT (NOR) throughout — NOR U-Boot loads Armbian from eMMC via extlinux.
+Follows the official documented procedure (we-are-mono/docs
+"Installing Armbian") — see armbian_lan.py, which owns the shared
+DIP-flip/firmware-refresh step implementations this file imports.
 
 Steps:
   1. Mount USB stick
   2. Detect firmware file on USB
   3. Flash Armbian image
   4. Unmount USB stick
-  5. Reboot device
+  5. Flip DIP to eMMC and verify boot
+  6. Refresh eMMC firmware (NOR round-trip)
 
 Image detection: scans USB for armbian*.img.xz or armbian*.img (case-insensitive).
 Original vendor filenames work directly — no renaming needed.
@@ -22,6 +25,7 @@ from mono_imager.step_registry import register_step, StepContext
 from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size
+from mono_imager.journeys.armbian_lan import _flip_to_emmc_and_verify, _refresh_firmware_and_finish
 
 logger = logging.getLogger(__name__)
 
@@ -102,11 +106,18 @@ def step_unmount_usb(ctx: StepContext) -> bool:
         return step(0, "USB unmount", True)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["usb_unmounted"], produces=["rebooted"], label="Reboot device")
-def step_reboot(ctx: StepContext) -> bool:
-    try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
-        console_logger.info("Rebooting device into Armbian...")
-    except Exception as e:
-        verbose(f"⚠ Reboot warning: {e}", "warning")
-    return step(0, "Reboot sent", True)
+# Official procedure from here on — same as armbian_lan.py, shared via
+# the imported helper functions (no network dependency of its own is
+# registered here; the firmware-refresh step resolves the device
+# network inline, fresh, only once it actually needs it).
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["usb_unmounted"], produces=["emmc_boot_verified"], label="Flip DIP to eMMC and verify boot")
+def step_flip_to_emmc_and_verify(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * 60)
+    return _flip_to_emmc_and_verify(ctx)
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_boot_verified"], produces=["rebooted"], label="Refresh eMMC firmware (NOR round-trip)")
+def step_refresh_firmware(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * 60)
+    return _refresh_firmware_and_finish(ctx)

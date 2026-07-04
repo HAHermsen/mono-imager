@@ -20,11 +20,31 @@ The resolved sequences for all current journeys:
 ```
 OPNsense + lan   →  8 steps
 OPNsense + usb   →  9 steps
-OpenWRT  + lan   →  8 steps
-OpenWRT  + usb   →  9 steps
+OpenWRT  + lan   →  6 steps
+OpenWRT  + usb   →  7 steps
 Armbian  + lan   →  6 steps
-Armbian  + usb   →  5 steps
+Armbian  + usb   →  6 steps
 ```
+
+OpenWRT and Armbian both follow the official documented procedure
+(we-are-mono/docs) as of the last update: eMMC's own firmware/
+bootloader region gets genuinely refreshed via `firmware update`
+after flashing, and DIP ends up flipped to eMMC — rather than the
+earlier NOR-stays-boot-source shortcut. OPNsense is unchanged (not
+yet revisited).
+
+Neither OS ends on an automated eMMC-boot verification anymore.
+Real-hardware testing showed that check (`verify_boot_source()`'s
+U-Boot marker-line poll) could time out even after a fully clean
+flash, and its failure wasn't being recorded in the step report
+either — a genuine failure could still show up as a full success.
+OpenWRT now simply ends after the firmware update, relying on
+tui.py's own always-shown end-of-flash instruction to flip the DIP
+switch. Armbian still needs one pause before its NOR-round-trip
+firmware refresh (that step can't start until eMMC is actually up),
+but it's now a manual "press Enter once it's booted" confirmation,
+not an automated poll — and the round-trip's own final DIP flip back
+to eMMC is a static instruction with no check at all, same as OpenWRT.
 
 You never write that sequence by hand. It falls out of the `requires`/`produces` declarations.
 

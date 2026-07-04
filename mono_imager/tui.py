@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: v1.1.0
+Version: v1.2.0
 License: GPLv3
 """
 

@@ -27,13 +27,12 @@ def main():
     args = parser.parse_args()
 
     if args.debug:
-        # Must be set before the first `import mono_imager` anywhere in
-        # this process. serial_device.py and flash_orchestrator.py each
-        # read MONO_DEBUG once, at their own import time, into a
-        # module-level _DEBUG constant — and mono_imager/__init__.py
-        # imports serial_device eagerly. Setting the env var here, before
-        # mono_imager.tui is imported below, is what makes both pick up
-        # the flag instead of a stale (unset) env snapshot.
+        # logging_setup.debug_enabled() reads MONO_DEBUG live on every
+        # call, not once at import time — so strictly this could also be
+        # set after importing mono_imager. It's set here anyway, before
+        # anything else runs, so the very first log lines (module imports,
+        # startup) are already covered rather than only calls made after
+        # some later point in main().
         os.environ["MONO_DEBUG"] = "1"
 
     from mono_imager.tui import MonoImager

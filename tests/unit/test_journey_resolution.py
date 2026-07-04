@@ -76,8 +76,6 @@ EXPECTED = {
         "Partition eMMC (fdisk)",
         "Flash OpenWRT image (dd)",
         "Firmware update (eMMC bootloader)",
-        "Prepare eMMC boot config",
-        "Reboot device",
     ],
     ("OpenWRT", "usb"): [
         "Device network ready",
@@ -86,24 +84,23 @@ EXPECTED = {
         "Detect firmware file on USB",
         "Flash OpenWRT image (dd)",
         "Firmware update (eMMC bootloader)",
-        "Prepare eMMC boot config",
         "Unmount USB stick",
-        "Reboot device",
     ],
     ("Armbian", "lan"): [
         "Device network ready",
         "Start HTTP server",
         "Verify firmware reachable",
         "Flash Armbian image (dd bs=1M)",
-        "Reboot to U-Boot",
-        "Configure U-Boot to boot Armbian",
+        "Flip DIP to eMMC and verify boot",
+        "Refresh eMMC firmware (NOR round-trip)",
     ],
     ("Armbian", "usb"): [
         "Mount USB stick",
         "Detect firmware file on USB",
         "Flash Armbian image",
         "Unmount USB stick",
-        "Reboot device",
+        "Flip DIP to eMMC and verify boot",
+        "Refresh eMMC firmware (NOR round-trip)",
     ],
 }
 

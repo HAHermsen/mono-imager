@@ -5,10 +5,15 @@ Steps:
   1. Device network ready
   2. Mount USB stick
   3. Detect firmware file on USB
-  4. Flash OpenWRT image (dd)
-  5. Unmount USB stick
-  6. Firmware update (eMMC bootloader)
-  7. Reboot device
+  4. Partition eMMC (fdisk)
+  5. Flash OpenWRT image (dd)
+  6. Unmount USB stick
+  7. Firmware update (eMMC bootloader)
+
+No automated final DIP-flip/boot-verify step — see openwrt_lan.py's
+module docstring. tui.py's own end-of-flash screen already prints the
+"flip DIP to eMMC, power-cycle" instruction whenever flash_success is
+True, so this journey ends after the firmware update.
 
 Image detection: scans USB for openwrt*.bin.gz / openwrt*.bin / openwrt*.img (case-insensitive).
 Sysupgrade .bin.gz format is handled on-device: extracts the 'root' ext4 member from the
@@ -161,11 +166,3 @@ def step_unmount_usb(ctx: StepContext) -> bool:
         return step(0, "USB unmount", True)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["usb_unmounted", "boot_configured"], produces=["rebooted"], label="Reboot device")
-def step_reboot(ctx: StepContext) -> bool:
-    try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
-        console_logger.info("Rebooting device...")
-    except Exception as e:
-        verbose(f"⚠ Reboot warning: {e}", "warning")
-    return step(0, "Reboot sent", True)

@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.1.0
+Version: v1.2.0
 License: GPLv3
 """
 

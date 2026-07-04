@@ -127,10 +127,15 @@ def show_flash_confirmation(
     print("  |   +-------------+      |  flashed now [OK]  |    |")
     print("  |                        +-------------------+     |")
     print("  |                                                  |")
-    print("  | After flashing, the DIP switch picks which one   |")
-    print("  | the board actually boots:                        |")
-    print("  |   LEFT  = eMMC  (your new OS boots)              |")
-    print("  |   RIGHT = NOR   (boots recovery instead)         |")
+    if os_name == "OPNsense":
+        print("  | After flashing: keep the DIP switch RIGHT        |")
+        print("  | (NOR). OPNsense boots via NOR itself, which      |")
+        print("  | loads the OS from eMMC — no DIP flip needed.     |")
+    else:
+        print("  | After flashing, the DIP switch picks which one   |")
+        print("  | the board actually boots:                        |")
+        print("  |   LEFT  = eMMC  (your new OS boots)              |")
+        print("  |   RIGHT = NOR   (boots recovery instead)         |")
     print("  +--------------------------------------------------+")
     print()
     print("  This tool is well tested, but writing firmware is never")
@@ -174,8 +179,15 @@ def show_device_stats(identity: dict, self_test: list) -> None:
         print("  " + "─" * 56)
         print("  SELF-TEST")
         print("  " + "─" * 56)
-        for label, value in self_test:
+        failures = 0
+        for label, value, passed in self_test:
             detail = f"  {value}" if value else ""
-            print(f"    ✓  {label}{detail}")
+            mark = "✓" if passed else "✗"
+            print(f"    {mark}  {label}{detail}")
+            if not passed:
+                failures += 1
+        if failures:
+            print()
+            print(f"  ⚠️  {failures} self-test item(s) reported [FAIL] — see above.")
 
     print()

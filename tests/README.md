@@ -18,27 +18,31 @@ No hardware required. All device interactions are mocked.
 
 ```
 python tests/unit/test_recovery_orchestrator.py
-python tests/unit/test_recovery_fallback.py
 python tests/unit/test_journey_resolution.py
 python tests/unit/test_device_network.py
 python tests/unit/test_usb_mount.py
 python tests/unit/test_uboot_env.py
+python tests/unit/test_uboot_parse.py
 python tests/unit/test_flash_orchestrator.py
 python tests/unit/test_step_registry.py
 python tests/unit/test_config.py
 python tests/unit/test_journeys_common.py
+python tests/unit/test_official_journeys_smoke.py
+python tests/unit/test_cli.py
 ```
 
 | File | What it tests |
 |------|--------------|
 | `test_recovery_orchestrator.py` | `recovery_orchestrator.py` pure-logic functions: `detect_modern_firmware_tool`, `get_device_mac`, `run_firmware_update`, `_stream_command`, `check_internet_reachable`, `try_dhcp`, `legacy_flash_emmc/nor`, `verify_boot_source` |
-| `test_recovery_fallback.py` | Recovery fallback logic: 5 scenarios covering modern→legacy eMMC fallback, modern→legacy NOR fallback, and full modern success |
 | `test_uboot_env.py` | `parse_uboot_env`/`capture_uboot_env`/`restore_uboot_env` (issue #8) and `SerialDevice.probe_uboot_prompt()` already-at-prompt detection (issue #12) |
+| `test_uboot_parse.py` | `uboot_parse.py`: `parse_uboot_identity()` SoC/Model/DRAM/clock extraction and CPU-clock same-vs-different-per-core collapsing; `parse_uboot_self_test()` `[ OK ]`/`[FAIL]` capture, multi-word label/value splitting, "Self-test starting" exclusion |
 | `test_flash_orchestrator.py` | `flash_orchestrator.py` phase implementations and helpers: result tracking (`step`/`reset_results`/`print_report`), `parse_active_eth_iface`, the `/report` store (`wait_for_report`/`peek_report`), `start_http_server`, `phase1_uboot`/`phase1_recovery`/`phase1_bootstrap` gating, `phase3_flash` step09-12 gating and buffered-vs-streaming script selection at `FLASH_SIZE_CAP`, `phase4_postflash` |
 | `test_step_registry.py` | `FlowRunner.run()` execution engine: success path + ordering, missing-requires abort, exception-in-step handling, produces-marking (default vs. explicit), stop-on-first-failure; `register_uboot_steps`/`run_uboot_steps`; `register_staging_boot`/`get_staging_boot_methods` |
 | `test_config.py` | `config.py`: `load_config`/`save_config` roundtrip, corrupt-JSON recovery, OSError-on-write handling, `save_last_port`/`get_last_port`, `is_known_uart` |
 | `test_journeys_common.py` | `journeys/_common.py`'s `_step_network_ready()`: fails when `device_net` unresolved/empty, forwards `device_ip` from `device_net` without clobbering an already-set value |
 | `test_journey_resolution.py` | Step registry: all 6 journeys resolve to the correct step sequence, OS/transfer isolation, dependency ordering, no circular dependencies |
+| `test_official_journeys_smoke.py` | Mocked full `FlowRunner.run()` execution of the official OpenWRT/Armbian lan+usb journeys end to end, including that the Armbian DIP-flip confirmation steps are actually recorded in `flash_orchestrator.results` |
+| `test_cli.py` | `cli.py` entry point and the TUI state machine |
 | `test_device_network.py` | `MonoImager._setup_recovery_network()` (issue #9): DHCP-first, manual fallback (IP/mask/gateway/DNS), session-cache reuse across calls, stale-cache re-resolution, manual-entry retry loop |
 | `test_usb_mount.py` | `MonoImager.menu_test_usb_mount()`: partitioned-device mount, bare-device fallback, mount failure, three-way OS image scan (pass/fail), unmount-always, serial port persistence |
 

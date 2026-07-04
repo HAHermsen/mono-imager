@@ -1,16 +1,36 @@
 """
 mono-imager journey: OpenWRT via LAN
 
+Follows the official documented procedure
+(docs.mono.si / we-are-mono/docs "Installing OpenWRT") instead of the
+previous NOR-stays-boot-source shortcut: eMMC's own firmware/bootloader
+region gets genuinely refreshed and DIP ends up parked on eMMC, verified,
+rather than relying on NOR forever.
+
 Steps:
   1. Device network ready
   2. Start HTTP server
   3. Verify firmware reachable
-  4. Flash OpenWRT image (dd bs=4096)
-  5. Reboot device
+  4. Partition eMMC (fdisk)
+  5. Flash OpenWRT image (dd bs=4096)
+  6. Firmware update (eMMC bootloader) — refreshes eMMC's own firmware
+     region (QSPI/boot area) while still NOR-booted, per doc step 7.
+
+No automated final DIP-flip/boot-verify step: real-hardware testing
+showed it could time out even after a fully clean flash, and — worse
+— that failure wasn't being recorded in the step report at all, so the
+run still looked like a full success. tui.py's own end-of-flash screen
+already tells the user to flip the DIP switch to eMMC and power-cycle
+once flash_success is True, so this journey now simply ends after the
+firmware update and lets that existing, always-shown instruction do
+the job — a static instruction beats an automated check that can
+produce a false failure.
 
 U-Boot pre-step:
   Ensures the 'recovery' U-Boot env variable is defined before
-  boot_recovery() calls 'run recovery'.
+  boot_recovery() calls 'run recovery', and sets the official 'emmc' +
+  'bootcmd' pair (ext4load /boot/kernel.itb && bootm, falling back to
+  'run recovery' if that ever fails) — no extlinux.conf file needed.
 
   On factory-fresh devices, 'recovery' is already in NOR env — nothing to do.
 
@@ -20,7 +40,8 @@ U-Boot pre-step:
   safe in NOR flash — only the pointer variable in NOR env can go missing.
 
   OpenWRT is written to /dev/mmcblk0p1 (partition only).  NOR flash is
-  never touched by the flash step.
+  never touched by the flash step itself — only by the firmware-update
+  step, which is the official procedure's whole point.
 
 Author:  H.A. Hermsen
 License: GPLv3
@@ -46,6 +67,18 @@ logger = logging.getLogger(__name__)
 OS       = "OpenWRT"
 FIRMWARE_PROMPT = "Type the full path (or drag-n-drop) of the OpenWRT .img or .bin.gz file:"
 TRANSFER = "lan"
+
+# Official U-Boot boot mechanism, per docs.mono.si "Installing OpenWRT" step 5:
+# a self-contained 'emmc' command (ext4load kernel.itb + bootm) with bootcmd
+# falling back to 'run recovery' if the eMMC boot ever fails. Replaces the
+# previous sysboot+extlinux.conf approach — no extra boot-config file needed
+# on the eMMC partition, and NOR stays self-healing if eMMC boot ever fails.
+_UBOOT_SET_EMMC_CMD = (
+    "setenv emmc 'setenv bootargs \"${bootargs_console} boot_medium=emmc "
+    "root=/dev/mmcblk0p1 rw rootwait rootfstype=ext4 ${bootargs_hwtest}\"; "
+    "ext4load mmc 0:1 ${kernel_addr_r} /boot/kernel.itb && bootm ${kernel_addr_r}'"
+)
+_UBOOT_SET_BOOTCMD_CMD = 'setenv bootcmd "run emmc || run recovery"'
 
 
 
@@ -134,10 +167,8 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 recovery_confirmed = True
 
             if recovery_confirmed:
-                device.send_command(
-                    'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
-                    timeout=10
-                )
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
                 # Re-persist decompression vars — something (firmware update?) can wipe them
                 # between runs, causing the next run to fall through to the slow NOR scan.
                 device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
@@ -170,12 +201,10 @@ def _uboot_steps_openwrt_lan(device) -> bool:
             if "recovery=" in check:
                 verbose(f"  ✓ Restored 'recovery' from NOR backup at {offset}")
                 verbose(f"  {check.strip()}")
-                # Override bootcmd to extlinux so OpenWRT boots after the flash.
+                # Override bootcmd so OpenWRT boots after the flash.
                 # The restored factory bootcmd (e.g. 'run opnsense') won't work.
-                device.send_command(
-                    'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
-                    timeout=10
-                )
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
                 device.send_command("saveenv", timeout=15)
                 device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
                 return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
@@ -286,10 +315,8 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                     continue  # no interesting magic at this offset
 
                 device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=10)
-                device.send_command(
-                    'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
-                    timeout=10
-                )
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
                 device.send_command("saveenv", timeout=15)
                 device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
                 return step(
@@ -571,78 +598,13 @@ def step_firmware_update(ctx: StepContext) -> bool:
         return step(0, "Firmware update", False, str(e))
 
 
-@register_step(
-    os=[OS], transfer=["lan", "usb"],
-    requires=["firmware_updated"], produces=["boot_configured"],
-    label="Prepare eMMC boot config"
-)
-def step_prepare_emmc_boot(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Prepare eMMC boot config"); verbose("=" * 60)
-    d = ctx.device
-
-    # The Armbian U-Boot on eMMC uses sysboot to load /boot/extlinux/extlinux.conf
-    # from partition 1.  OpenWRT does not ship this file, so we create it after
-    # flashing.  The FIT image (kernel.itb) is booted via the kernel directive;
-    # sysboot detects the FIT format and calls bootm internally.
-    extlinux_content = (
-        "timeout 1\\n"
-        "default openwrt\\n"
-        "\\n"
-        "label openwrt\\n"
-        "  kernel /boot/kernel.itb\\n"
-        "  append root=/dev/mmcblk0p1 rw rootwait earlycon\\n"
-    )
-    MNT = "/mnt/mono_owrt"
-    try:
-        d.send_command(f"mkdir -p {MNT}", timeout=5)
-        mount_resp, _mnt_err = with_spinner(
-            d.send_command,
-            f"mount -t ext4 /dev/mmcblk0p1 {MNT} 2>&1; echo RC=$?",
-            timeout=15,
-            message="Mounting eMMC partition..."
-        )
-        if _mnt_err:
-            raise _mnt_err
-        if "RC=0" not in mount_resp:
-            verbose("  ⚠ Could not mount /dev/mmcblk0p1 — extlinux.conf not written", "warning")
-            verbose("  If DIP=LEFT boot fails, at the U-Boot prompt run:", "warning")
-            verbose('    setenv bootcmd "ext4load mmc 0:1 0x82000000 /boot/kernel.itb; bootm 0x82000000#config-1"', "warning")
-            verbose('    setenv bootargs "root=/dev/mmcblk0p1 rw rootwait earlycon"', "warning")
-            verbose("    saveenv", "warning")
-            return step(0, "eMMC boot config (mount failed — see warning)", False)
-
-        check = d.send_command(
-            f"test -f {MNT}/boot/extlinux/extlinux.conf && echo EXISTS || echo MISSING",
-            timeout=5
-        )
-        if "EXISTS" in check:
-            d.send_command(f"umount {MNT}", timeout=10)
-            return step(0, "eMMC extlinux.conf already present", True)
-
-        d.send_command(f"mkdir -p {MNT}/boot/extlinux", timeout=5)
-        d.send_command(
-            f"printf '{extlinux_content}' > {MNT}/boot/extlinux/extlinux.conf",
-            timeout=10
-        )
-        d.send_command("sync", timeout=10)
-        d.send_command(f"umount {MNT}", timeout=15)
-        d.send_command(f"rmdir {MNT} 2>/dev/null", timeout=5)
-        return step(0, "eMMC extlinux.conf created", True)
-    except Exception as e:
-        try:
-            d.send_command(f"umount {MNT} 2>/dev/null", timeout=10)
-        except Exception as _umount_err:
-            verbose(f"  ⚠ umount {MNT} failed: {_umount_err}", "debug")
-        verbose(f"  ⚠ eMMC boot config step: {e}", "warning")
-        return step(0, "eMMC boot config (warning — may need manual fix)", False)
-
-
-@register_step(os=[OS], transfer=[TRANSFER], requires=["boot_configured"], produces=["rebooted"], label="Reboot device")
-def step_reboot(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Reboot device"); verbose("=" * 60)
-    try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
-        console_logger.info("Rebooting device...")
-    except Exception as e:
-        verbose(f"⚠ Reboot warning: {e}", "warning")
-    return step(0, "Reboot sent", True)
+# No "prepare eMMC boot config" step anymore — the official procedure's
+# 'emmc' bootcmd (see _UBOOT_SET_EMMC_CMD above) ext4loads /boot/kernel.itb
+# directly, no /boot/extlinux/extlinux.conf file required on the eMMC
+# partition. That file-writing step (mount + printf + umount) is gone.
+#
+# No automated "flip DIP + verify boot" step either anymore — see the
+# module docstring. tui.py's own end-of-flash screen (menu_done())
+# already prints the "flip DIP to eMMC, power-cycle" instruction
+# unconditionally whenever flash_success is True, so this journey's
+# last step is simply the firmware update above.

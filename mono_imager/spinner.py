@@ -21,7 +21,7 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: v1.1.0
+Version: v1.2.0
 License: GPLv3
 """
 
@@ -178,11 +178,13 @@ def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tup
         **kwargs: Keyword arguments to pass to fn.
 
     Returns:
-        (result, error) — exactly one will be None. If fn raised an
+        (result, error). error is None on success. If fn raised an
         exception, it is captured in error rather than re-raised
-        immediately, so the spinner can clean up its terminal line
-        first; callers should check error and handle/re-raise as
-        appropriate for their context.
+        immediately (so the spinner can clean up its terminal line
+        first), and result is then None. Note fn's own successful
+        return value can legitimately be None too — callers should
+        check error's truthiness to distinguish "failed" from
+        "succeeded with a None result," not result's.
 
     Example:
         result, error = with_spinner(

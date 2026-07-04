@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v1.1.0
+Version: v1.2.0
 License: GPLv3
 """
 

@@ -1,21 +1,41 @@
 """
 mono-imager journey: Armbian via LAN
 
-DIP switch: RIGHT (NOR) throughout — NOR U-Boot loads Armbian from eMMC via extlinux.
+Follows the official documented procedure (we-are-mono/docs
+"Installing Armbian") instead of the previous NOR-stays-boot-source
+shortcut: no U-Boot env editing at all. DIP actually ends up flipped
+to and verified on eMMC, with eMMC's own firmware region genuinely
+refreshed (the whole-disk dd wipes it, same as it does for OpenWRT).
 
 Steps:
   1. Device network ready
   2. Start HTTP server
   3. Verify firmware reachable
   4. Flash Armbian image (dd bs=1M, or xz -dc | dd for .img.xz)
-  5. Reboot to U-Boot
-  6. Configure U-Boot to boot Armbian (setenv bootcmd + saveenv)
+  5. Flip DIP to eMMC and verify boot — manual confirm (press Enter
+     once it's booted), not an automated check: real-hardware testing
+     showed the automated boot-source poll could time out even after
+     a clean flash, and its failure wasn't recorded in the step
+     report either. A pause is still needed here regardless, since
+     the NOR round-trip below can't start until eMMC is actually up.
+     The pause relays live serial output while waiting (see
+     _pause_with_live_serial) instead of leaving the console blank —
+     a plain input() gave no way to actually see the device boot,
+     since mono-imager holds the port exclusively (no second terminal
+     can attach to watch it either).
+  6. Refresh eMMC firmware (NOR round-trip) — flip back to NOR, power
+     cycle, re-resolve network, run `firmware update` to restore
+     eMMC's own firmware region, then flip to eMMC one last time
+     (static instruction only — nothing further depends on it).
 
 Author:  H.A. Hermsen
 License: GPLv3
 """
 
 import logging
+import sys
+import time
+import threading
 from mono_imager.step_registry import register_step, StepContext
 from mono_imager.spinner import with_spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, start_http_server, wait_for_report
@@ -107,47 +127,167 @@ def step_flash_armbian(ctx: StepContext) -> bool:
     return has_records and not has_error
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["reboot_triggered"], label="Reboot to U-Boot")
-def step_reboot_to_uboot(ctx: StepContext) -> bool:
-    try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=1)
-        console_logger.info("  Rebooting — waiting for U-Boot autoboot...")
-    except Exception as e:
-        verbose(f"⚠ Reboot warning: {e}", "warning")
-    return step(0, "Reboot triggered", True)
+# ---------------------------------------------------------------------
+# Official procedure (we-are-mono/docs "Installing Armbian") from here
+# on, instead of the previous NOR-stays-boot-source shortcut: no U-Boot
+# env editing at all — flip DIP to eMMC and let eMMC's own factory
+# firmware boot Armbian directly, then refresh that firmware region
+# (the whole-disk dd wipes it, same as it wipes OpenWRT's), then leave
+# DIP parked on eMMC, verified.
+# ---------------------------------------------------------------------
 
-
-@register_step(os=[OS], transfer=[TRANSFER], requires=["reboot_triggered"], produces=["rebooted"], label="Configure U-Boot to boot Armbian")
-def step_configure_uboot(ctx: StepContext) -> bool:
+def _pause_with_live_serial(ctx: StepContext, prompt: str) -> None:
     """
-    Interrupt U-Boot after the Armbian flash and set the bootcmd to load
-    Armbian via extlinux from eMMC partition 1.
+    input(), but with the raw serial stream relayed to the console while
+    waiting, instead of going silent. Real-hardware use showed the plain
+    input() pause gave zero feedback during a manual DIP-flip/power-cycle
+    — the console just sat blank, and a second terminal can't be opened
+    on the same port since SerialDevice.connect() holds it exclusively
+    for the whole session. This relays what's actually on the wire so
+    "once it's booted" is something you can actually see, not guess at.
 
-    Must happen AFTER the flash because dd overwrites the eMMC env area,
-    resetting bootcmd to the factory default. Official procedure:
-      setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"
-      saveenv
-    Source: https://opnsense.mono.si/experimental/
+    Polls in_waiting rather than blocking on read() with the full 10s
+    port timeout, so the relay thread notices the stop signal quickly
+    once Enter is pressed. Any read/decode error (e.g. the port
+    dropping mid power-cycle) is swallowed and retried — this is purely
+    a visual aid and must never be able to abort the journey itself.
     """
     d = ctx.device
-    interrupted, _ab_err = with_spinner(d.wait_for_autoboot, timeout=90, message="Waiting for U-Boot autoboot (up to 90s)...")
-    if _ab_err or not interrupted:
-        return step(0, "U-Boot interrupt", False, "autoboot message not seen within 90s")
-    try:
-        # Restore whatever env vars the whole-disk flash reset to
-        # factory defaults, BEFORE setting our own bootcmd below — see
-        # flash_orchestrator.restore_uboot_env(): it's safe to restore
-        # first and override after, since U-Boot env is last-write-wins.
-        from mono_imager.flash_orchestrator import restore_uboot_env
-        restore_uboot_env(d, getattr(d, "captured_uboot_env", None))
+    stop = threading.Event()
 
-        d.send_command(
-            'setenv bootcmd "sysboot mmc 0:1 any 0x80000000 /boot/extlinux/extlinux.conf"',
-            timeout=10
-        )
-        d.send_command("saveenv", timeout=15)
-        step(0, "U-Boot bootcmd set (sysboot mmc 0:1 extlinux)", True)
-        d.send_command("boot", wait_for_prompt=False, timeout=5)
-        return step(0, "Armbian booting from eMMC", True)
-    except Exception as e:
-        return step(0, "U-Boot bootcmd configure", False, str(e))
+    def relay():
+        while not stop.is_set():
+            try:
+                waiting = d.ser.in_waiting
+                if waiting:
+                    chunk = d.ser.read(waiting)
+                    if chunk:
+                        sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+                        sys.stdout.flush()
+                else:
+                    time.sleep(0.05)
+            except Exception:
+                time.sleep(0.05)
+
+    t = threading.Thread(target=relay, daemon=True)
+    t.start()
+    try:
+        input(prompt)
+    finally:
+        stop.set()
+        t.join(timeout=1)
+
+
+def _flip_to_emmc_and_verify(ctx: StepContext) -> bool:
+    """
+    Official procedure steps 4-5: flip the DIP switch to eMMC and let
+    the user confirm by eye that it booted — no automated
+    verify_boot_source() poll anymore. That automated check proved
+    unreliable on real hardware (a confirmed-good flash still timed
+    out waiting for the boot-source marker line), and — worse — its
+    failure wasn't even being recorded in the step report, so a
+    genuinely failed check could still show up as a full success. A
+    manual "did it come up?" confirmation can't produce that kind of
+    false result.
+
+    A pause is still needed here regardless of automation: the NOR
+    round-trip that follows can't proceed until eMMC is actually up.
+    Unlike the old automated check (which sent the reboot itself),
+    the user must flip the DIP switch AND power-cycle the device
+    themselves before pressing Enter. The pause relays live serial
+    output while waiting (see _pause_with_live_serial) so there's
+    actually something to look at instead of a blank console.
+    """
+    console_logger.info("")
+    console_logger.info("=" * 60)
+    console_logger.info("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
+    console_logger.info("=" * 60)
+    _pause_with_live_serial(ctx, "  Once Armbian has booted, press Enter to continue...")
+    return step(0, "DIP flipped to eMMC — boot confirmed by user", True)
+
+
+def _refresh_firmware_and_finish(ctx: StepContext) -> bool:
+    """
+    Official procedure step 6 ("Write fresh firmware again"): the
+    whole-disk Armbian flash also overwrote eMMC's own firmware/
+    bootloader region (0-32MiB), so it needs to be restored via
+    `firmware update`. Unlike the DIP flip above, getting back to
+    NOR-booted recovery Linux needs an actual power cycle here — the
+    device is now running Armbian itself (booted from eMMC), and
+    mono-imager has no known login to send it a soft reboot with.
+
+    Once back in recovery, the device network needs a fresh DHCP
+    resolution (a brand new Linux boot, no state carried over from
+    before) — done inline here with a throwaway RecoveryNetwork
+    instance rather than the session-cached one on MonoImager, since
+    journeys stay decoupled from tui.py (see JOURNEYS.md).
+    """
+    d = ctx.device
+    console_logger.info("")
+    console_logger.info("=" * 60)
+    console_logger.info("  ⚡ FLIP THE DIP SWITCH TO NOR, THEN POWER-CYCLE ⚡")
+    console_logger.info("=" * 60)
+    input("  Press Enter once you've done that...")
+
+    interrupted, _err = with_spinner(
+        d.wait_for_autoboot, timeout=60,
+        message="Waiting for U-Boot autoboot interrupt..."
+    )
+    if _err or not interrupted:
+        return step(0, "U-Boot autoboot interrupted (NOR)", False,
+                    str(_err) if _err else "autoboot message not seen within 60s")
+
+    booted, _err = with_spinner(
+        d.boot_recovery, boot_medium="qspi",
+        message="Booting recovery Linux..."
+    )
+    if _err or not booted:
+        return step(0, "Recovery Linux booted (NOR)", False, str(_err) if _err else "")
+
+    logged_in, _err = with_spinner(
+        d.login_recovery, timeout=30,
+        message="Logging into recovery shell..."
+    )
+    if _err or not logged_in:
+        return step(0, "Logged into recovery shell (NOR)", False, str(_err) if _err else "")
+    step(0, "Back in NOR recovery shell", True)
+
+    from mono_imager.device_net import RecoveryNetwork
+    net = RecoveryNetwork()
+    net_ok, _err = with_spinner(net.resolve, d, message="Resolving device network...")
+    if _err or not net_ok:
+        return step(0, "Device network ready (post-reboot)", False, str(_err) if _err else "")
+
+    from mono_imager.recovery_orchestrator import run_firmware_update
+    fw_ok, _err = with_spinner(
+        run_firmware_update, d,
+        message="Refreshing eMMC firmware region..."
+    )
+    if _err:
+        fw_ok = False
+    if not step(0, "eMMC firmware region refreshed", fw_ok):
+        return False
+
+    # Final DIP flip back to eMMC: no automated boot-source check here
+    # either — see _flip_to_emmc_and_verify() above for why. This is
+    # the true last step of the journey, so unlike that one there's
+    # nothing further to gate on; hand off the instruction (tui.py's
+    # own end-of-flash screen repeats a version of it too) and finish.
+    console_logger.info("")
+    console_logger.info("=" * 60)
+    console_logger.info("  ⚡ FLIP THE DIP SWITCH BACK TO eMMC, THEN POWER-CYCLE ⚡")
+    console_logger.info("  It will boot Armbian from eMMC with the refreshed firmware.")
+    console_logger.info("=" * 60)
+    return step(0, "Firmware refresh complete — flip DIP to eMMC and power-cycle", True)
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["emmc_boot_verified"], label="Flip DIP to eMMC and verify boot")
+def step_flip_to_emmc_and_verify(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * 60)
+    return _flip_to_emmc_and_verify(ctx)
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_boot_verified"], produces=["rebooted"], label="Refresh eMMC firmware (NOR round-trip)")
+def step_refresh_firmware(ctx: StepContext) -> bool:
+    verbose("=" * 60); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * 60)
+    return _refresh_firmware_and_finish(ctx)
