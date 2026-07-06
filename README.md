@@ -2,7 +2,7 @@
 
 Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — no manual `dd`/`tftp` fiddling required.
 
-Version: **1.2.0** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
+Version: **1.2.3** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
 ---
 
@@ -48,6 +48,7 @@ mono-imager [--debug | --verbose]
 | Argument | Description |
 |---|---|
 | `--debug`, `--verbose` | Print verbose console output — every serial command sent and received. Quiet by default; the log file always captures full detail regardless of this flag. Equivalent to setting the environment variable `MONO_DEBUG=1` before launch. |
+| `--version`| Prints version, author and license |
 
 There are no other CLI arguments — everything else (which OS, which port, which firmware file, network settings) is driven interactively through the menu once the tool starts.
 
