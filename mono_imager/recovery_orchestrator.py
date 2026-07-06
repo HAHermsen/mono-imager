@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.2.0
+Version: v1.2.3
 License: GPLv3
 """
 
@@ -281,7 +281,8 @@ def try_dhcp(d: SerialDevice, iface: str = "eth0", timeout: int = 12) -> Optiona
 
 def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
                      max_total: float = 900.0, auto_confirm_response: str = None,
-                     on_output: Optional[Callable[[str], None]] = None) -> str:
+                     on_output: Optional[Callable[[str], None]] = None,
+                     done_markers: Optional[list] = None) -> str:
     """
     Send a command and stream its raw output live from the serial
     port, rather than buffering it via run_script() (which blocks
@@ -315,6 +316,8 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
     last_byte_time = time.time()
     overall_start = time.time()
     poll_interval = 0.01  # 10ms polling loop
+    marker_seen_at = None  # set once a done_marker appears in the output
+    marker_grace = 0.3     # after a done marker the result is known - stop almost immediately
 
     while True:
         now = time.time()
@@ -322,7 +325,14 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
             logger.warning(f"_stream_command: hit hard ceiling of {max_total}s")
             break
         if now - last_byte_time > idle_timeout:
-            logger.debug(f"_stream_command: {idle_timeout}s with no new output — assuming done")
+            logger.debug(f"_stream_command: {idle_timeout}s with no new output - assuming done")
+            break
+        # A completion marker (e.g. "Firmware update complete") means the
+        # command is done - stop after a short grace to catch the trailing
+        # shell prompt, instead of waiting out the full idle_timeout (which
+        # looked like a ~30s hang after the flash finished).
+        if marker_seen_at is not None and now - marker_seen_at > marker_grace:
+            logger.debug("_stream_command: done marker seen - finishing early")
             break
 
         # Non-blocking: check if data is available without waiting
@@ -334,6 +344,10 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
                     on_output(text)
                 buffer += chunk
                 last_byte_time = now
+                if marker_seen_at is None and done_markers:
+                    tail = buffer.decode("utf-8", errors="replace")
+                    if any(m in tail for m in done_markers):
+                        marker_seen_at = now
         else:
             # No data available; sleep briefly before polling again
             time.sleep(poll_interval)
@@ -436,30 +450,47 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     # were already built into _stream_command() for exactly this,
     # just never passed in at this call site. Wiring them up here.
     #
-    # --preserve-env is always passed (not user-configurable): without
-    # it, the device's own env restore is skipped and U-Boot vars this
-    # tool doesn't separately back up can be lost. Always preserving is
-    # strictly safer than the previous default of not preserving.
+    # --preserve-env: passed for NOR flashes, but NOT for eMMC flashes.
+    # Preserving on an eMMC flash restores the device's OLD eMMC U-Boot
+    # env (e.g. a prior Armbian env with no "recovery" command) over the
+    # freshly flashed firmware's env - that wiped the "recovery" U-Boot
+    # command option 3 (NOR update) needs to boot recovery from eMMC,
+    # causing "run recovery -> not defined". Dropping it on the eMMC
+    # flash lets the new firmware's env (with "recovery") survive.
+    # Tradeoff: MAC/serial etc. now come from the new eMMC image instead
+    # of being carried over.
+    fw_cmd = "firmware update" if target == "emmc" else "firmware update --preserve-env"
     output = _stream_command(
-        d, "firmware update --preserve-env",
+        d, fw_cmd,
         idle_timeout=idle_timeout, max_total=max_total,
         auto_confirm_response="yes",
         on_output=on_output,
+        done_markers=["Firmware update complete", "Aborted", "ERROR:"],
     )
 
-    try:
-        rc_output = d.run_script("echo RC=$?", marker="firmware_update_rc", exec_timeout=10)
-    except RuntimeError as e:
-        logger.warning(f"run_firmware_update: could not verify exit code: {e}")
-        rc_output = ""
-
-    # RC=0 alone isn't a reliable success signal:
-    #   • "Aborted." — self-abort on confirmation prompt, exits 0.
-    #   • "ERROR:"   — e.g. "Cannot detect boot medium" when old U-Boot
-    #                  omits boot_medium= from the kernel cmdline; also exits 0.
-    # Both are treated as hard failures regardless of exit code.
     aborted      = "Aborted" in output
     error_output = "ERROR:" in output
+    completed    = "Firmware update complete" in output
+
+    # FAST PATH: the tool's own "Firmware update complete" line is a
+    # definitive success signal. Trust it and SKIP the slow `echo RC=$?`
+    # round-trip - that goes through run_script (write temp file, verify
+    # byte count, exec, delete), each serial hop carrying a ~5s wait, which
+    # added ~20s of dead time after the flash had already finished. Only
+    # fall back to the exit-code check when the completion line is absent
+    # (e.g. an unexpected firmware build that does not print it).
+    if completed:
+        rc_output = "RC=0 (inferred from 'Firmware update complete')"
+    else:
+        try:
+            rc_output = d.run_script("echo RC=$?", marker="firmware_update_rc", exec_timeout=10)
+        except RuntimeError as e:
+            logger.warning(f"run_firmware_update: could not verify exit code: {e}")
+            rc_output = ""
+
+    # RC=0 alone isn't a reliable success signal: "Aborted." (confirm-prompt
+    # self-abort) and "ERROR:" (e.g. "Cannot detect boot medium" on old
+    # U-Boot) both exit 0, so they are hard failures regardless of RC.
     success = ("RC=0" in rc_output) and not aborted and not error_output
     logger.info(f"firmware update — full streamed output:\n{output}")
     if aborted:
@@ -752,7 +783,9 @@ def run_emmc_update(
 
     d = None
     try:
-        soft_reboot(port)
+        # NOTE: no auto soft-reboot here. phase1_uboot()'s own
+        # "POWER CYCLE NOW" prompt drives the reboot, so we don't send a
+        # silent reset that would contradict that on-screen instruction.
         d = core.phase1_bootstrap(port, 115200, boot_medium="qspi")
         if d is None:
             console_logger.info("")
@@ -837,7 +870,9 @@ def run_nor_update(
 
     d = None
     try:
-        soft_reboot(port)
+        # NOTE: no auto soft-reboot here. phase1_uboot()'s own
+        # "POWER CYCLE NOW" prompt drives the reboot, so we don't send a
+        # silent reset that would contradict that on-screen instruction.
         d = core.phase1_bootstrap(port, 115200, boot_medium="emmc")
         if d is None:
             console_logger.info("")

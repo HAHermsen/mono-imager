@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v1.2.0
+Version: v1.2.3
 License: GPLv3
 """
 
@@ -992,9 +992,33 @@ class SerialDevice:
                             if " login:" in line:
                                 verbose(f"✓ Login prompt: '{line.strip()}' — logging in as root...")
                                 break
-                        self.ser.write(b"root\r\n")
-                        time.sleep(0.5)
-                        self.ser.write(b"\r\n")  # blank password — recovery Linux root has none
+                        # Send the username with a bare CR (not CR+LF). A
+                        # trailing LF gets eaten by the "Password:" prompt as a
+                        # premature empty entry, desyncing the exchange so the
+                        # real blank password lands out of order -> "Login
+                        # incorrect" even though root has no password. Confirmed
+                        # on hardware (gateway-dk eMMC OS login).
+                        self.ser.write(b"root\r")
+
+                        # Wait for the actual "Password:" prompt before
+                        # answering, instead of a blind sleep, so the blank
+                        # password isn't sent before login is ready to read it.
+                        # Passwordless builds drop straight to a shell (no
+                        # prompt) — handle that too.
+                        pw_buf = b""
+                        pw_start = time.time()
+                        while time.time() - pw_start < 5.0:
+                            chunk = self.ser.read(128)
+                            if chunk:
+                                pw_buf += chunk
+                                if b"assword" in pw_buf:
+                                    break
+                                if b"root@" in pw_buf and b"#" in pw_buf:
+                                    break
+                        if b"root@" in pw_buf and b"#" in pw_buf:
+                            verbose("✓ Recovery Linux booted and logged in")
+                            return True
+                        self.ser.write(b"\r")  # blank password — bare CR
 
                         # Poll for the shell prompt instead of one fixed-sleep
                         # read_all(). CONFIRMED BUG THIS GUARDS AGAINST: right

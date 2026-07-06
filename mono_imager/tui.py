@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: v1.2.0
+Version: v1.2.3
 License: GPLv3
 """
 
@@ -331,6 +331,20 @@ class MonoImager:
     def _recovery_finish(self, success: bool) -> None:
         """Set flash result, wait for Enter, and return to main menu."""
         self.flash_success = success
+        # Drain buffered stdin (stray newlines from the serial session /
+        # the piped 'yes' the flash uses) so this Enter actually blocks.
+        # Without it a leftover '\n' satisfies input() instantly and the
+        # report is wiped by the next clear_screen() before it can be read.
+        try:
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        except ImportError:
+            try:
+                import termios
+                termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            except Exception:
+                pass
         input("  Press Enter to continue...")
         self.current_state = MenuState.MAIN
 
@@ -1086,6 +1100,19 @@ class MonoImager:
             print()
             input("  Press Enter to exit...")
             sys.exit(0)
+
+        # Detection only lists the port; it does not confirm we can OPEN
+        # it. On Linux the tty usually needs sudo / dialout-group access,
+        # so opening can fail with PermissionError. No usable tty -> no
+        # point going to the main menu; every option needs the device.
+        import serial
+        try:
+            _probe = serial.Serial(port)
+            _probe.close()
+        except (serial.SerialException, OSError):
+            print()
+            print("  tty device could not be opened, did you run this script with sudo?")
+            sys.exit(1)
 
         d = core.phase1_bootstrap(port, 115200)
         if d is None:

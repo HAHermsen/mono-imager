@@ -227,6 +227,43 @@ finally:
 
 
 # ============================================================================
+# --version flag
+# ============================================================================
+
+print()
+print("=" * 60)
+print("CLI entry point - --version")
+print("=" * 60)
+
+import io
+import contextlib
+from mono_imager import __version__, __author__, __license__
+
+# --version must print release version, developer and license, each on its
+# own line, then exit(0) BEFORE the menu (MonoImager) is ever touched.
+with patch("mono_imager.tui.MonoImager") as MockApp, \
+     patch.object(sys, "argv", ["mono-imager", "--version"]):
+    import mono_imager.cli as cli_module
+    importlib.reload(cli_module)
+    _buf = io.StringIO()
+    _exit_code = None
+    with contextlib.redirect_stdout(_buf):
+        try:
+            cli_module.main()
+        except SystemExit as e:
+            _exit_code = e.code
+    _out = _buf.getvalue()
+
+check("--version exits with code 0", _exit_code == 0)
+check("--version never reaches MonoImager", not MockApp.called)
+check("--version prints the release version", __version__ in _out)
+check("--version prints the developer", __author__ in _out)
+check("--version prints the license", __license__ in _out)
+check("--version prints three separate lines (newlines preserved)",
+      len([ln for ln in _out.splitlines() if ln.strip()]) == 3)
+
+
+# ============================================================================
 # safe_input() escape hatch
 # ============================================================================
 

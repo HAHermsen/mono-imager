@@ -127,7 +127,19 @@ check("success detected", rec.run_firmware_update(d, idle_timeout=0.3, max_total
 # but the device never sees it trigger (harmless). We only check it was NOT triggered
 # as a confirmation, not that no bytes were written.
 sent = b"".join(d.ser.written)
-check("firmware update command was sent to device", b"firmware update --preserve-env\r\n" in sent)
+# eMMC flash (target auto-detected as emmc here: boot_output has no "mmcblk0")
+# must DROP --preserve-env, so the freshly-flashed firmware's U-Boot env
+# (with the "recovery" command option 3 needs) is not overwritten by the
+# device's old preserved env.
+check("eMMC flash drops --preserve-env", b"firmware update\r\n" in sent and b"--preserve-env" not in sent)
+
+# NOR flash (boot_output contains mmcblk0 -> target qspi) KEEPS --preserve-env.
+d2 = MagicMock()
+d2.ser = FakeSerial(b"Downloading...\nDone.\n")
+d2.run_script.return_value = "root=/dev/mmcblk0p1"
+rec.run_firmware_update(d2, idle_timeout=0.3, max_total=5.0)
+sent2 = b"".join(d2.ser.written)
+check("NOR flash keeps --preserve-env", b"firmware update --preserve-env\r\n" in sent2)
 
 d = MagicMock()
 d.ser = FakeSerial(b"curl: connection refused\n")
