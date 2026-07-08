@@ -13,6 +13,7 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
+import sys
 import logging
 from typing import Optional
 
@@ -114,81 +115,82 @@ class RecoveryNetwork:
                 if not ifaces:
                     print("  ❌ Still no Ethernet port with a cable detected.")
                     return False
-            if len(ifaces) > 1:
-                # Multiple live cables = unsupported complex topology (#19).
-                # Have the user pick the WAN port; the rest are set down.
-                iface = self._select_iface(d, ifaces)
-                if iface is None:
-                    return False
-            else:
-                iface = ifaces[0]
-            print(f"  ✓ {iface} is ready.")
+            print(f"  Port(s) reporting a link: {', '.join(ifaces)}")
         except Exception as e:
             print(f"  ❌ Failed to check Ethernet carrier: {e}")
             return False
 
-        # Already resolved earlier this session. Recovery Linux doesn't
-        # persist config across a reboot, so the known values still have
-        # to be re-applied on this fresh shell — but we don't ask again.
+        # LOWER_UP is unreliable on this board: several internal ports
+        # (SerDes/SFP side) report a link with NO external cable, so a
+        # LOWER_UP count > 1 does NOT mean multiple cables (#19 false
+        # positive). Find the real uplink by which candidate actually
+        # obtains a working DHCP lease; only treat it as a genuine
+        # multi-uplink (and prompt) if more than one truly reaches the net.
+
+        # Cached config: re-apply on whichever candidate still reaches the
+        # net - the working port can differ from the previous boot.
         if self.config:
             net = self.config
-            print(f"  Re-applying known network config: {net['ip']}/{net['prefix']} via {net['gateway']}...")
-            if self._apply(d, iface, net):
-                # The path (cable, switch, gateway, upstream route) already
-                # proved reachable once this session — only pay for the
-                # several-second ping re-check if it's never been proven.
-                reachable = True
-                if not self.verified:
-                    reachable = self._verify(d, net["gateway"])
-                    self.verified = reachable
-                if reachable:
-                    print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                    # Refresh iface in case port enumeration differs this boot.
-                    self.config = {**net, "iface": iface}
+            order = ([net["iface"]] if net.get("iface") in ifaces else []) + \
+                    [c for c in ifaces if c != net.get("iface")]
+            for cand in order:
+                print(f"  Re-applying known config on {cand}: {net['ip']}/{net['prefix']} via {net['gateway']}...")
+                if self._apply(d, cand, net) and self._verify(d, net["gateway"]):
+                    self.verified = True
+                    self.config = {**net, "iface": cand}
+                    print(f"  ✓ Internet reachable via {cand} - network is ready.")
                     return True
-            print("  ⚠ Previously-working network config is no longer reachable — re-resolving...")
+            print("  ⚠ Previously-working config no longer reachable - re-resolving...")
             self.config = None
             self.verified = False
 
-        # First time this session — try DHCP before ever asking the user.
-        lease, _dhcp_err = with_spinner(
-            rec.try_dhcp, d, iface,
-            message="Attempting DHCP..."
-        )
-        if _dhcp_err:
-            lease = None
-
-        if lease:
-            dns_note = f", DNS {lease['dns']}" if lease["dns"] else ""
-            print(f"  DHCP lease: {lease['ip']}/{lease['prefix']} via {lease['gateway']}{dns_note}")
+        # First time (or cache invalidated): DHCP-probe each candidate.
+        working = []  # [(iface, lease)]
+        for cand in ifaces:
+            lease, _dhcp_err = with_spinner(
+                rec.try_dhcp, d, cand,
+                message=f"Attempting DHCP on {cand}..."
+            )
+            if _dhcp_err or not lease:
+                continue
             if self._verify(d, lease["gateway"]):
-                print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                self.config = {**lease, "source": "dhcp"}
-                self.verified = True
-                return True
-            print("  ❌ DHCP lease obtained but the internet is not reachable through it.")
-        else:
-            print("  ❌ No DHCP response.")
+                working.append((cand, lease))
+
+        if len(working) > 1:
+            # Genuinely multiple working uplinks - now the #19 prompt is real.
+            chosen = self._select_iface(d, [w[0] for w in working])
+            if chosen is None:
+                return False
+            working = [w for w in working if w[0] == chosen]
+
+        if working:
+            iface, lease = working[0]
+            dns_note = f", DNS {lease['dns']}" if lease["dns"] else ""
+            print(f"  DHCP lease on {iface}: {lease['ip']}/{lease['prefix']} via {lease['gateway']}{dns_note}")
+            print(f"  ✓ Internet reachable via {iface} - network is ready.")
+            self.config = {**lease, "source": "dhcp", "iface": iface}
+            self.verified = True
+            return True
 
         print()
+        print("  ❌ No Ethernet port obtained a working DHCP lease.")
         print("  Falling back to manual network entry.")
 
         while True:
             net = self._prompt_manual()
             if net is None:
                 return False
-
-            print(f"  Configuring {iface} = {net['ip']}/{net['prefix']}, gateway {net['gateway']}...")
-            if self._apply(d, iface, net):
-                print("  ✓ Local network config applied.", end=" ", flush=True)
-                if self._verify(d, net["gateway"]):
-                    print(f"  ✓ Internet reachable via {iface} — network is ready.")
-                    self.config = {**net, "source": "manual", "iface": iface}
+            # Try the static config on each candidate; use whichever reaches.
+            applied = False
+            for cand in ifaces:
+                print(f"  Configuring {cand} = {net['ip']}/{net['prefix']}, gateway {net['gateway']}...")
+                if self._apply(d, cand, net) and self._verify(d, net["gateway"]):
+                    print(f"  ✓ Internet reachable via {cand} - network is ready.")
+                    self.config = {**net, "source": "manual", "iface": cand}
                     self.verified = True
                     return True
-                print(f"  ❌ {iface} has link but could not reach the internet.")
-                print("     Check the gateway IP, cable, and network configuration.")
-
+            print("  ❌ None of the live ports reached the internet with that config.")
+            print("     Check the gateway IP, cable, and network configuration.")
             retry = input("  Try entering the network settings again? [Y/n]: ").strip().lower()
             if retry == "n":
                 return False
@@ -252,10 +254,10 @@ class RecoveryNetwork:
         print()
         chosen = None
         while chosen is None:
-            raw = input(f"  Select the WAN port [1-{len(ifaces)}] (or 'q' to abort): ").strip().lower()
+            raw = input(f"  Select the WAN port [1-{len(ifaces)}] (or 'q' to quit): ").strip().lower()
             if raw == "q":
-                print("  Aborted - remove the non-essential cables and try again.")
-                return None
+                print("  Quitting - remove the non-essential cables and re-run mono-imager.")
+                sys.exit(0)
             try:
                 chosen = ifaces[int(raw) - 1]
             except (ValueError, IndexError):

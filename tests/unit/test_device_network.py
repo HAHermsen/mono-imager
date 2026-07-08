@@ -82,7 +82,7 @@ with patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=lease), \
     result = app._setup_recovery_network(d)
 
 check("returns True", result is True)
-check("device_net cached from lease", app.device_net == {**lease, "source": "dhcp"})
+check("device_net cached from lease", app.device_net == {**lease, "source": "dhcp", "iface": "eth0"})
 
 
 # ============================================================================
@@ -164,7 +164,7 @@ with patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=new_lease)
     result = app._setup_recovery_network(d)
 
 check("returns True after re-resolving", result is True)
-check("device_net replaced with fresh DHCP lease", app.device_net == {**new_lease, "source": "dhcp"})
+check("device_net replaced with fresh DHCP lease", app.device_net == {**new_lease, "source": "dhcp", "iface": "eth0"})
 
 
 # ============================================================================
@@ -310,6 +310,39 @@ check("device_net defaults to None when not resolved yet", journey_none.ctx.devi
 
 
 # ============================================================================
+# #19 false positive: many LOWER_UP but only one real uplink (this board)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("multiple LOWER_UP but only one DHCP lease -> no prompt")
+print("=" * 60)
+
+from mono_imager.device_net import RecoveryNetwork
+
+# eth1/eth3/eth4 all report LOWER_UP (spurious internal links), but only
+# eth3 actually leases. Must pick eth3 automatically, with NO prompt.
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "4: eth4: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+)
+_lease3 = {"ip": "10.0.0.5", "prefix": "24", "gateway": "10.0.0.1", "dns": "10.0.0.1"}
+def _dhcp_only_eth3(dev, iface, *a, **k):
+    return _lease3 if iface == "eth3" else None
+rn = RecoveryNetwork()
+with patch.object(RecoveryNetwork, "_select_iface") as _sel, \
+     patch("mono_imager.recovery_orchestrator.try_dhcp", side_effect=_dhcp_only_eth3), \
+     patch("mono_imager.recovery_orchestrator.check_internet_reachable", return_value=True), \
+     patch("builtins.print"):
+    _ok = rn.resolve(d)
+check("no prompt when only one LOWER_UP port actually leases", not _sel.called)
+check("resolve() succeeds on the port that leased", _ok is True)
+check("the leased port (eth3) is the one recorded", rn.config.get("iface") == "eth3")
+
+
+# ============================================================================
 # _select_iface() / complex-topology rejection (issue #19)
 # ============================================================================
 
@@ -332,12 +365,17 @@ check("_select_iface sets eth1/eth2/eth4 down too",
       all(f"ip link set eth{n} down" in _downcmd for n in (1, 2, 4)))
 check("_select_iface does NOT set the chosen port down", "set eth3 down" not in _downcmd)
 
-# Abort with q -> None, nothing set down.
+# 'q' quits the whole app (SystemExit 0), and sets nothing down.
 rn = RecoveryNetwork()
 d = MagicMock()
+_exited = False
 with patch("builtins.input", return_value="q"), patch("builtins.print"):
-    check("_select_iface returns None on abort", rn._select_iface(d, ["eth0", "eth1"]) is None)
-check("_select_iface sets nothing down when aborted", not d.run_script.called)
+    try:
+        rn._select_iface(d, ["eth0", "eth1"])
+    except SystemExit as _e:
+        _exited = _e.code in (0, None)
+check("_select_iface quits the app on 'q'", _exited)
+check("_select_iface sets nothing down when quitting", not d.run_script.called)
 
 # Invalid entries re-prompt until a valid one is given.
 rn = RecoveryNetwork()
