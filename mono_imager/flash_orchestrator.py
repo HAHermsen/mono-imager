@@ -18,7 +18,7 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: v1.2.7
+Version: v1.2.8
 License: GPLv3
 """
 

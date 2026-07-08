@@ -4,7 +4,7 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: v1.2.7
+Version: v1.2.8
 License: GPLv3
 """
 
@@ -533,6 +533,20 @@ class MonoImager:
                 self.current_state = MenuState.NETWORK_AUTO_CONFIG
                 return
             firmware_display = str(firmware_path)
+
+            # Guard against an image whose real format does not match the
+            # chosen OS journey (e.g. a bzip2 OPNsense image via OpenWRT's
+            # raw dd) - that flashes "OK" but leaves an unbootable device.
+            from mono_imager.journeys import check_image_matches_os
+            _img_ok, _img_why = check_image_matches_os(os_name, firmware_path)
+            if not _img_ok:
+                print()
+                print(f"  ⚠ Image/OS mismatch: {_img_why}")
+                if self.safe_input("  Flash anyway? [y/N]: ") not in ("y", "Y"):
+                    print("  Cancelled.")
+                    input("  Press Enter to continue...")
+                    self.current_state = MenuState.NETWORK_AUTO_CONFIG
+                    return
 
         host_ip = core.detect_host_ip()
         if not host_ip:

@@ -22,6 +22,70 @@ _FLASH_TARGETS = {
     "Armbian":  "/dev/mmcblk0",
 }
 
+# --- Image / OS format guard --------------------------------------------
+# Each journey feeds its downloaded image to a specific decompressor before
+# dd (opnsense: bzip2 always; openwrt: gunzip on .gz else raw; armbian: xz
+# on .xz else raw). Flashing an image whose real container does not match
+# that pipeline "succeeds" but produces an unbootable device (e.g. a bzip2
+# OPNsense image sent through OpenWRT's raw dd). These helpers catch that.
+_CONTAINER_MAGIC = {
+    "bzip2": b"BZh",
+    "gzip":  b"\x1f\x8b",
+    "xz":    b"\xfd7zXZ\x00",
+    "zip":   b"PK\x03\x04",
+}
+
+
+def detect_container(path) -> str:
+    """Compression container of `path` from its magic bytes:
+    'bzip2' | 'gzip' | 'xz' | 'zip' | 'raw' (raw = none recognised)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(6)
+    except OSError:
+        return "raw"
+    for name, magic in _CONTAINER_MAGIC.items():
+        if head.startswith(magic):
+            return name
+    return "raw"
+
+
+def expected_container(os_name: str, path) -> str:
+    """The container the chosen OS journey WILL decompress before dd
+    (mirrors the per-OS flash steps). 'raw' means it is written as-is."""
+    name = str(path).lower()
+    if os_name == "OPNsense":
+        return "bzip2"
+    if os_name == "OpenWRT":
+        return "gzip" if name.endswith(".gz") else "raw"
+    if os_name == "Armbian":
+        return "xz" if name.endswith(".xz") else "raw"
+    return "raw"
+
+
+def check_image_matches_os(os_name: str, path):
+    """Return (ok, reason). ok=True when the image's real container matches
+    what the chosen OS journey will do with it. Guards against the
+    wrong-journey botch (bzip2 OPNsense image via OpenWRT raw dd, etc.)."""
+    expected = expected_container(os_name, path)
+    actual = detect_container(path)
+    if expected == actual:
+        return True, ""
+    if expected == "raw":
+        reason = (
+            f"{os_name} expects a raw/uncompressed image here, but this file "
+            f"looks {actual}-compressed. It would be written as-is and will "
+            f"not boot. Decompress it, or use the extension the journey "
+            f"decompresses (OpenWRT: .gz, Armbian: .xz)."
+        )
+    else:
+        seen = "uncompressed" if actual == "raw" else actual
+        reason = (
+            f"{os_name} expects a {expected}-compressed image, but this file "
+            f"looks {seen}. Use the correct image (OPNsense: .img.bz2)."
+        )
+    return False, reason
+
 def _load_all_journeys():
     """Import all journey modules in this package."""
     package_dir = Path(__file__).parent

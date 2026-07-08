@@ -310,6 +310,50 @@ for os_name in SUPPORTED_OS:
 
 
 # ============================================================================
+# Image / OS format guard (detect_container / check_image_matches_os)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("image/OS format guard")
+print("=" * 60)
+
+import tempfile, os as _os
+from mono_imager.journeys import detect_container, expected_container, check_image_matches_os
+
+def _tmp(magic: bytes) -> str:
+    fd, path = tempfile.mkstemp(suffix=".img")
+    _os.write(fd, magic + b"\x00" * 64)
+    _os.close(fd)
+    return path
+
+check("detect bzip2 magic", detect_container(_tmp(b"BZh91AY&SY")) == "bzip2")
+check("detect gzip magic", detect_container(_tmp(b"\x1f\x8b\x08\x00")) == "gzip")
+check("detect xz magic", detect_container(_tmp(b"\xfd7zXZ\x00")) == "xz")
+check("detect raw (no known magic)", detect_container(_tmp(b"\x00\x11\x22\x33")) == "raw")
+
+check("OPNsense always expects bzip2", expected_container("OPNsense", "x.img") == "bzip2")
+check("OpenWRT .gz expects gzip", expected_container("OpenWRT", "x.img.gz") == "gzip")
+check("OpenWRT plain expects raw", expected_container("OpenWRT", "x.img") == "raw")
+check("Armbian .xz expects xz", expected_container("Armbian", "x.img.xz") == "xz")
+check("Armbian plain expects raw", expected_container("Armbian", "x.img") == "raw")
+
+_bz = _tmp(b"BZh91AY&SY")
+_raw = _tmp(b"\x00\x00\x00\x00")
+check("bzip2 image OK for OPNsense", check_image_matches_os("OPNsense", _bz)[0] is True)
+check("bzip2 image flagged for OpenWRT (raw dd)", check_image_matches_os("OpenWRT", _bz)[0] is False)
+check("raw image flagged for OPNsense", check_image_matches_os("OPNsense", _raw)[0] is False)
+check("raw image OK for OpenWRT", check_image_matches_os("OpenWRT", _raw)[0] is True)
+check("mismatch returns a non-empty reason", bool(check_image_matches_os("OpenWRT", _bz)[1]))
+
+for _p in (_bz, _raw):
+    try:
+        _os.unlink(_p)
+    except OSError:
+        pass
+
+
+# ============================================================================
 # Result
 # ============================================================================
 
