@@ -9,7 +9,7 @@ What this tests:
   - get_device_mac()               — MAC parsing from ip addr output
   - run_firmware_update()          — success/failure/callback detection
   - _stream_command()              — auto-confirm and output streaming
-  - check_internet_reachable()     — gateway + host ping logic
+  - check_internet_reachable()     — raw-IP ping + nslookup (routing/DNS split, #16)
   - legacy_flash_emmc/nor()        — dd record detection, auth failure
   - verify_boot_source()           — NOR/eMMC boot marker detection
 
@@ -183,34 +183,42 @@ print("=" * 60)
 print("check_internet_reachable()")
 print("=" * 60)
 
+# #16: validation is now two independent checks - a raw-IP ping (routing,
+# no DNS needed) and an nslookup (DNS). The gateway is never pinged, since
+# a firewall dropping ICMP to itself is expected, not a failure.
 d = MagicMock()
 d.run_script.return_value = "RC=0"
-check("gateway + host both reachable -> True",
-      rec.check_internet_reachable(d, gateway="192.168.1.1", host="firmware.mono.si") is True)
-check("pinged gateway then host (2 calls)", d.run_script.call_count == 2)
-check("gateway pinged first", "192.168.1.1" in d.run_script.call_args_list[0][0][0])
-check("host pinged second", "firmware.mono.si" in d.run_script.call_args_list[1][0][0])
+check("routing ping + DNS lookup both OK -> True",
+      rec.check_internet_reachable(d, host="firmware.mono.si") is True)
+check("exactly two checks run (ping then nslookup)", d.run_script.call_count == 2)
+check("first check pings a raw WAN IP (8.8.8.8, no DNS)",
+      "ping" in d.run_script.call_args_list[0][0][0] and "8.8.8.8" in d.run_script.call_args_list[0][0][0])
+check("second check is an nslookup of the host",
+      "nslookup" in d.run_script.call_args_list[1][0][0] and "firmware.mono.si" in d.run_script.call_args_list[1][0][0])
 
+# Passing a gateway must NOT add a gateway ping (issue #16).
 d = MagicMock()
-d.run_script.return_value = "RC=1"
-check("gateway unreachable -> False (host never pinged)",
-      rec.check_internet_reachable(d, gateway="192.168.1.1") is False and d.run_script.call_count == 1)
+d.run_script.return_value = "RC=0"
+rec.check_internet_reachable(d, gateway="10.1.9.1", host="firmware.mono.si")
+check("gateway is never pinged even when provided",
+      not any("10.1.9.1" in c[0][0] for c in d.run_script.call_args_list))
 
+# Routing down -> False, and DNS is not even attempted.
+d = MagicMock()
+d.run_script.side_effect = ["RC=1"]
+check("WAN ping fails -> False", rec.check_internet_reachable(d, host="firmware.mono.si") is False)
+check("DNS not attempted when routing already failed (1 call)", d.run_script.call_count == 1)
+
+# Routing OK but DNS broken -> False (the actionable edge case from #16).
 d = MagicMock()
 d.run_script.side_effect = ["RC=0", "RC=1"]
-check("gateway OK but host unreachable -> False",
-      rec.check_internet_reachable(d, gateway="192.168.1.1", host="firmware.mono.si") is False)
-
-d = MagicMock()
-d.run_script.return_value = "RC=0"
-check("no gateway given — only pings host",
-      rec.check_internet_reachable(d, host="firmware.mono.si") is True)
-check("only 1 call made (no gateway check)", d.run_script.call_count == 1)
+check("ping OK but nslookup fails -> False (DNS broken)",
+      rec.check_internet_reachable(d, host="firmware.mono.si") is False)
 
 d = MagicMock()
 d.run_script.side_effect = RuntimeError("serial broke")
 check("run_script raising -> False (no crash)",
-      rec.check_internet_reachable(d, gateway="192.168.1.1") is False)
+      rec.check_internet_reachable(d, host="firmware.mono.si") is False)
 
 
 # ============================================================================

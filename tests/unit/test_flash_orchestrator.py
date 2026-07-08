@@ -123,6 +123,37 @@ check("first matching iface wins when several have LOWER_UP",
 
 
 # ============================================================================
+# parse_active_eth_ifaces()  (multi-cable / complex topology, issue #19)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("parse_active_eth_ifaces()")
+print("=" * 60)
+
+_multi = (
+    "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n"
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth1: <BROADCAST,MULTICAST> mtu 1500\n"
+    "4: eth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+)
+check("returns every live eth* (loopback excluded), in order",
+      core.parse_active_eth_ifaces(_multi) == ["eth0", "eth2"])
+
+check("single live port -> one-element list",
+      core.parse_active_eth_ifaces("3: eth1: <UP,LOWER_UP> mtu 1500\n") == ["eth1"])
+
+check("no live port -> empty list",
+      core.parse_active_eth_ifaces("2: eth0: <BROADCAST> mtu 1500\n") == [])
+
+check("empty input -> empty list", core.parse_active_eth_ifaces("") == [])
+
+# The singular helper must stay consistent: first of the list, or None.
+check("singular helper returns first of the multi list",
+      core.parse_active_eth_iface(_multi) == "eth0")
+
+
+# ============================================================================
 # _FirmwareHandler report store: wait_for_report() / peek_report()
 # ============================================================================
 

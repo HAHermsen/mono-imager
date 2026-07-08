@@ -5,7 +5,7 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v1.2.3
+Version: v1.2.7
 License: GPLv3
 """
 
@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 
 from mono_imager.logging_setup import make_verbose, debug_enabled as _debug_enabled  # noqa: F401
 verbose = make_verbose(logger)
+
+
+def _is_permission_error(exc) -> bool:
+    """
+    True if `exc` is an OS 'permission denied' opening the serial port
+    (a Linux tty needs sudo or 'dialout' membership). pyserial wraps the
+    OS error in SerialException, so check the type, errno 13, and message.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "errno", None) == 13:
+        return True
+    return "permission denied" in str(exc).lower()
 
 
 class SerialDevice:
@@ -1242,6 +1255,10 @@ class SerialDevice:
     def wait_for_port(self, timeout: float = 30.0) -> bool:
         """
         Wait until the serial port appears (device plugged in or rebooted).
+
+        A 'permission denied' open is NOT transient: retrying for the full
+        timeout only hides it behind a misleading "did not appear" message
+        (issue #15). Detect it and fail fast with the actionable fix.
         """
         verbose(f"Waiting for device on {self.port}...")
 
@@ -1253,10 +1270,23 @@ class SerialDevice:
                 test.close()
                 verbose("✓ Device detected")
                 return True
-            except serial.SerialException:
+            except serial.SerialException as e:
+                if _is_permission_error(e):
+                    verbose(
+                        f"Cannot open {self.port}: permission denied. On Linux, "
+                        "run with sudo, or add your user to the 'dialout' group "
+                        "(sudo usermod -a -G dialout $USER, then log out/in).",
+                        "error",
+                    )
+                    return False
                 time.sleep(0.5)
 
-        verbose(f"Device on {self.port} did not appear within {timeout}s", "error")
+        verbose(
+            f"Device on {self.port} did not appear within {timeout}s. If it is "
+            "connected, power-cycle/reset the device (it may be stuck at a "
+            "U-Boot or shell prompt) and try again.",
+            "error",
+        )
         return False
 
     def wait_for_any_output(self, timeout: float = 60.0) -> bool:

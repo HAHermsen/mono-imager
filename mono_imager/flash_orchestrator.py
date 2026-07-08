@@ -18,7 +18,7 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: v1.2.3
+Version: v1.2.7
 License: GPLv3
 """
 
@@ -343,25 +343,37 @@ def detect_host_ip() -> str:
         return ""
 
 
-def parse_active_eth_iface(ip_link_output: str) -> Optional[str]:
+def parse_active_eth_ifaces(ip_link_output: str) -> list:
     """
-    Parse `ip link show` output and return the first eth* interface
-    that reports LOWER_UP (has a live carrier — a cable is actually
-    plugged in), or None if none do.
+    Parse `ip link show` output and return ALL eth* interfaces that
+    report LOWER_UP (a live carrier — a cable actually plugged in),
+    in the order they appear. Empty list if none do.
 
-    Auto-detects whichever physical port the cable is actually in
-    rather than assuming a specific jack — recovery Linux boots with
-    every eth port administratively DOWN, so callers must bring all
-    candidate ports up first before this can find anything.
+    Recovery Linux boots every eth port administratively DOWN, so
+    callers must bring all candidate ports up first before this finds
+    anything. More than one entry means multiple cables are live — an
+    ambiguous ("complex") topology the caller must resolve (issue #19)
+    rather than silently guessing which port is the WAN uplink.
     """
+    ifaces = []
     for line in ip_link_output.split('\n'):
         if 'LOWER_UP' in line and ': ' in line:
             parts = line.split(': ')
             if len(parts) >= 2:
-                iface_name = parts[1].split()[0]
-                if iface_name.startswith('eth'):
-                    return iface_name
-    return None
+                name = parts[1].split()[0]
+                if name.startswith('eth') and name not in ifaces:
+                    ifaces.append(name)
+    return ifaces
+
+
+def parse_active_eth_iface(ip_link_output: str) -> Optional[str]:
+    """
+    Backwards-compatible single-port helper: the FIRST eth* interface
+    with LOWER_UP, or None. See parse_active_eth_ifaces() for the full
+    list (used to detect the multi-cable complex-topology case, #19).
+    """
+    ifaces = parse_active_eth_ifaces(ip_link_output)
+    return ifaces[0] if ifaces else None
 
 # --- U-Boot env capture/restore -----------------------------------------------
 # This hardware's U-Boot env backend is MMC-primary (see opnsense_lan.py's

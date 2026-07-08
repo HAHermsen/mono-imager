@@ -253,6 +253,7 @@ print("=" * 60)
 
 app = make_app()
 with patch.object(app, "_select_port", return_value="COM5"), \
+     patch("serial.Serial", return_value=MagicMock()), \
      patch("mono_imager.flash_orchestrator.phase1_bootstrap", return_value=None), \
      patch("builtins.input", return_value=""), \
      patch("builtins.print"):
@@ -275,6 +276,7 @@ def fake_setup_recovery_network(dev):
     return True
 
 with patch.object(app, "_select_port", return_value="COM5"), \
+     patch("serial.Serial", return_value=MagicMock()), \
      patch("mono_imager.flash_orchestrator.phase1_bootstrap", return_value=d), \
      patch.object(app, "_setup_recovery_network", side_effect=fake_setup_recovery_network) as mock_setup, \
      patch("builtins.input", return_value=""), \
@@ -305,6 +307,112 @@ check("ctx.device_net matches what was passed in", journey.ctx.device_net == net
 
 journey_none = get_journey("OpenWRT", "usb", device=MagicMock())
 check("device_net defaults to None when not resolved yet", journey_none.ctx.device_net is None)
+
+
+# ============================================================================
+# _select_iface() / complex-topology rejection (issue #19)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("complex topology: multiple live Ethernet ports (#19)")
+print("=" * 60)
+
+from mono_imager.device_net import RecoveryNetwork
+
+# Direct: user picks port 2 of [eth0, eth3]; the rest are set link down.
+rn = RecoveryNetwork()
+d = MagicMock()
+with patch("builtins.input", return_value="2"), patch("builtins.print"):
+    _chosen = rn._select_iface(d, ["eth0", "eth3"])
+check("_select_iface returns the user-chosen port", _chosen == "eth3")
+_downcmd = d.run_script.call_args[0][0]
+check("_select_iface sets a non-chosen port down (eth0)", "ip link set eth0 down" in _downcmd)
+check("_select_iface sets eth1/eth2/eth4 down too",
+      all(f"ip link set eth{n} down" in _downcmd for n in (1, 2, 4)))
+check("_select_iface does NOT set the chosen port down", "set eth3 down" not in _downcmd)
+
+# Abort with q -> None, nothing set down.
+rn = RecoveryNetwork()
+d = MagicMock()
+with patch("builtins.input", return_value="q"), patch("builtins.print"):
+    check("_select_iface returns None on abort", rn._select_iface(d, ["eth0", "eth1"]) is None)
+check("_select_iface sets nothing down when aborted", not d.run_script.called)
+
+# Invalid entries re-prompt until a valid one is given.
+rn = RecoveryNetwork()
+d = MagicMock()
+_ins = iter(["9", "x", "1"])
+with patch("builtins.input", side_effect=lambda *_a, **_k: next(_ins)), patch("builtins.print"):
+    check("_select_iface re-prompts on invalid input then accepts",
+          rn._select_iface(d, ["eth0", "eth1"]) == "eth0")
+
+# Integration: resolve() must route through _select_iface when >1 port is live.
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+)
+_lease = {"ip": "192.168.1.50", "prefix": "24", "gateway": "192.168.1.1", "dns": "192.168.1.1"}
+rn = RecoveryNetwork()
+with patch.object(RecoveryNetwork, "_select_iface", return_value="eth0") as _mock_sel, \
+     patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=_lease), \
+     patch("mono_imager.recovery_orchestrator.check_internet_reachable", return_value=True), \
+     patch("builtins.print"):
+    _ok = rn.resolve(d)
+check("resolve() calls _select_iface when multiple ports are live", _mock_sel.called)
+check("resolve() succeeds after the user picks a port", _ok is True)
+
+
+# ============================================================================
+# _prompt_manual(): accept IP/CIDR in the address field (issue #17)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("manual entry: IP/CIDR parsing (#17)")
+print("=" * 60)
+
+def _responder(mapping):
+    def _r(prompt, *_a, **_k):
+        for key, val in mapping.items():
+            if key in prompt:
+                return val
+        return ""
+    return _r
+
+# "10.1.9.32/24" in the IP field -> prefix from CIDR, mask prompt skipped.
+# The mask responder returns /25's mask; if it were (wrongly) used the
+# prefix would be "25", so prefix == "24" proves the CIDR won.
+rn = RecoveryNetwork()
+_map = {"Device IP": "10.1.9.32/24", "Subnet mask": "255.255.255.128",
+        "Gateway": "10.1.9.1", "DNS": "10.1.8.8"}
+with patch("builtins.input", side_effect=_responder(_map)) as _inp, patch("builtins.print"):
+    _net = rn._prompt_manual()
+check("IP/CIDR: IP stripped of the /CIDR", _net and _net["ip"] == "10.1.9.32")
+check("IP/CIDR: prefix taken from CIDR (24), not the mask", _net and _net["prefix"] == "24")
+check("IP/CIDR: subnet-mask prompt never shown",
+      not any("Subnet mask" in c.args[0] for c in _inp.call_args_list))
+check("IP/CIDR: gateway and DNS still captured",
+      _net and _net["gateway"] == "10.1.9.1" and _net["dns"] == "10.1.8.8")
+
+# Plain IP (no CIDR) still uses the subnet-mask prompt as before.
+rn = RecoveryNetwork()
+_map = {"Device IP": "10.1.9.32", "Subnet mask": "", "Gateway": "10.1.9.1", "DNS": "10.1.8.8"}
+with patch("builtins.input", side_effect=_responder(_map)), patch("builtins.print"):
+    _net = rn._prompt_manual()
+check("plain IP: prefix from default mask (/24)",
+      _net and _net["ip"] == "10.1.9.32" and _net["prefix"] == "24")
+
+# Invalid CIDR is rejected.
+rn = RecoveryNetwork()
+with patch("builtins.input", side_effect=_responder({"Device IP": "10.1.9.32/99"})), patch("builtins.print"):
+    check("invalid CIDR (/99) -> None", rn._prompt_manual() is None)
+
+# "/24" with no address before the slash is rejected.
+rn = RecoveryNetwork()
+with patch("builtins.input", side_effect=_responder({"Device IP": "/24"})), patch("builtins.print"):
+    check("'/24' with no IP -> None", rn._prompt_manual() is None)
 
 
 # ============================================================================

@@ -103,17 +103,25 @@ class RecoveryNetwork:
             )
             if _eth_err:
                 raise _eth_err
-            iface = core.parse_active_eth_iface(ip_output)
-            if iface is None:
+            ifaces = core.parse_active_eth_ifaces(ip_output)
+            if not ifaces:
                 print("  ❌ No Ethernet port has a cable plugged in.")
                 print("     Plug an Ethernet cable into any RJ-45 jack (not the SFP+ cages).")
                 print()
                 input("  Press Enter once the cable is plugged in...")
                 ip_output = d.run_script("ip link show", marker="recovery_eth_check_retry", exec_timeout=5)
-                iface = core.parse_active_eth_iface(ip_output)
-                if iface is None:
+                ifaces = core.parse_active_eth_ifaces(ip_output)
+                if not ifaces:
                     print("  ❌ Still no Ethernet port with a cable detected.")
                     return False
+            if len(ifaces) > 1:
+                # Multiple live cables = unsupported complex topology (#19).
+                # Have the user pick the WAN port; the rest are set down.
+                iface = self._select_iface(d, ifaces)
+                if iface is None:
+                    return False
+            else:
+                iface = ifaces[0]
             print(f"  ✓ {iface} is ready.")
         except Exception as e:
             print(f"  ❌ Failed to check Ethernet carrier: {e}")
@@ -223,6 +231,47 @@ class RecoveryNetwork:
             return False
         return bool(result)
 
+    def _select_iface(self, d, ifaces: list):
+        """
+        Multiple Ethernet ports have a live cable - a complex topology
+        the tool does not support automatically (issue #19). Only one
+        port can serve as the WAN uplink for 'firmware update', so ask
+        the user which one, then set every OTHER eth* port 'link down'
+        so nothing downstream (DHCP, routing) can pick the wrong port.
+
+        Returns the chosen iface name, or None if the user aborts.
+        """
+        print()
+        print("  ⚠ Multiple Ethernet ports have a live link:")
+        for i, name in enumerate(ifaces, 1):
+            print(f"      {i}) {name}")
+        print()
+        print("    This is a complex topology the tool cannot resolve on its")
+        print("    own - only one port can be the WAN uplink. The others will")
+        print("    be set 'link down'.")
+        print()
+        chosen = None
+        while chosen is None:
+            raw = input(f"  Select the WAN port [1-{len(ifaces)}] (or 'q' to abort): ").strip().lower()
+            if raw == "q":
+                print("  Aborted - remove the non-essential cables and try again.")
+                return None
+            try:
+                chosen = ifaces[int(raw) - 1]
+            except (ValueError, IndexError):
+                print("  Invalid selection.")
+                chosen = None
+        # Set every other eth* port down (not just the live ones) so no
+        # ambiguous carrier or route can survive downstream.
+        others = [f"eth{n}" for n in range(5) if f"eth{n}" != chosen]
+        down_cmd = "; ".join(f"ip link set {n} down 2>/dev/null" for n in others)
+        try:
+            d.run_script(down_cmd, marker="recovery_eth_down_unused", exec_timeout=10)
+        except Exception as e:
+            print(f"  ⚠ Could not set the other ports down: {e}")
+        print(f"  Using {chosen}; the other Ethernet ports were set down.")
+        return chosen
+
     def _prompt_manual(self) -> Optional[dict]:
         """
         Prompt for Device IP, subnet mask, gateway, and DNS. Returns
@@ -240,11 +289,30 @@ class RecoveryNetwork:
             print("  ❌ Device IP is required.")
             return None
 
-        mask_raw = input("  Subnet mask (e.g. 255.255.255.0) [255.255.255.0]: ").strip() or "255.255.255.0"
-        prefix = netmask_to_prefix(mask_raw)
+        # Accept "IP/CIDR" (e.g. 10.1.9.32/24) in the address field: take
+        # the prefix from it and skip the subnet-mask prompt. Without this
+        # the "/24" stayed part of the IP and _apply() built an invalid
+        # "10.1.9.32/24/24" (#17).
+        prefix = None
+        if "/" in device_ip:
+            device_ip, _, cidr = device_ip.partition("/")
+            device_ip = device_ip.strip()
+            cidr = cidr.strip()
+            if not device_ip:
+                print("  ❌ Device IP is required.")
+                return None
+            if not (cidr.isdigit() and 0 <= int(cidr) <= 32):
+                print(f"  ❌ Invalid CIDR prefix '/{cidr}': expected /0 to /32.")
+                return None
+            prefix = cidr
+            print(f"  Using /{prefix} from the address you entered (skipping subnet mask).")
+
         if prefix is None:
-            print(f"  ❌ Invalid subnet mask: {mask_raw}")
-            return None
+            mask_raw = input("  Subnet mask (e.g. 255.255.255.0) [255.255.255.0]: ").strip() or "255.255.255.0"
+            prefix = netmask_to_prefix(mask_raw)
+            if prefix is None:
+                print(f"  ❌ Invalid subnet mask: {mask_raw}")
+                return None
 
         gateway = input("  Gateway (your router's IP on that network, e.g. 192.168.1.1): ").strip()
         if not gateway:

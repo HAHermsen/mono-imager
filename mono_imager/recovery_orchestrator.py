@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.2.3
+Version: v1.2.7
 License: GPLv3
 """
 
@@ -156,68 +156,64 @@ def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
 
 
 def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
-                              host: str = "firmware.mono.si", timeout: int = 15) -> bool:
+                              host: str = "firmware.mono.si",
+                              ping_ip: str = "8.8.8.8", timeout: int = 15) -> bool:
     """
-    Verify the device can actually reach the internet — not just that
-    local 'ip link'/'ip addr'/'ip route' commands reported success,
-    which only confirms local interface configuration, not real
-    reachability.
+    Validate real WAN connectivity in two INDEPENDENT checks, so a failure
+    points at the layer that is actually broken (issue #16):
 
-    CONFIRMED BUG THIS GUARDS AGAINST: a real run reported RC=0 from
-    network setup (interface up, IP assigned, route added) yet
-    'firmware update' still aborted within seconds of its own
-    confirmation prompt, because the interface had no actual working
-    path to the real internet on that physical port. Local config
-    succeeding and real reachability are not the same thing, and
-    nothing was checking the latter before this.
+      1. Routing: ping a raw WAN IP (ping_ip, default 8.8.8.8). A numeric
+         target needs no DNS, so this isolates reachability/routing. The
+         default gateway is deliberately NOT pinged — a firewall gateway
+         dropping ICMP to itself is expected behaviour, not a failure.
+      2. DNS: resolve `host` with nslookup. 'firmware update' downloads
+         from firmware.mono.si, so name resolution must work even when
+         routing already does.
 
-    Pings the gateway first if given (confirms basic LAN/L3
-    connectivity — catches "wrong cable/port" early), then pings
-    `host` (confirms DNS + a real path out to the internet — the
-    actual prerequisite 'firmware update' and the legacy curl path
-    both need). Returns False with a specific reason logged for
-    whichever layer failed, rather than a generic failure the user
-    has to guess at.
+    Returns True only if both pass. `gateway` is accepted for backward
+    compatibility but no longer pinged.
     """
-    if gateway:
-        try:
-            gw_output = d.run_script(
-                f"ping -c 2 {gateway} >/dev/null 2>&1; echo RC=$?",
-                marker="check_gateway", exec_timeout=timeout,
-            )
-        except RuntimeError as e:
-            msg = f"Could not run the gateway ping check at all: {e}"
-            logger.warning(f"check_internet_reachable: {msg}")
-            console_logger.info(f"  ⚠ {msg}")
-            return False
-        if "RC=0" not in gw_output:
-            msg = (
-                f"Gateway {gateway} is not reachable from the device — "
-                "check the cable and which physical port is actually in use."
-            )
-            logger.error(msg)
-            console_logger.info(f"  ⚠ {msg}")
-            return False
-
+    # 1. Routing / reachability — ping a raw WAN IP (no DNS dependency).
     try:
-        host_output = d.run_script(
-            f"ping -c 2 {host} >/dev/null 2>&1; echo RC=$?",
-            marker="check_internet_host", exec_timeout=timeout,
+        ping_out = d.run_script(
+            f"ping -c 2 {ping_ip} >/dev/null 2>&1; echo RC=$?",
+            marker="check_wan_ping", exec_timeout=timeout,
         )
     except RuntimeError as e:
-        msg = f"Could not run the internet-host ping check at all: {e}"
+        msg = f"Could not run the WAN ping check: {e}"
         logger.warning(f"check_internet_reachable: {msg}")
         console_logger.info(f"  ⚠ {msg}")
         return False
-
-    if "RC=0" not in host_output:
+    if "RC=0" not in ping_out:
         msg = (
-            f"{host} is not reachable from the device — gateway responds but "
-            "there's no real path to the internet (DNS, routing, or upstream issue)."
+            f"No route to the internet — ping to {ping_ip} failed. Check the "
+            "device IP, gateway, cable, and which physical port is in use."
         )
         logger.error(msg)
         console_logger.info(f"  ⚠ {msg}")
         return False
+    console_logger.info(f"  ✓ Reachability OK (ping {ping_ip}).")
+
+    # 2. DNS — resolve the real firmware host with nslookup.
+    try:
+        dns_out = d.run_script(
+            f"nslookup {host} >/dev/null 2>&1; echo RC=$?",
+            marker="check_dns", exec_timeout=timeout,
+        )
+    except RuntimeError as e:
+        msg = f"Could not run the DNS check: {e}"
+        logger.warning(f"check_internet_reachable: {msg}")
+        console_logger.info(f"  ⚠ {msg}")
+        return False
+    if "RC=0" not in dns_out:
+        msg = (
+            f"DNS lookup failed ({host}) — routing works but name resolution "
+            "does not. Check the DNS server you set is reachable and correct."
+        )
+        logger.error(msg)
+        console_logger.info(f"  ⚠ {msg}")
+        return False
+    console_logger.info(f"  ✓ DNS lookup OK ({host}).")
 
     return True
 
