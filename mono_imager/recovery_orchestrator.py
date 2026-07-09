@@ -32,7 +32,7 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.2.8
+Version: v1.2.9
 License: GPLv3
 """
 
@@ -407,9 +407,24 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
             never naturally goes idle for 30 real seconds.
     """
     # Step 1: Detect which medium we're booting from (so we know which to flash)
+    #
+    # BUG FIXED: this used to grep `root=` out of /proc/cmdline, with a
+    # failure-fallback of `root=/dev/mmcblk0p1` — a string that itself
+    # contains "mmcblk0". That made a detection FAILURE indistinguishable
+    # from a successful eMMC-boot detection: both silently resolved to
+    # target="qspi". Worse, `root=` isn't actually a reliable signal for
+    # current boot medium on this board even when the grep succeeds — the
+    # recovery kernel's cmdline can carry a static root= value that doesn't
+    # track which physical media was actually booted from.
+    #
+    # The board's own U-Boot env already sets an unambiguous signal for
+    # this instead: `boot_medium=emmc` / `boot_medium=qspi`, baked into
+    # bootargs by the "emmc" and "recovery" U-Boot boot commands
+    # respectively (see printenv on real hardware). Keying off that
+    # instead removes the ambiguity entirely.
     try:
         boot_output = d.run_script(
-            "cat /proc/cmdline | grep -o 'root=/dev/[^ ]*' || echo 'root=/dev/mmcblk0p1'",
+            "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
             marker="detect_boot_source", exec_timeout=5
         )
     except RuntimeError as e:
@@ -417,8 +432,19 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
         # Default: assume booted from NOR, so flash eMMC
         target = "emmc"
     else:
-        # If booted from mmcblk0 (eMMC), target is qspi (NOR); otherwise target is emmc
-        target = "qspi" if "mmcblk0" in boot_output else "emmc"
+        if "boot_medium=emmc" in boot_output:
+            target = "qspi"
+        elif "boot_medium=qspi" in boot_output:
+            target = "emmc"
+        else:
+            # Neither value present — detection genuinely inconclusive.
+            # Don't guess silently: log it plainly and fall back to the
+            # same safe default as the exception path above.
+            logger.warning(
+                f"run_firmware_update: boot_medium not found in cmdline "
+                f"(got: {boot_output!r}) — defaulting to emmc target"
+            )
+            target = "emmc"
 
     logger.info(f"run_firmware_update: will flash {target} (auto-detected by device)")
 
