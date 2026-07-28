@@ -21,7 +21,7 @@ mono-imager automates the full flashing procedure for the Mono Gateway hardware:
 
 Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each available via **LAN** or **USB** transfer.
 
-## What it does **NOT** do (and never will do)
+## What it does **NOT** do (and never will)
 
 - Does NOT download OS/firmware image files for you. You are responsible for obtaining and verifying the files before flashing it to the Mono Gateway.
 
