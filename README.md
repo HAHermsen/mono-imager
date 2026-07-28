@@ -13,12 +13,18 @@ mono-imager automates the full flashing procedure for the Mono Gateway hardware:
 - Detects the serial port, connects, and interrupts U-Boot autoboot automatically.
 - Boots the device into its NOR or eMMC recovery Linux shell and logs in.
 - Resolves the device's own network (DHCP first, verified for real internet reachability, falling back to manual IP/subnet/gateway/DNS entry) — done once per session and reused everywhere.
+- Downloads the NOR /eMMC uboot firmware from mono's official repo and flashes it
 - Flashes a full OS image over LAN (via a local HTTP server + `curl`/`dd` on the device) or from a USB stick plugged into the device itself.
 - Refreshes eMMC/NOR firmware regions where the flashing procedure requires it, following each OS's documented official procedure.
 - Falls back to a legacy `curl`+`dd`/`flashcp` path automatically on older devices that don't have the modern `firmware update` tool.
 - Prints a step-by-step pass/fail report for every operation, plus a full log file.
 
 Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each available via **LAN** or **USB** transfer.
+
+## What it does **NOT** do (and never will do)
+
+- Does NOT download OS/firmware image files for you. You are responsible for obtaining and verifying the files before flashing it to the Mono Gateway.
+
 
 ## Requirements
 
