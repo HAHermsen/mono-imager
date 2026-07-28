@@ -39,6 +39,8 @@ This registers the `mono-imager` command via the `[project.scripts]` entry point
 python -m mono_imager.cli
 ```
 
+See [`Installing-mono-imager.md`](Installing-mono-imager.md) for further instructons. 
+
 ## Usage
 
 ```bash
