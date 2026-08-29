@@ -112,6 +112,21 @@ class MonoImager:
     def print_header(self):
         console.print_header(__version__, __author__, self.device_net)
 
+    def print_screen_divider(self):
+        """
+        Scrolling-transcript equivalent of clear_screen()+print_header()
+        (branch poc/continous_cli_menu): appends a divider + a one-line
+        status recap instead of wiping the screen, so prior output —
+        including earlier steps' results — stays visible and scrollable.
+        Every menu screen uses this now; see menu_main()'s original PoC
+        docstring in git history for the rationale. menu_network_flashing()
+        and menu_done() already didn't clear the screen even before this
+        (deliberately, for debugging visibility) and are unaffected.
+        """
+        print()
+        print("-" * 60)
+        console.print_status_line(__version__, self.device_net)
+
     # Minimum plausible firmware size. This is a sanity check against
     # obviously wrong paths (a README, a 0-byte placeholder, a text
     # file typo) — NOT a content/format check. mono-imager deliberately
@@ -355,19 +370,8 @@ class MonoImager:
     #  1. MAIN MENU                                                        #
     # ------------------------------------------------------------------ #
     def menu_main(self):
-        """
-        Main menu — action first.
-
-        PoC (branch poc/continous_cli_menu): scrolling output instead of
-        clear-and-redraw. No self.clear_screen()/self.print_header() here
-        on purpose — every other menu still clears the screen; only this
-        one screen is being trialled as an append-only transcript, with
-        a one-line status recap (console.print_status_line) standing in
-        for the boxed header.
-        """
-        print()
-        print("-" * 60)
-        console.print_status_line(__version__, self.device_net)
+        """Main menu — action first. See print_screen_divider()."""
+        self.print_screen_divider()
         print("What would you like to do?")
         print()
         print("  1) Flash OS")
@@ -407,8 +411,7 @@ class MonoImager:
             self.current_state = MenuState.MAIN
 
     def menu_flash_auto_or_manual(self):
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("  1) Fully Auto — flash via LAN or USB")
         print("  2) Back")
         print()
@@ -435,8 +438,7 @@ class MonoImager:
         from mono_imager import flash_orchestrator as core
         from mono_imager.config import detect_serial_ports
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("  Fully Auto")
         print()
 
@@ -670,8 +672,7 @@ class MonoImager:
         """
         from mono_imager import recovery_orchestrator as rec
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("Update eMMC Firmware")
         print()
         print("  +-----------------------------------------------+")
@@ -727,8 +728,7 @@ class MonoImager:
         """
         from mono_imager import recovery_orchestrator as rec
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("Update NOR Firmware")
         print()
         print("  ┌─────────────────────────────────────────────────┐")
@@ -779,8 +779,7 @@ class MonoImager:
         """
         from mono_imager import diagnostics
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("  Test Serial Connection")
         print("  " + "─" * 56)
         print()
@@ -816,8 +815,7 @@ class MonoImager:
         """
         from mono_imager import diagnostics
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
 
         port = self.serial_port
         if not port:
@@ -855,8 +853,7 @@ class MonoImager:
         """
         from mono_imager import diagnostics
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
 
         port = self.serial_port
         if not port:
@@ -916,8 +913,7 @@ class MonoImager:
         from mono_imager.serial_device import SerialDevice
         import threading
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("  CLI Console — Serial")
         print()
 
@@ -932,8 +928,7 @@ class MonoImager:
             self.current_state = MenuState.MAIN
             return
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print(f"  Connecting to {port} at 115200 baud...")
         print()
 
@@ -1010,8 +1005,7 @@ class MonoImager:
         """Query and display Mono Gateway hardware statistics"""
         from mono_imager.serial_device import SerialDevice
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
 
         print("  Select device to query:")
         print()
@@ -1027,8 +1021,7 @@ class MonoImager:
             return
 
         # Query device
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print(f"  Connecting to {port}...")
         print()
 
@@ -1105,8 +1098,7 @@ class MonoImager:
         """
         from mono_imager import flash_orchestrator as core
 
-        self.clear_screen()
-        self.print_header()
+        self.print_screen_divider()
         print("  🔧 Setting up your device's network — this happens once per launch.")
         print("  You'll be asked to power-cycle in a moment, then the tool scans")
         print("  for a DHCP connection automatically — this needs a router or")
