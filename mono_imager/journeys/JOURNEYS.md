@@ -20,8 +20,8 @@ The resolved sequences for all current journeys:
 ```
 OPNsense + lan   →  8 steps
 OPNsense + usb   →  9 steps
-OpenWRT  + lan   →  6 steps
-OpenWRT  + usb   →  7 steps
+OpenWRT  + lan   →  5 steps
+OpenWRT  + usb   →  6 steps
 Armbian  + lan   →  6 steps
 Armbian  + usb   →  6 steps
 ```
@@ -128,7 +128,7 @@ VyOS flashes to the whole eMMC (`/dev/mmcblk0`) and reboots — identical to Arm
 ```python
 _FLASH_TARGETS = {
     "OPNsense": "/dev/mmcblk0",
-    "OpenWRT":  "/dev/mmcblk0p1",
+    "OpenWRT":  "/dev/mmcblk0",   # whole disk, per current doc
     "Armbian":  "/dev/mmcblk0",
     "VyOS":     "/dev/mmcblk0",   # ← add this
 }

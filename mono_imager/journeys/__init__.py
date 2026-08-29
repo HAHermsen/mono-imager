@@ -18,7 +18,7 @@ from pathlib import Path
 # Flash targets per OS — single source of truth used by journeys and tui.py
 _FLASH_TARGETS = {
     "OPNsense": "/dev/mmcblk0",
-    "OpenWRT":  "/dev/mmcblk0p1",
+    "OpenWRT":  "/dev/mmcblk0",
     "Armbian":  "/dev/mmcblk0",
 }
 

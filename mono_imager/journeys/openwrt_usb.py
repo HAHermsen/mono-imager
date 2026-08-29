@@ -5,19 +5,24 @@ Steps:
   1. Device network ready
   2. Mount USB stick
   3. Detect firmware file on USB
-  4. Partition eMMC (fdisk)
-  5. Flash OpenWRT image (dd)
-  6. Unmount USB stick
-  7. Firmware update (eMMC bootloader)
+  4. Flash OpenWRT image (dd) — two dd passes, same doc-matched scheme
+     as openwrt_lan.py: bs=512 count=8 (partition table) then
+     bs=1M skip=32 seek=32 (rest of image). No local staging needed
+     here (the image is already a file on the mounted USB stick), so
+     both passes just read it a second time via zcat/cat.
+  5. Unmount USB stick
+  6. Firmware update (eMMC bootloader)
 
 No automated final DIP-flip/boot-verify step — see openwrt_lan.py's
 module docstring. tui.py's own end-of-flash screen already prints the
 "flip DIP to eMMC, power-cycle" instruction whenever flash_success is
 True, so this journey ends after the firmware update.
 
-Image detection: scans USB for openwrt*.bin.gz / openwrt*.bin / openwrt*.img (case-insensitive).
-Sysupgrade .bin.gz format is handled on-device: extracts the 'root' ext4 member from the
-inner tar and writes it directly to the flash target.
+Image detection: scans USB for openwrt*.img / openwrt*.img.gz
+(case-insensitive). Sysupgrade .bin.gz support was DROPPED — see the
+"Revision note" in openwrt_lan.py's module docstring; that format has
+no partition table and doesn't fit the whole-disk model both OpenWRT
+journeys now use.
 
 U-Boot pre-step:
   Shared with the LAN journey — ensures 'recovery' is defined and
@@ -72,87 +77,76 @@ def step_firmware_on_usb(ctx: StepContext) -> bool:
     path, fmt = find_image_on_usb(ctx.device, ctx.usb_mount, OS)
     if not path:
         return step(0, "Firmware found on USB", False,
-                    "no OpenWRT image found — expected openwrt*.bin.gz, openwrt*.bin, or openwrt*.img")
+                    "no OpenWRT image found — expected openwrt*.img.gz or openwrt*.img")
     ctx.set("firmware_source", path)
     ctx.set("firmware_format", fmt)
     return step(0, f"Firmware found on USB ({path})", True)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready", "emmc_partitioned"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
+_STAGED_IMG = "/tmp/mono_imager_openwrt_usb.img"
+
+
+@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
 def step_flash_openwrt(ctx: StepContext) -> bool:
+    """
+    Decompresses to a local plain file first (if needed), then runs
+    both dd passes reading directly from that file — no zcat|dd or
+    cat|dd pipes into dd. Same reasoning as openwrt_lan.py's flash
+    step: a pipe can hand dd short reads, which for the exact-4KiB
+    partition-table pass (bs=512 count=8) is a correctness bug on
+    BusyBox dd, not just cosmetic — see that module's docstring for
+    the real-hardware finding this is based on. Reading a real local
+    file has no such short-read risk.
+    """
     d = ctx.device
     source = ctx.get("firmware_source")
     fmt    = ctx.get("firmware_format", "img")
 
-    if fmt in ("bin.gz", "bin"):
-        # OpenWRT sysupgrade: outer gzip wraps a tar with a 'root' member.
-        # The 'root' member is itself gzip-compressed (double-compressed).
-        # Extract root from tar → check first 2 bytes for gzip magic (1f8b) →
-        # if gzip, pipe through a second zcat before dd; otherwise dd directly.
-        decomp = "zcat" if fmt == "bin.gz" else "cat"
-        flash_script = (
-            f"SRC={source}; "
-            f"TMP=/tmp/mono_rootfs_raw; "
-            f"rm -f \"$TMP\"; "
-            # Find root member dynamically: handles bare 'root', './root', and
-            # 'PREFIX/root' layouts (e.g. sysupgrade-mono_gateway-dk/root).
-            # BusyBox head requires -n 1, not -1.
-            f"ROOT=$({decomp} \"$SRC\" | tar -t 2>/dev/null | grep -E '(^|/)root$' | head -n 1); "
-            f"[ -n \"$ROOT\" ] && {decomp} \"$SRC\" | tar -xOf - \"$ROOT\" 2>/dev/null > \"$TMP\"; "
-            f"if [ -s \"$TMP\" ]; then "
-            # gzip -t is more reliable than od magic bytes on BusyBox
-            f"  if gzip -t \"$TMP\" 2>/dev/null; then "
-            f"    zcat \"$TMP\" | dd of={ctx.flash_target} bs=4096 "
-            f"    > /tmp/mono_imager_flash.log 2>&1; "
-            f"  else "
-            f"    dd if=\"$TMP\" of={ctx.flash_target} bs=4096 "
-            f"    > /tmp/mono_imager_flash.log 2>&1; "
-            f"  fi; "
-            f"  rm -f \"$TMP\"; "
-            f"else "
-            f"  {decomp} \"$SRC\" | dd of={ctx.flash_target} bs=4096 "
-            f"  > /tmp/mono_imager_flash.log 2>&1; "
-            f"fi; "
-            f"sync; cat /tmp/mono_imager_flash.log"
-        )
-        console_logger.info("Flashing OpenWRT from USB (sysupgrade) — this takes several minutes...")
-    elif fmt == "img.gz":
-        flash_script = (
-            f"zcat {source} | dd of={ctx.flash_target} bs=4096 "
-            f"> /tmp/mono_imager_flash.log 2>&1; sync; "
-            f"cat /tmp/mono_imager_flash.log"
-        )
-        console_logger.info("Flashing OpenWRT from USB (gz | dd) — this takes several minutes...")
-    else:
-        flash_script = (
-            f"dd if={source} of={ctx.flash_target} bs=4096 "
-            f"> /tmp/mono_imager_flash.log 2>&1; sync; "
-            f"cat /tmp/mono_imager_flash.log"
-        )
-        console_logger.info("Flashing OpenWRT from USB — this takes several minutes...")
+    if fmt not in ("img", "img.gz"):
+        return step(0, "OpenWRT flash executed", False,
+                    f"unsupported format '{fmt}' — only raw -emmc.img / -emmc.img.gz accepted "
+                    "(sysupgrade .bin/.bin.gz is no longer supported)")
 
+    if fmt == "img.gz":
+        prep = f'rm -f {_STAGED_IMG}; gunzip -c "{source}" > {_STAGED_IMG} 2>/tmp/mono_imager_dl.log; '
+        img_path = _STAGED_IMG
+    else:
+        prep = ""
+        img_path = source  # already a real file on the USB stick — dd reads it directly
+
+    console_logger.info("Flashing OpenWRT — writing both dd passes...")
+    script = (
+        f"{prep}"
+        f'{{ dd if="{img_path}" of={ctx.flash_target} bs=512 count=8; '
+        f'dd if="{img_path}" of={ctx.flash_target} bs=1M skip=32 seek=32; }} '
+        f"> /tmp/mono_imager_flash.log 2>&1; "
+        f"sync; "
+        + (f"rm -f {_STAGED_IMG}; " if fmt == "img.gz" else "")
+        + "cat /tmp/mono_imager_flash.log"
+    )
     response, err = with_spinner(
-        d.run_script, flash_script, marker="flash_dd",
+        d.run_script, script, marker="flash_dd",
         exec_timeout=600, message="Flashing OpenWRT"
     )
     if err:
-        return step(0, "OpenWRT flash executed", False, str(err))
+        return step(0, "OpenWRT flash (dd, both passes)", False, str(err))
 
-    m = re.search(r"(\d+)\+(\d+)\s+records out", response)
-    if m:
-        full_records, partial_records = int(m.group(1)), int(m.group(2))
-        bytes_written = full_records * 4096 + partial_records
-    else:
-        full_records = partial_records = bytes_written = 0
+    matches = re.findall(r"(\d+)\+(\d+)\s+records out", response or "")
+    has_error = "error" in (response or "").lower() or "failed" in (response or "").lower()
 
-    has_real_data = bytes_written > 0
-    has_error     = "error" in response.lower() or "failed" in response.lower()
+    if len(matches) < 2:
+        return step(0, "OpenWRT flash (dd, both passes)", False,
+                    f"expected 2 'records out' lines, got {len(matches)}: {(response or '')[-300:]}")
 
-    step(0, "OpenWRT flash executed", True)
-    step(0, f"dd wrote data ({bytes_written // 1024} KB)", has_real_data,
-         response[-200:] if not has_real_data else "")
-    step(0, "No errors", not has_error, response[-200:] if has_error else "")
-    return has_real_data and not has_error
+    pt_bytes = int(matches[0][0]) * 512 + int(matches[0][1])
+    bulk_bytes = int(matches[1][0]) * 1024 * 1024 + int(matches[1][1])
+
+    step(0, "OpenWRT partition table (dd bs=512 count=8)", pt_bytes > 0,
+         response[-200:] if pt_bytes == 0 else "")
+    ok = pt_bytes > 0 and bulk_bytes > 0 and not has_error
+    step(0, f"OpenWRT image (dd bs=1M skip=32 seek=32, {bulk_bytes // 1024 // 1024} MB)",
+         ok, response[-200:] if not ok else "")
+    return ok
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")

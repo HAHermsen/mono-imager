@@ -1,19 +1,39 @@
 """
 mono-imager journey: OpenWRT via LAN
 
-Follows the official documented procedure
-(docs.mono.si / we-are-mono/docs "Installing OpenWRT") instead of the
-previous NOR-stays-boot-source shortcut: eMMC's own firmware/bootloader
-region gets genuinely refreshed and DIP ends up parked on eMMC, verified,
-rather than relying on NOR forever.
+Follows docs.mono.si "Installing OpenWRT" (2026 revision) exactly:
+the eMMC's factory GPT (partition 1 = boot @32MiB, partition 2 =
+rootfs @96MiB) is never repartitioned — the whole-disk image is
+written with two dd passes that recreate the image's own GPT/boot
+region while leaving Mono's firmware region (4KiB-32MiB) untouched.
+
+  Revision note (see git log): earlier versions of this journey used
+  a different, doc-mismatched scheme — fdisk'ing a single MBR
+  partition at 32MiB and flashing only /dev/mmcblk0p1. That has been
+  replaced to match the current doc exactly. Support for flashing
+  OpenWRT sysupgrade.bin.gz tarballs (kernel+rootfs only, no GPT) has
+  been DROPPED — that format has no partition table and doesn't fit
+  the whole-disk model. Only the raw `*-emmc.img` / `*-emmc.img.gz`
+  release image is accepted now.
 
 Steps:
   1. Device network ready
   2. Start HTTP server
   3. Verify firmware reachable
-  4. Partition eMMC (fdisk)
-  5. Flash OpenWRT image (dd bs=4096)
-  6. Firmware update (eMMC bootloader) — refreshes eMMC's own firmware
+  4. Flash OpenWRT image — two dd passes, per doc step 3:
+       a) bs=512 count=8   → first 4KiB (partition table) to /dev/mmcblk0
+       b) bs=1M skip=32 seek=32 → rest of image, 32MiB onward
+     Image is downloaded to a local file on-device first, then both
+     dd passes read that plain file directly (no curl|dd or gunzip|dd
+     pipes into dd) — matching Mono's own vendor-documented procedure.
+     A real-hardware finding already recorded in flash_orchestrator.py
+     (FLASH_SIZE_CAP comment) found piping curl straight into dd
+     produces all-partial-record reads; for this journey's exact-4KiB
+     partition-table pass that would be a correctness bug on BusyBox
+     dd (count= counts read() calls, not bytes), not just cosmetic
+     log noise. OpenWRT images are ~100MB against recovery Linux's
+     confirmed ~3.8GB tmpfs rootfs, so staging fits comfortably.
+  5. Firmware update (eMMC bootloader) — refreshes eMMC's own firmware
      region (QSPI/boot area) while still NOR-booted, per doc step 7.
 
 No automated final DIP-flip/boot-verify step: real-hardware testing
@@ -28,9 +48,10 @@ produce a false failure.
 
 U-Boot pre-step:
   Ensures the 'recovery' U-Boot env variable is defined before
-  boot_recovery() calls 'run recovery', and sets the official 'emmc' +
-  'bootcmd' pair (ext4load /boot/kernel.itb && bootm, falling back to
-  'run recovery' if that ever fails) — no extlinux.conf file needed.
+  boot_recovery() calls 'run recovery', and sets the official 'openwrt'
+  + 'bootcmd' pair per doc step 4 (booti with kernel_addr_r/fdt_addr_r
+  via the 'emmc_load' env var, falling back to 'run recovery' if that
+  ever fails).
 
   On factory-fresh devices, 'recovery' is already in NOR env — nothing to do.
 
@@ -39,20 +60,24 @@ U-Boot pre-step:
   that U-Boot stores at a second NOR offset.  The recovery KERNEL is always
   safe in NOR flash — only the pointer variable in NOR env can go missing.
 
-  OpenWRT is written to /dev/mmcblk0p1 (partition only).  NOR flash is
-  never touched by the flash step itself — only by the firmware-update
-  step, which is the official procedure's whole point.
+  ASSUMPTION NOT YET VERIFIED ON HARDWARE: this relies on 'emmc_load'
+  being present in the factory U-Boot env, same as 'recovery'. Unlike
+  'recovery', there is no restore-from-NOR-backup handling for
+  'emmc_load' here yet — if a device has had 'env default -a' run and
+  it's missing 'emmc_load' too, boot will fail after a clean flash.
+  Add the same backup-restore treatment here if that turns out to
+  matter in the field.
+
+  NOR flash (4KiB-32MiB) is never touched by the flash step itself —
+  only by the firmware-update step, which is the official procedure's
+  whole point.
 
 Author:  H.A. Hermsen
 License: GPLv3
 """
 
-import gzip
 import logging
 import re
-import shutil
-import tarfile
-import tempfile
 from pathlib import Path
 
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
@@ -65,20 +90,20 @@ from mono_imager.journeys import _common  # noqa: F401 — registers "Device net
 logger = logging.getLogger(__name__)
 
 OS       = "OpenWRT"
-FIRMWARE_PROMPT = "Type the full path (or drag-n-drop) of the OpenWRT .img or .bin.gz file:"
+FIRMWARE_PROMPT = "Type the full path (or drag-n-drop) of the OpenWRT -emmc.img or -emmc.img.gz file:"
 TRANSFER = "lan"
 
-# Official U-Boot boot mechanism, per docs.mono.si "Installing OpenWRT" step 5:
-# a self-contained 'emmc' command (ext4load kernel.itb + bootm) with bootcmd
-# falling back to 'run recovery' if the eMMC boot ever fails. Replaces the
-# previous sysboot+extlinux.conf approach — no extra boot-config file needed
-# on the eMMC partition, and NOR stays self-healing if eMMC boot ever fails.
+# Official U-Boot boot mechanism, per docs.mono.si "Installing OpenWRT" step 4:
+# a self-contained 'openwrt' command (run emmc_load && booti) with bootcmd
+# falling back to 'run recovery' if the eMMC boot ever fails. 'emmc_load' is
+# assumed to be a pre-existing factory env var (loads kernel+fdt from the
+# boot partition into kernel_addr_r/fdt_addr_r) — see the ASSUMPTION note
+# in the module docstring above.
 _UBOOT_SET_EMMC_CMD = (
-    "setenv emmc 'setenv bootargs \"${bootargs_console} boot_medium=emmc "
-    "root=/dev/mmcblk0p1 rw rootwait rootfstype=ext4 ${bootargs_hwtest}\"; "
-    "ext4load mmc 0:1 ${kernel_addr_r} /boot/kernel.itb && bootm ${kernel_addr_r}'"
+    "setenv openwrt 'setenv bootargs \"${bootargs_console} boot_medium=emmc "
+    "root=/dev/mmcblk0p2 rootwait\"; run emmc_load && booti ${kernel_addr_r} - ${fdt_addr_r}'"
 )
-_UBOOT_SET_BOOTCMD_CMD = 'setenv bootcmd "run emmc || run recovery"'
+_UBOOT_SET_BOOTCMD_CMD = "setenv bootcmd 'run openwrt || run recovery'"
 
 
 
@@ -338,98 +363,17 @@ def _uboot_steps_openwrt_lan(device) -> bool:
 register_uboot_steps(OS, TRANSFER, _uboot_steps_openwrt_lan)
 
 
-def _extract_sysupgrade_rootfs(firmware_path: Path) -> tuple[Path, bool]:
-    """
-    Detect and extract the raw ext4 rootfs from an OpenWRT sysupgrade.bin.gz.
-
-    OpenWRT sysupgrade images are NOT raw partition images — they are a
-    gzip-compressed tar archive (tar.gz) whose 'root' member is the actual
-    ext4 image.  Writing the .bin.gz directly through gunzip|dd puts a
-    tar.gz stream on the partition instead of an ext4 filesystem, which is
-    why U-Boot ext4load says "Can't set block device" afterwards.
-
-    Returns (extracted_temp_path, True) when the input is a sysupgrade tar.
-    Returns (original_path, False) for raw images (.img, .img.gz, etc.) so
-    the caller can still gunzip+dd those in the normal way.
-    """
-    name = firmware_path.name.lower()
-    if not name.endswith(".bin.gz") and not name.endswith(".bin"):
-        return firmware_path, False
-
-    def _find_root_in_tar(tf: tarfile.TarFile) -> Path | None:
-        for member in tf.getmembers():
-            if member.name == "root" or member.name.endswith("/root"):
-                f = tf.extractfile(member)
-                if f is None:
-                    continue
-                tmp = tempfile.NamedTemporaryFile(
-                    suffix=".ext4", delete=False,
-                    dir=None,  # system temp dir, not alongside firmware file
-                )
-                tmp_path = Path(tmp.name)
-                try:
-                    try:
-                        # Try gzip decompression first (LS1046A sysupgrade format:
-                        # gzip(tar(kernel, root_gz)) — ext4 is gzip-compressed inside tar)
-                        with gzip.open(f) as gz:
-                            shutil.copyfileobj(gz, tmp)
-                    except (gzip.BadGzipFile, OSError):
-                        f.seek(0)
-                        shutil.copyfileobj(f, tmp)
-                    # Validate ext4 superblock magic (offset 0x438, little-endian 0xEF53)
-                    tmp.seek(0x438)
-                    magic = tmp.read(2)
-                    if len(magic) < 2 or magic != b'\x53\xef':
-                        logger.warning(f"Extracted 'root' member failed ext4 magic check (got {magic!r})")
-                        tmp.close()
-                        tmp_path.unlink(missing_ok=True)
-                        return None
-                    tmp.close()
-                    return tmp_path
-                except Exception:
-                    tmp.close()
-                    tmp_path.unlink(missing_ok=True)
-                    raise
-        return None
-
-    # Stream outer.gz -> inner.gz -> tar without loading full image into RAM
-    try:
-        with gzip.open(firmware_path, "rb") as outer:
-            try:
-                with gzip.open(outer) as inner_gz:
-                    with tarfile.open(fileobj=inner_gz) as tf:
-                        result = _find_root_in_tar(tf)
-                        if result:
-                            return result, True
-            except (OSError, gzip.BadGzipFile, tarfile.TarError):
-                pass
-    except (OSError, gzip.BadGzipFile):
-        return firmware_path, False
-
-    # Fallback: outer.gz -> plain tar (unusual but possible)
-    try:
-        with gzip.open(firmware_path, "rb") as outer:
-            with tarfile.open(fileobj=outer) as tf:
-                result = _find_root_in_tar(tf)
-                if result:
-                    return result, True
-    except (OSError, gzip.BadGzipFile, tarfile.TarError):
-        pass
-
-    return firmware_path, False
+# NOTE: sysupgrade.bin.gz support (extracting the raw ext4 'root' member
+# from an OpenWRT sysupgrade tarball) was dropped here — that format has
+# no partition table and doesn't fit the whole-disk-with-GPT model this
+# journey now uses. Only the raw `*-emmc.img[.gz]` release image is
+# accepted. See module docstring "Revision note".
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["http_server_up"], label="Start HTTP server")
 def step_http_server_start(ctx: StepContext) -> bool:
     verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
-    serve_path, extracted = _extract_sysupgrade_rootfs(Path(ctx.firmware_path))
-    if extracted:
-        verbose(f"  Sysupgrade format detected — extracted rootfs to {serve_path.name}")
-        ctx.set("serve_raw_ext4", True)   # flash step must NOT gunzip
-        ctx.set("extracted_rootfs", str(serve_path))
-    else:
-        serve_path = Path(ctx.firmware_path)
-        ctx.set("serve_raw_ext4", False)
+    serve_path = Path(ctx.firmware_path)
     try:
         server = start_http_server(ctx.host_ip, ctx.http_port, serve_path)
         if server:
@@ -460,118 +404,99 @@ def step_firmware_reachable(ctx: StepContext) -> bool:
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
 
 
-@register_step(
-    os=[OS], transfer=["lan", "usb"],
-    requires=[], produces=["emmc_partitioned"],
-    label="Partition eMMC (fdisk)"
-)
-def step_partition_emmc(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Partition eMMC"); verbose("=" * 60)
-    d = ctx.device
-    base = re.sub(r'p\d+$', '', ctx.flash_target)  # /dev/mmcblk0p1 → /dev/mmcblk0
-    try:
-        response, _fdisk_err = with_spinner(
-            d.send_command,
-            f"printf 'o\\nn\\np\\n\\n65536\\n\\nw\\n' | fdisk {base} 2>&1; echo RC=$?",
-            timeout=30,
-            message="Partitioning eMMC..."
-        )
-        if _fdisk_err:
-            raise _fdisk_err
-        ok = "RC=0" in response
-        if ok:
-            d.send_command(
-                f"partprobe {base} 2>/dev/null || blockdev --rereadpt {base} 2>/dev/null || true",
-                timeout=10
-            )
-        return step(0, f"eMMC partitioned ({ctx.flash_target}, first sector 65536)", ok,
-                   response[-200:] if not ok else "")
-    except Exception as e:
-        return step(0, "eMMC partition table", False, str(e))
+# No fdisk/partition step: the doc's own two dd passes recreate the
+# image's embedded GPT (first 4KiB) on every flash, so the eMMC never
+# needs a separate partitioning step and is never left in a state that
+# depends on whatever partition table an earlier OS (OPNsense/Armbian,
+# which both flash-whole-disk-from-0) may have left behind.
+
+# Local staging path for the decompressed image on-device. OpenWRT
+# images are ~100MB (usb_utils.py docstring) against recovery Linux's
+# confirmed ~3.8GB tmpfs rootfs (see flash_orchestrator.py's
+# FLASH_SIZE_CAP comment, ≈3.0GB safe cap) — comfortably below it, so
+# no separate size check is done here the way the >3GB OPNsense/Armbian
+# path does.
+_STAGED_IMG = "/tmp/mono_imager_openwrt.img"
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready", "emmc_partitioned"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
+@register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OpenWRT image (dd)")
 def step_flash_openwrt(ctx: StepContext) -> bool:
+    """
+    Downloads the image to a local file on-device, then runs both dd
+    passes against that plain local file — no curl|dd or gunzip|dd
+    pipes into dd at all.
+
+    This mirrors Mono's own vendor-documented procedure (wget once,
+    dd twice from the local file) rather than streaming, per a
+    real-hardware finding already recorded elsewhere in this codebase
+    (flash_orchestrator.py, FLASH_SIZE_CAP comment): piping curl
+    directly into dd produces all-partial-record reads ("0+N records",
+    zero full records), because a pipe never delivers clean
+    fixed-size blocks regardless of bs. For the bulk pass that was
+    only confusing (verified working via mounted-filesystem check on
+    real hardware), but for this journey's exact-4KiB partition-table
+    pass it would be a correctness bug, not just cosmetic: BusyBox dd
+    counts each read() as one record toward `count=`, so a
+    short/partial read could let `count=8` finish with fewer than
+    4096 bytes actually written — a truncated, invalid GPT.
+    """
     verbose("=" * 60); verbose("Flash OpenWRT image"); verbose("=" * 60)
     d = ctx.device
     source = ctx.get("firmware_source")
+    is_gz = str(ctx.firmware_path).lower().endswith(".gz")
 
-    # serve_raw_ext4=True means the HTTP server is already serving the raw
-    # ext4 partition image (extracted from the sysupgrade tar on the host).
-    # In that case we must NOT gunzip on the device — the file is already
-    # uncompressed.  For plain .img or .img.gz the normal logic applies.
-    serve_raw = ctx.get("serve_raw_ext4", False)
+    staged_gz = _STAGED_IMG + ".gz"
+    download_step = (
+        f"curl -sk -o {staged_gz if is_gz else _STAGED_IMG} {source} "
+        f"> /tmp/mono_imager_dl.log 2>&1; "
+    )
+    decompress_step = f"gunzip -f {staged_gz}; " if is_gz else ""
 
-    if serve_raw:
-        # Raw ext4 served directly — stream into dd, no gunzip
-        flash_script = (
-            f"{{ curl -sk {source} | "
-            f"dd of={ctx.flash_target} bs=4096; }} "
-            f"> /tmp/mono_imager_step07_flash.log 2>&1; "
-            f"sync; "
-            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
-            f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
-            f">/dev/null 2>&1"
-        )
-        console_logger.info("Flashing OpenWRT (raw ext4) — this takes several minutes...")
-    elif str(ctx.firmware_path).lower().endswith(".gz"):
-        flash_script = (
-            f"{{ curl -sk {source} | gunzip -c | "
-            f"dd of={ctx.flash_target} bs=4096; }} "
-            f"> /tmp/mono_imager_step07_flash.log 2>&1; "
-            f"sync; "
-            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
-            f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
-            f">/dev/null 2>&1"
-        )
-        console_logger.info("Flashing OpenWRT (gz streaming) — this takes several minutes...")
-    else:
-        flash_script = (
-            f"curl -sk -o /tmp/mono_imager_firmware.img {source} "
-            f"> /tmp/mono_imager_step07_flash.log 2>&1; "
-            f"dd if=/tmp/mono_imager_firmware.img of={ctx.flash_target} bs=4096 "
-            f">> /tmp/mono_imager_step07_flash.log 2>&1; "
-            f"sync; "
-            f"rm -f /tmp/mono_imager_firmware.img; "
-            f"curl -sk -X POST --data-binary @/tmp/mono_imager_step07_flash.log "
-            f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=07\" "
-            f">/dev/null 2>&1"
-        )
-        console_logger.info("Flashing OpenWRT — this takes several minutes...")
+    script = (
+        f"rm -f {_STAGED_IMG} {staged_gz}; "
+        f"{download_step}"
+        f"{decompress_step}"
+        f"{{ "
+        f"dd if={_STAGED_IMG} of={ctx.flash_target} bs=512 count=8; "
+        f"dd if={_STAGED_IMG} of={ctx.flash_target} bs=1M skip=32 seek=32; "
+        f"}} > /tmp/mono_imager_flash.log 2>&1; "
+        f"sync; "
+        f"rm -f {_STAGED_IMG}; "
+        f"curl -sk -X POST --data-binary @/tmp/mono_imager_flash.log "
+        f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=flash\" >/dev/null 2>&1"
+    )
 
     try:
-        try:
-            d.launch_script(flash_script, marker="step07_flash")
-        except Exception as e:
-            return step(0, "OpenWRT flash launched", False, str(e))
+        d.launch_script(script, marker="flash")
+    except Exception as e:
+        return step(0, "OpenWRT flash launched", False, str(e))
 
-        raw, err = with_spinner(wait_for_report, "07", timeout=600.0, message="Flashing OpenWRT")
-        if err or raw is None:
-            return step(0, "OpenWRT flash (dd)", False,
-                        str(err) if err else "no report-back from device in 600s")
+    console_logger.info("Flashing OpenWRT — downloading, then writing both dd passes...")
+    raw, err = with_spinner(wait_for_report, "flash", timeout=600.0, message="Flashing OpenWRT")
+    if err or raw is None:
+        return step(0, "OpenWRT flash (dd)", False,
+                    str(err) if err else "no report-back from device in 600s")
 
-        # Count actual records written — "0+0 records out" still contains
-        # "records out" and used to pass the old check despite writing nothing.
-        m = re.search(r"(\d+)\+(\d+)\s+records out", raw)
-        if m:
-            full_records, partial_records = int(m.group(1)), int(m.group(2))
-            bytes_written = full_records * 4096 + partial_records  # approx
-        else:
-            full_records = partial_records = bytes_written = 0
+    # Two dd calls -> two "records out" lines in the combined log.
+    matches = re.findall(r"(\d+)\+(\d+)\s+records out", raw)
+    has_error = "error" in raw.lower() or "failed" in raw.lower() or "not in" in raw.lower() \
+        or "no space" in raw.lower()
 
-        has_real_data = bytes_written > 0
-        has_error = "error" in raw.lower() or "failed" in raw.lower() or "not in" in raw.lower()
+    if len(matches) < 2:
+        return step(0, "OpenWRT flash (dd, both passes)", False,
+                    f"expected 2 'records out' lines, got {len(matches)}: {raw[-300:]}")
 
-        step(0, "OpenWRT flash executed", True)
-        step(0, f"dd wrote data ({bytes_written // 1024} KB)", has_real_data,
-             raw[-200:] if not has_real_data else "")
-        step(0, "No errors", not has_error, raw[-200:] if has_error else "")
-        return has_real_data and not has_error
-    finally:
-        if ctx.get("serve_raw_ext4"):
-            extracted = ctx.get("extracted_rootfs")
-            if extracted:
-                Path(extracted).unlink(missing_ok=True)
+    pt_full, pt_partial = int(matches[0][0]), int(matches[0][1])
+    pt_bytes = pt_full * 512 + pt_partial
+    bulk_full, bulk_partial = int(matches[1][0]), int(matches[1][1])
+    bulk_bytes = bulk_full * 1024 * 1024 + bulk_partial
+
+    step(0, "OpenWRT partition table (dd bs=512 count=8)", pt_bytes > 0,
+         raw[-200:] if pt_bytes == 0 else "")
+    ok = pt_bytes > 0 and bulk_bytes > 0 and not has_error
+    step(0, f"OpenWRT image (dd bs=1M skip=32 seek=32, {bulk_bytes // 1024 // 1024} MB)",
+         ok, raw[-200:] if not ok else "")
+    return ok
 
 
 @register_step(
@@ -586,7 +511,7 @@ def step_firmware_update(ctx: StepContext) -> bool:
         response, _fw_err = with_spinner(
             d.send_command,
             "printf 'yes\\n' | firmware update 2>&1; echo RC=$?",
-            timeout=120,
+            timeout=300,
             message="Updating eMMC bootloader (firmware update)..."
         )
         if _fw_err:

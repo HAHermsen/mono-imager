@@ -4,7 +4,7 @@ Shared USB helpers for mono-imager USB flash journeys.
 Images are located by lowercased filename pattern — original vendor-named
 files work directly, no renaming needed:
     Armbian_26.2.5_Gateway-dk_resolute_current_6.12.49_minimal.img.xz
-    openwrt-layerscape-armv8_64b-mono_gateway-dk-ext4-sysupgrade.bin.gz
+    openwrt-layerscape-armv8_64b-mono_gateway-dk-ext4-emmc.img.gz
     OPNsense-26.1.5-arm-aarch64-GATEWAY.img.bz2
 
 Recommended minimum USB stick size: 16 GB.
@@ -29,8 +29,6 @@ _PATTERNS = {
         ("armbian", ".img",    "img"),
     ],
     "OpenWRT": [
-        ("openwrt", ".bin.gz", "bin.gz"),
-        ("openwrt", ".bin",    "bin"),
         ("openwrt", ".img.gz", "img.gz"),
         ("openwrt", ".img",    "img"),
     ],
@@ -81,7 +79,7 @@ def find_image_on_usb(device, usb_mount: str, os_name: str):
     comparison).
 
     Returns (filepath, format_tag) on success, (None, None) if not found.
-    format_tag is one of: 'img', 'img.xz', 'bin.gz', 'bin', 'img.gz', 'img.bz2'
+    format_tag is one of: 'img', 'img.xz', 'img.gz', 'img.bz2'
     """
     patterns = _PATTERNS.get(os_name)
     if not patterns:
@@ -116,7 +114,7 @@ def find_image_on_usb(device, usb_mount: str, os_name: str):
         verbose(f"  ⚠ USB image scan failed: {e}", "warning")
         return None, None
 
-    valid_tags = {"img", "img.xz", "bin.gz", "bin", "img.gz", "img.bz2"}
+    valid_tags = {"img", "img.xz", "img.gz", "img.bz2"}
     for line in raw.splitlines():
         line = line.strip()
         if line == "NOT_FOUND":
