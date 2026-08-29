@@ -4,8 +4,6 @@ Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway D
 
 Version: **1.3.0** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
-> This is the `poc/continous_cli_menu` branch — a trial of a scrolling-transcript CLI (see "Screen behavior" below) in place of the previous clear-and-redraw menu system. Not yet merged to `main`.
-
 ---
 
 ## What it does
