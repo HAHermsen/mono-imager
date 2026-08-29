@@ -10,7 +10,8 @@ License: GPLv3
 """
 
 from mono_imager.step_registry import register_step, StepContext, ALL_OS
-from mono_imager.flash_orchestrator import step, verbose
+from mono_imager.flash_orchestrator import step, verbose, start_http_server, wait_for_report
+from mono_imager.spinner import with_spinner
 
 
 def _step_network_ready(ctx: StepContext) -> bool:
@@ -55,3 +56,51 @@ register_step(
     requires=[], produces=["network_up"],
     label="Device network ready",
 )(_step_network_ready)
+
+
+# --- Shared LAN steps ---------------------------------------------------
+# Not auto-registered here (unlike _step_network_ready above) because
+# requires= varies per journey — e.g. OPNsense's HTTP-server step also
+# gates on "dip_confirmed_nor", which the others don't have. Each LAN
+# journey file registers these explicitly:
+#
+#   register_step(os=[OS], transfer=[TRANSFER], requires=[...],
+#                 produces=["http_server_up"], label="Start HTTP server"
+#   )(_common._step_http_server_start)
+
+def _step_http_server_start(ctx: StepContext) -> bool:
+    """Serve ctx.firmware_path over HTTP for the device to curl from."""
+    try:
+        server = start_http_server(ctx.host_ip, ctx.http_port, ctx.firmware_path)
+        if server:
+            ctx.set("http_server", server)
+            return step(0, f"HTTP server up ({ctx.host_ip}:{ctx.http_port})", True)
+        return step(0, "HTTP server start", False)
+    except Exception as e:
+        return step(0, "HTTP server start", False, str(e))
+
+
+def _step_firmware_reachable(ctx: StepContext) -> bool:
+    """
+    Confirm the device can reach the host's firmware HTTP server before
+    committing to a flash. One HEAD request run on the device (curl -I),
+    reported back over TCP/IP rather than read from serial — see
+    flash_orchestrator.phase3_flash()'s Step 09 comment for why: a HEAD
+    avoids downloading the whole image just to check reachability, and
+    TCP/IP report-back is the reliable channel vs. serial-echo readback.
+    """
+    url = f"http://{ctx.host_ip}:{ctx.http_port}/firmware.img"
+    ctx.set("firmware_source", url)
+    check_script = (
+        f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
+        f"> /tmp/mono_imager_step06_code.txt; "
+        f"curl -sk -X POST --data-binary @/tmp/mono_imager_step06_code.txt "
+        f"\"http://{ctx.host_ip}:{ctx.http_port}/report?step=06\" >/dev/null 2>&1"
+    )
+    try:
+        ctx.device.launch_script(check_script, marker="step06_reachable")
+    except Exception as e:
+        return step(0, f"Firmware reachable ({url})", False, str(e))
+    check, _rep_err = with_spinner(wait_for_report, "06", timeout=20.0, message="Verifying firmware reachable...")
+    ok = check is not None and "200" in check
+    return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")
