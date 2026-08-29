@@ -82,6 +82,32 @@ def print_header(version: str, author: str, device_net: Optional[dict]) -> None:
     print()
 
 
+def print_status_line(version: str, device_net: Optional[dict]) -> None:
+    """
+    Compact one-line stand-in for print_header(), for screens that scroll
+    rather than clear-and-redraw (see menu_main() for the first use of
+    this pattern). Carries the same live device-network summary as the
+    boxed header, just without the box — printed fresh above each
+    prompt instead of persisting via a fixed on-screen region, since
+    this codebase has no TUI framework/terminal-region handling and
+    deliberately avoids relying on advanced terminal features (see
+    print_header()'s ASCII-not-Unicode comment above for the same
+    reasoning applied to a different problem).
+    """
+    if device_net:
+        dns_note = f" (DNS {device_net['dns']})" if device_net.get("dns") else ""
+        network_summary = (
+            f"{device_net['ip']}/{device_net['prefix']} via {device_net['gateway']}"
+            f"{dns_note} - {device_net['source']}"
+        )
+    else:
+        network_summary = "network not yet detected"
+    # Plain ASCII separator, not an em-dash: same reasoning as
+    # print_header()'s box characters above — a stock Windows console
+    # outside a UTF-8 codepage mangles non-ASCII punctuation too.
+    print(f"mono-imager {version} - {network_summary}")
+
+
 def check(results: list, label: str, passed: bool, detail: str = "") -> bool:
     """Record pass/fail in results and print a status line."""
     mark = "✓" if passed else "✗"

@@ -355,9 +355,19 @@ class MonoImager:
     #  1. MAIN MENU                                                        #
     # ------------------------------------------------------------------ #
     def menu_main(self):
-        """Main menu — action first"""
-        self.clear_screen()
-        self.print_header()
+        """
+        Main menu — action first.
+
+        PoC (branch poc/continous_cli_menu): scrolling output instead of
+        clear-and-redraw. No self.clear_screen()/self.print_header() here
+        on purpose — every other menu still clears the screen; only this
+        one screen is being trialled as an append-only transcript, with
+        a one-line status recap (console.print_status_line) standing in
+        for the boxed header.
+        """
+        print()
+        print("-" * 60)
+        console.print_status_line(__version__, self.device_net)
         print("What would you like to do?")
         print()
         print("  1) Flash OS")
