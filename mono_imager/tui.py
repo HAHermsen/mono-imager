@@ -901,7 +901,7 @@ class MonoImager:
             verbose(f"📄 Report saved to: {self.log_file}")
             print(f"  📄 Report: {self.log_file}")
             print()
-        input("Press Enter to return to main menu...")
+        input("Press Enter to continue...")
         self.flash_success = False
         self.current_state = MenuState.MAIN
 
@@ -940,7 +940,7 @@ class MonoImager:
             return
 
         print("  ✓ Connected — you are now in raw serial console.")
-        print("  Type Ctrl+] to exit.")
+        print("  Type Ctrl+] to exit the console.")
         print()
 
         # Drain any leftover bytes from connect()'s own internal probe,
@@ -1060,7 +1060,7 @@ class MonoImager:
             print(f"  ❌ Error: {e}")
 
         print()
-        input("  Press Enter to return to main menu...")
+        input("  Press Enter to continue...")
         self.current_state = MenuState.MAIN
 
     def _display_device_stats(self, raw_output: str):

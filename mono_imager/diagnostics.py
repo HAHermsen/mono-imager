@@ -51,7 +51,7 @@ def test_serial(port: str) -> bool:
     d = SerialDevice(port, timeout=5)
     connected = console.check(results, "Connect at 115200 baud", d.connect(115200))
     if not connected:
-        input("\n  Press Enter to return to main menu...")
+        input("\n  Press Enter to continue...")
         return False
 
     try:
@@ -68,7 +68,7 @@ def test_serial(port: str) -> bool:
             autoboot_ok = False
         console.check(results, "U-Boot autoboot interrupted", bool(autoboot_ok))
         if not results[-1]:
-            input("\n  Press Enter to return to main menu...")
+            input("\n  Press Enter to continue...")
             return connected
 
         response = d.send_command("printenv ethact", timeout=5)
@@ -113,7 +113,7 @@ def test_serial(port: str) -> bool:
     else:
         print(f"  ✗  {total - passed}/{total} checks failed.")
 
-    input("\n  Press Enter to return to main menu...")
+    input("\n  Press Enter to continue...")
     return connected
 
 
@@ -156,17 +156,17 @@ def test_lan(
 
     d = phase1_bootstrap(port, 115200)
     if not console.check(results, "Device in recovery shell", d is not None):
-        input("\n  Press Enter to return to main menu...")
+        input("\n  Press Enter to continue...")
         return None
 
     try:
         host_ip = host_ip or detect_host_ip()
         if not console.check(results, "Host IP detected", bool(host_ip), host_ip or "could not detect"):
-            input("\n  Press Enter to return to main menu...")
+            input("\n  Press Enter to continue...")
             return None
 
         if not console.check(results, "Device network ready", setup_network(d)):
-            input("\n  Press Enter to return to main menu...")
+            input("\n  Press Enter to continue...")
             return None
         device_net = get_device_net() or {}
         device_ip = device_net.get("ip")
@@ -178,7 +178,7 @@ def test_lan(
         server = start_http_server(host_ip, http_port, tmp)
         if not console.check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
             tmp.unlink(missing_ok=True)
-            input("\n  Press Enter to return to main menu...")
+            input("\n  Press Enter to continue...")
             return None
 
         url = f"http://{host_ip}:{http_port}/firmware.img"
@@ -222,7 +222,7 @@ def test_lan(
     else:
         print(f"  ✗  {total - passed_count}/{total} checks failed.")
 
-    input("\n  Press Enter to return to main menu...")
+    input("\n  Press Enter to continue...")
     return {"serial_port": port, "host_ip": host_ip, "device_ip": device_ip}
 
 
@@ -249,7 +249,7 @@ def test_usb(port: str) -> bool:
 
     d = phase1_bootstrap(port, 115200)
     if not console.check(results, "Device in recovery shell", d is not None):
-        input("\n  Press Enter to return to main menu...")
+        input("\n  Press Enter to continue...")
         return False
 
     usb_device = "/dev/sda"
@@ -274,7 +274,7 @@ def test_usb(port: str) -> bool:
 
         if not console.check(results, f"USB mounted ({usb_device} -> {usb_mount})", mounted,
                               "" if mounted else "no USB stick detected, or it's not FAT32/exFAT formatted"):
-            input("\n  Press Enter to return to main menu...")
+            input("\n  Press Enter to continue...")
             return False
 
         check_usb_size(d, usb_mount)
@@ -310,5 +310,5 @@ def test_usb(port: str) -> bool:
     else:
         print(f"  ✗  {total - passed_count}/{total} checks failed.")
 
-    input("\n  Press Enter to return to main menu...")
+    input("\n  Press Enter to continue...")
     return mounted
