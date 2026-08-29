@@ -764,7 +764,7 @@ class MonoImager:
         self._recovery_finish(rec.print_report())
 
     # ------------------------------------------------------------------ #
-    #  TEST SERIAL — option 4 from main menu                             #
+    #  TEST SERIAL — option 5 from main menu                             #
     # ------------------------------------------------------------------ #
     def menu_test_serial(self):
         """
@@ -799,7 +799,7 @@ class MonoImager:
 
 
     # ------------------------------------------------------------------ #
-    #  TEST LAN — option 5 from main menu                                #
+    #  TEST LAN — option 6 from main menu                                #
     # ------------------------------------------------------------------ #
     def menu_test_lan(self):
         """
@@ -887,7 +887,7 @@ class MonoImager:
             print("  It will boot with the new firmware.")
             print()
             print("  💡 Tip: You can watch it boot live via")
-            print("     option 3 (CLI / raw serial console) from the main menu.")
+            print("     option 4 (CLI / raw serial console) from the main menu.")
         else:
             print("❌ Flashing did not complete successfully.")
             print()
