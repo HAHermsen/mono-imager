@@ -45,6 +45,7 @@ from typing import Optional, Callable
 
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner
+from mono_imager.step_tracker import StepTracker
 
 logger = logging.getLogger(__name__)
 # Must match logging_setup.py's "mono_imager.console" exactly — that's the
@@ -59,22 +60,18 @@ console_logger = logging.getLogger("mono_imager.console")
 
 # --- Result tracker (ISOLATED from flash_orchestrator.results — see
 #     module docstring for why) -----------------------------------------
+# Bookkeeping itself (format/log/accumulate) is shared via StepTracker —
+# see step_tracker.py's module docstring — but this module keeps its own
+# instance/list, same isolation as before.
 
-results: list[tuple[int, str, bool, str]] = []
+_tracker = StepTracker(logger, console_logger, auto_number=False)
+results  = _tracker.results
 
 def reset_results():
     """Clear accumulated step results before a new recovery attempt."""
-    results.clear()
+    _tracker.reset()
 
-def step(num: int, description: str, passed: bool, reason: str = ""):
-    mark = "✓" if passed else "✗"
-    file_msg = f"Step {num:02d}: {'✓ PASS' if passed else '✗ FAIL'} — {description}"
-    if reason:
-        file_msg += f" ({reason})"
-    logger.info(file_msg) if passed else logger.error(file_msg)
-    console_logger.info(f"  {mark} {description}")
-    results.append((num, description, passed, reason))
-    return passed
+step = _tracker.step
 
 
 # --- Firmware URLs (per documented "Manual flashing (legacy)" section) ------

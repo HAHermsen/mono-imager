@@ -24,7 +24,6 @@ License: GPLv3
 
 __author__  = "H.A. Hermsen"
 
-import itertools
 import logging
 import shutil
 import socket
@@ -39,6 +38,7 @@ from typing import Optional, Callable
 from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner
+from mono_imager.step_tracker import StepTracker
 
 # Set MONO_DEBUG=1 (or `mono-imager --debug`/`--verbose`) to restore full
 # verbose output to console. debug_enabled() reads MONO_DEBUG live rather
@@ -64,9 +64,12 @@ console_logger = logging.getLogger("mono_imager.console")
 
 
 # --- Result tracker ----------------------------------------------------------
+# Bookkeeping (format/log/accumulate a step result) lives in StepTracker,
+# shared with recovery_orchestrator.py — see step_tracker.py's module
+# docstring for why print_report() itself stays separate per module.
 
-results: list[tuple[int, str, bool, str]] = []  # (step, description, passed, reason)
-_step_seq = itertools.count(1)
+_tracker = StepTracker(file_logger, console_logger, auto_number=True)
+results  = _tracker.results  # (step, description, passed, reason) — same list object across reset_results() calls; journeys/tests read this directly
 
 def reset_results():
     """
@@ -89,29 +92,9 @@ def reset_results():
     calls it automatically since that's the true entry point shared by
     every caller (auto, manual, and any future one).
     """
-    global _step_seq
-    results.clear()
-    _step_seq = itertools.count(1)
+    _tracker.reset()
 
-def step(num: int, description: str, passed: bool, reason: str = ""):
-    if num == 0:
-        num = next(_step_seq)
-    mark = "✓" if passed else "✗"
-
-    # File gets the full technical detail: step number, PASS/FAIL, reason.
-    file_msg = f"Step {num:02d}: {'✓ PASS' if passed else '✗ FAIL'} — {description}"
-    if reason:
-        file_msg += f" ({reason})"
-    log = file_logger.info if passed else file_logger.error
-    log(file_msg)
-
-    # Console gets a short, plain line — no step numbers, no technical
-    # reason strings (those are jargon like "wc -c returned unparseable
-    # output" that mean nothing to someone just running the tool).
-    console_logger.info(f"  {mark} {description}")
-
-    results.append((num, description, passed, reason))
-    return passed
+step = _tracker.step
 
 # --- HTTP server -------------------------------------------------------------
 
