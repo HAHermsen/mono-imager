@@ -782,30 +782,70 @@ def phase_legacy_flash_nor(d: SerialDevice) -> bool:
 # Test LAN, startup). Passing them in keeps this module with no
 # dependency on tui.py at all, same pattern as diagnostics.py.
 
-def run_emmc_update(
+# _MEDIUM_CONFIG parametrizes the one real difference between the eMMC
+# and NOR update flows: which medium to boot from/target, which modern-
+# path and legacy-path functions to call, and the messages that name
+# them. See _run_medium_update() below for the shared flow itself.
+#
+# modern_flash/legacy_flash are lambdas, not bare function references —
+# a bare `phase_legacy_flash_emmc` here would bind that name's value at
+# module-import time, so a test's patch.object(rec, "phase_legacy_flash_emmc", ...)
+# (the pattern this file's own tests use elsewhere) would silently miss
+# this dict's already-captured reference. The lambda defers the name
+# lookup to call time, same as every other call site in this module.
+_MEDIUM_CONFIG = {
+    "emmc": {
+        "boot_medium":   "qspi",   # boot from NOR recovery so 'firmware update' targets eMMC
+        "label":         "eMMC",
+        "tool_name":     "curl+dd",
+        "modern_flash":  lambda d, on_output: phase_modern_flash_emmc(d, on_output=on_output),
+        "legacy_flash":  lambda d: phase_legacy_flash_emmc(d),
+        "legacy_message": "Flashing eMMC (legacy curl+dd)...",
+        "legacy_only_extra_note": None,
+    },
+    "nor": {
+        "boot_medium":   "emmc",   # boot from eMMC recovery so 'firmware update' targets NOR
+        "label":         "NOR",
+        "tool_name":     "curl+flashcp",
+        "modern_flash":  lambda d, on_output: phase_modern_flash_nor(d, on_output=on_output),
+        "legacy_flash":  lambda d: phase_legacy_flash_nor(d),
+        "legacy_message": "Flashing NOR (legacy curl+flashcp)...",
+        "legacy_only_extra_note": "  (No DIP-switch flip needed for this path.)",
+    },
+}
+
+
+def _run_medium_update(
+    medium: str,
     port: str,
-    soft_reboot: Callable[[str], None],
     setup_network: Callable[[SerialDevice], bool],
     on_output: Optional[Callable[[str], None]] = None,
 ) -> bool:
     """
-    Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT)
-    — bootstraps into it, detects modern vs. legacy firmware tool,
-    resolves the device network, then flashes eMMC via the modern
-    `firmware update` (falling back to legacy curl+dd if that fails or
-    isn't available). Prints its own step-by-step report before
-    returning.
+    Shared flow behind run_emmc_update()/run_nor_update(): bootstrap
+    into the recovery shell for the OTHER medium, detect modern vs.
+    legacy firmware tool, resolve the device network, then flash the
+    target medium via the modern `firmware update` (falling back to
+    the legacy curl-based path if that fails or isn't available).
+    Prints its own step-by-step report before returning.
+
+    This ~90-line bootstrap/detect/flash/fallback sequence used to be
+    duplicated almost verbatim between run_emmc_update() and
+    run_nor_update() themselves (previously copy-pasted from
+    tui.py's menu_update_emmc()/menu_update_nor() — see git history);
+    _MEDIUM_CONFIG above now carries the only real differences.
 
     Returns True on overall success.
     """
     from mono_imager import flash_orchestrator as core
 
+    cfg = _MEDIUM_CONFIG[medium]
     d = None
     try:
         # NOTE: no auto soft-reboot here. phase1_uboot()'s own
         # "POWER CYCLE NOW" prompt drives the reboot, so we don't send a
         # silent reset that would contradict that on-screen instruction.
-        d = core.phase1_bootstrap(port, 115200, boot_medium="qspi")
+        d = core.phase1_bootstrap(port, 115200, boot_medium=cfg["boot_medium"])
         if d is None:
             console_logger.info("")
             console_logger.info("  ❌ Could not bootstrap into the recovery shell.")
@@ -831,31 +871,33 @@ def run_emmc_update(
             console_logger.info("")
             console_logger.info("  Modern firmware tool detected.")
             console_logger.info("")
-            emmc_ok = phase_modern_flash_emmc(d, on_output=on_output)
-            if not emmc_ok:
+            ok = cfg["modern_flash"](d, on_output)
+            if not ok:
                 console_logger.info("")
-                console_logger.info("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+dd...")
-                emmc_ok, _leg_err = with_spinner(
-                    phase_legacy_flash_emmc, d,
-                    message="Flashing eMMC (legacy curl+dd)..."
+                console_logger.info(f"  ⚠ Modern 'firmware update' failed — falling back to legacy {cfg['tool_name']}...")
+                ok, _leg_err = with_spinner(
+                    cfg["legacy_flash"], d,
+                    message=cfg["legacy_message"]
                 )
                 if _leg_err:
-                    emmc_ok = False
-                if not emmc_ok:
-                    console_logger.info("  ❌ Legacy fallback also failed for eMMC.")
+                    ok = False
+                if not ok:
+                    console_logger.info(f"  ❌ Legacy fallback also failed for {cfg['label']}.")
                     return print_report()
                 console_logger.info("  ✓ Legacy fallback succeeded.")
         else:
             console_logger.info("")
-            console_logger.info("  Legacy firmware tool detected — using curl+dd directly.")
+            console_logger.info(f"  Legacy firmware tool detected — using {cfg['tool_name']} directly.")
+            if cfg["legacy_only_extra_note"]:
+                console_logger.info(cfg["legacy_only_extra_note"])
             console_logger.info("")
-            emmc_ok, _leg_err = with_spinner(
-                phase_legacy_flash_emmc, d,
-                message="Flashing eMMC (legacy curl+dd)..."
+            ok, _leg_err = with_spinner(
+                cfg["legacy_flash"], d,
+                message=cfg["legacy_message"]
             )
             if _leg_err:
-                emmc_ok = False
-            if not emmc_ok:
+                ok = False
+            if not ok:
                 return print_report()
 
     finally:
@@ -863,6 +905,25 @@ def run_emmc_update(
             d.disconnect()
 
     return print_report()
+
+
+def run_emmc_update(
+    port: str,
+    soft_reboot: Callable[[str], None],
+    setup_network: Callable[[SerialDevice], bool],
+    on_output: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """
+    Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT)
+    — bootstraps into it, detects modern vs. legacy firmware tool,
+    resolves the device network, then flashes eMMC via the modern
+    `firmware update` (falling back to legacy curl+dd if that fails or
+    isn't available). Prints its own step-by-step report before
+    returning. See _run_medium_update() for the shared implementation.
+
+    Returns True on overall success.
+    """
+    return _run_medium_update("emmc", port, setup_network, on_output)
 
 
 def run_nor_update(
@@ -881,75 +942,12 @@ def run_nor_update(
     responsible for that if/when they want it (see
     phase_modern_verify_nor_boot() below, still available but no
     longer called from here). Prints its own step-by-step report
-    before returning.
+    before returning. See _run_medium_update() for the shared
+    implementation.
 
     Returns True on overall success.
     """
-    from mono_imager import flash_orchestrator as core
-
-    d = None
-    try:
-        # NOTE: no auto soft-reboot here. phase1_uboot()'s own
-        # "POWER CYCLE NOW" prompt drives the reboot, so we don't send a
-        # silent reset that would contradict that on-screen instruction.
-        d = core.phase1_bootstrap(port, 115200, boot_medium="emmc")
-        if d is None:
-            console_logger.info("")
-            console_logger.info("  ❌ Could not bootstrap into the recovery shell.")
-            return core.print_report()
-
-        reset_results()
-        is_modern, _fw_err = with_spinner(
-            detect_modern_firmware_tool, d,
-            message="Detecting firmware tool type..."
-        )
-        if _fw_err:
-            is_modern = None
-
-        if is_modern is None:
-            console_logger.info("")
-            console_logger.info("  ❌ Could not determine the device's firmware tool type.")
-            return print_report()
-
-        if not setup_network(d):
-            return print_report()
-
-        if is_modern:
-            console_logger.info("")
-            console_logger.info("  Modern firmware tool detected.")
-            console_logger.info("")
-            nor_ok = phase_modern_flash_nor(d, on_output=on_output)
-            if not nor_ok:
-                console_logger.info("")
-                console_logger.info("  ⚠ Modern 'firmware update' failed — falling back to legacy curl+flashcp...")
-                nor_ok, _leg_err = with_spinner(
-                    phase_legacy_flash_nor, d,
-                    message="Flashing NOR (legacy curl+flashcp)..."
-                )
-                if _leg_err:
-                    nor_ok = False
-                if not nor_ok:
-                    console_logger.info("  ❌ Legacy fallback also failed for NOR.")
-                    return print_report()
-                console_logger.info("  ✓ Legacy fallback succeeded.")
-
-        else:
-            console_logger.info("")
-            console_logger.info("  Legacy firmware tool detected — using curl+flashcp directly.")
-            console_logger.info("  (No DIP-switch flip needed for this path.)")
-            console_logger.info("")
-            nor_ok, _leg_err = with_spinner(
-                phase_legacy_flash_nor, d,
-                message="Flashing NOR (legacy curl+flashcp)..."
-            )
-            if _leg_err:
-                nor_ok = False
-
-    finally:
-        if d:
-            d.disconnect()
-
-    return print_report()
+    return _run_medium_update("nor", port, setup_network, on_output)
 
 
 def print_report() -> bool:
