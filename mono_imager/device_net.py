@@ -47,6 +47,25 @@ def netmask_to_prefix(value: str) -> Optional[str]:
     return str(bits.count("1"))
 
 
+# Fixed hardware layout on every Mono Gateway DK unit: eth0-eth2 are the
+# copper RJ-45 jacks, eth3-eth4 are the SFP+ cages. Soft preference only:
+# copper is tried first since it's the common uplink and unpopulated SFP
+# cages otherwise waste DHCP/verify round trips, but SFP is a legitimate
+# WAN uplink in some deployments, so it's never excluded - just
+# deprioritized. Kept as a single constant, not logic buried in resolve(),
+# since this default may need revisiting in the field.
+_COPPER_IFACES = ("eth0", "eth1", "eth2")
+
+
+def _copper_first(ifaces: list) -> list:
+    """
+    Stable-sort `ifaces` so any name in _COPPER_IFACES precedes any name
+    not in it, preserving relative order within each group. Pure
+    function - does not mutate its argument.
+    """
+    return sorted(ifaces, key=lambda name: name not in _COPPER_IFACES)
+
+
 class RecoveryNetwork:
     """
     Session-scoped device-network resolver for the recovery shell.
@@ -104,14 +123,14 @@ class RecoveryNetwork:
             )
             if _eth_err:
                 raise _eth_err
-            ifaces = core.parse_active_eth_ifaces(ip_output)
+            ifaces = _copper_first(core.parse_active_eth_ifaces(ip_output))
             if not ifaces:
                 print("  ❌ No Ethernet port has a cable plugged in.")
                 print("     Plug an Ethernet cable into any RJ-45 jack (not the SFP+ cages).")
                 print()
                 input("  Press Enter once the cable is plugged in...")
                 ip_output = d.run_script("ip link show", marker="recovery_eth_check_retry", exec_timeout=5)
-                ifaces = core.parse_active_eth_ifaces(ip_output)
+                ifaces = _copper_first(core.parse_active_eth_ifaces(ip_output))
                 if not ifaces:
                     print("  ❌ Still no Ethernet port with a cable detected.")
                     return False
@@ -176,13 +195,18 @@ class RecoveryNetwork:
         print("  ❌ No Ethernet port obtained a working DHCP lease.")
         print("  Falling back to manual network entry.")
 
+        # retry_ifaces tracks which port(s) each attempt fans out over. It
+        # starts as every live candidate (current behavior), but narrows to
+        # a single interface once the user explicitly picks one via 'p'
+        # below - otherwise "pick a specific port" wouldn't actually stop
+        # the retry loop from re-trying ports the user just ruled out.
+        retry_ifaces = ifaces
         while True:
             net = self._prompt_manual()
             if net is None:
                 return False
             # Try the static config on each candidate; use whichever reaches.
-            applied = False
-            for cand in ifaces:
+            for cand in retry_ifaces:
                 print(f"  Configuring {cand} = {net['ip']}/{net['prefix']}, gateway {net['gateway']}...")
                 if self._apply(d, cand, net) and self._verify(d, net["gateway"]):
                     print(f"  ✓ Internet reachable via {cand} - network is ready.")
@@ -191,9 +215,34 @@ class RecoveryNetwork:
                     return True
             print("  ❌ None of the live ports reached the internet with that config.")
             print("     Check the gateway IP, cable, and network configuration.")
-            retry = input("  Try entering the network settings again? [Y/n]: ").strip().lower()
-            if retry == "n":
-                return False
+            # Inner loop: re-asks just this question on an invalid token,
+            # rather than bouncing the user back to re-typing the whole
+            # manual IP/mask/gateway/DNS form for a simple typo.
+            while True:
+                print()
+                print("  y) Try again with the same port(s)")
+                print("  p) Pick a specific Ethernet port to target")
+                print("  s) Skip network setup for now")
+                print("  n) Give up and return to the menu")
+                retry = input("  What next? [Y/p/s/n]: ").strip().lower()
+                if retry == "n":
+                    return False
+                if retry == "s":
+                    print("  ⚠ Skipping network setup. 'firmware update' and any LAN-based")
+                    print("    flash journey will not work until network setup succeeds.")
+                    print("    You can still: use 'CLI only (serial)' from the main menu for a")
+                    print("    raw console, or flash an OS image over USB (no device network")
+                    print("    needed for Armbian-via-USB).")
+                    return False
+                if retry == "p":
+                    picked = self._select_iface(d, ifaces, prompt_reason="pick")
+                    if picked is None:
+                        return False
+                    retry_ifaces = [picked]
+                    break  # re-prompt manual entry, now pinned to retry_ifaces
+                if retry in ("", "y"):
+                    break  # re-prompt manual entry with retry_ifaces unchanged
+                print("  Invalid selection.")
 
     def _apply(self, d, iface: str, net: dict) -> bool:
         """
@@ -233,25 +282,42 @@ class RecoveryNetwork:
             return False
         return bool(result)
 
-    def _select_iface(self, d, ifaces: list):
+    def _select_iface(self, d, ifaces: list, prompt_reason: str = "multi"):
         """
-        Multiple Ethernet ports have a live cable - a complex topology
-        the tool does not support automatically (issue #19). Only one
-        port can serve as the WAN uplink for 'firmware update', so ask
-        the user which one, then set every OTHER eth* port 'link down'
-        so nothing downstream (DHCP, routing) can pick the wrong port.
+        Ask the user which Ethernet port to use as the WAN uplink, then
+        set every OTHER eth* port 'link down' so nothing downstream
+        (DHCP, routing) can pick the wrong port.
+
+        prompt_reason selects the framing text printed above the menu:
+          "multi" (default) - multiple ports genuinely have a live cable
+              and reached the internet, a complex topology the tool does
+              not support automatically (issue #19).
+          "pick" - the user explicitly asked (from the manual-entry retry
+              loop) to target one specific port instead of fanning
+              attempts out across every live candidate.
+        The selection loop, 'q'-quits, invalid-input re-prompt, and
+        "set other ports down" logic are identical either way.
 
         Returns the chosen iface name, or None if the user aborts.
         """
         print()
-        print("  ⚠ Multiple Ethernet ports have a live link:")
-        for i, name in enumerate(ifaces, 1):
-            print(f"      {i}) {name}")
-        print()
-        print("    This is a complex topology the tool cannot resolve on its")
-        print("    own - only one port can be the WAN uplink. The others will")
-        print("    be set 'link down'.")
-        print()
+        if prompt_reason == "pick":
+            print("  Pick which Ethernet port to target for the next attempt:")
+            for i, name in enumerate(ifaces, 1):
+                print(f"      {i}) {name}")
+            print()
+            print("    The other live ports will be set 'link down' so nothing")
+            print("    ambiguous can interfere with this attempt.")
+            print()
+        else:
+            print("  ⚠ Multiple Ethernet ports have a live link:")
+            for i, name in enumerate(ifaces, 1):
+                print(f"      {i}) {name}")
+            print()
+            print("    This is a complex topology the tool cannot resolve on its")
+            print("    own - only one port can be the WAN uplink. The others will")
+            print("    be set 'link down'.")
+            print()
         chosen = None
         while chosen is None:
             raw = input(f"  Select the WAN port [1-{len(ifaces)}] (or 'q' to quit): ").strip().lower()

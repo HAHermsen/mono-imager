@@ -2,7 +2,7 @@
 
 Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — no manual `dd`/`tftp` fiddling required.
 
-Version: **1.2.10** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
+Version: **1.2.15** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
 ---
 
@@ -63,6 +63,14 @@ There are no other CLI arguments — everything else (which OS, which port, whic
 ### On launch
 
 Before showing any menu, mono-imager connects to the device and resolves its network once (DHCP first, manual fallback if needed). This can take a minute or two and only happens once per session — every menu afterward reuses the result.
+
+**Ethernet port selection**: the Mono Gateway's copper RJ-45 jacks (eth0-eth2) are tried before its SFP+ cages (eth3-eth4) by default, since an unpopulated SFP cage otherwise wastes time on DHCP/reachability attempts that can never succeed. This is a soft preference, not a restriction — SFP is a legitimate WAN uplink on some deployments, so it's still tried automatically if no copper port works.
+
+If manual IP entry is needed and a typed configuration doesn't reach the internet, the retry prompt offers:
+- **y** (or Enter) — try again with the same port(s)
+- **p** — pick one specific Ethernet port to target, instead of the tool cycling through every port with a live cable
+- **s** — skip network setup for now (you can still use option 4, "CLI only (serial)", for a raw console, or flash an OS over USB, which needs no device-side network for Armbian)
+- **n** — give up and return to the menu
 
 ### Main menu
 

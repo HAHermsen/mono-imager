@@ -225,6 +225,97 @@ check("device_net left unset", app.device_net is None)
 
 
 # ============================================================================
+# _setup_recovery_network() — manual retry loop: 'p' pins to one port
+# ============================================================================
+
+print()
+print("=" * 60)
+print("_setup_recovery_network(): retry-loop 'p' pins subsequent attempts to one port")
+print("=" * 60)
+
+from mono_imager.device_net import RecoveryNetwork as _RN_pick
+
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+)
+_apply_calls = []
+def _apply_fail_then_succeed(self, d, iface, net):
+    _apply_calls.append(iface)
+    return len(_apply_calls) == 3 and iface == "eth1"
+rn = _RN_pick()
+manual_inputs = iter([
+    "192.168.1.50", "255.255.255.0", "192.168.1.1", "1.1.1.1",  # attempt 1 (both ports fail)
+    "p",                                                          # pick a specific port
+    "2",                                                          # -> eth1 (2nd in list)
+    "192.168.1.51", "255.255.255.0", "192.168.1.1", "1.1.1.1",  # attempt 2 (pinned to eth1 only)
+])
+with patch.object(_RN_pick, "_apply", _apply_fail_then_succeed), \
+     patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=None), \
+     patch("mono_imager.recovery_orchestrator.check_internet_reachable", return_value=True), \
+     patch("builtins.input", side_effect=lambda *_: next(manual_inputs)), \
+     patch("builtins.print"):
+    _pick_result = rn.resolve(d)
+
+check("'p' pick: returns True after pinned retry succeeds", _pick_result is True)
+check("'p' pick: only 3 apply attempts (eth0, eth1, then eth1 only)",
+      _apply_calls == ["eth0", "eth1", "eth1"])
+check("'p' pick: final config recorded against the pinned port (eth1)",
+      rn.config["iface"] == "eth1")
+
+
+# ============================================================================
+# _setup_recovery_network() — manual retry loop: 's' skips (same as 'n')
+# ============================================================================
+
+print()
+print("=" * 60)
+print("_setup_recovery_network(): retry-loop 's' (skip) behaves like 'n'")
+print("=" * 60)
+
+rn = _RN_pick()
+d = MagicMock()
+d.run_script.return_value = "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+manual_inputs = iter(["192.168.1.50", "255.255.255.0", "192.168.1.1", "1.1.1.1", "s"])
+with patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=None), \
+     patch("mono_imager.recovery_orchestrator.check_internet_reachable", return_value=False), \
+     patch("builtins.input", side_effect=lambda *_: next(manual_inputs)), \
+     patch("builtins.print"):
+    _skip_result = rn.resolve(d)
+
+check("'s' (skip) returns False", _skip_result is False)
+check("'s' (skip) leaves config unset", rn.config is None)
+check("'s' (skip) leaves verified False", rn.verified is False)
+
+
+# ============================================================================
+# _setup_recovery_network() — manual retry loop: invalid token re-prompts
+# ============================================================================
+
+print()
+print("=" * 60)
+print("_setup_recovery_network(): retry-loop invalid token re-prompts, 'n' still gives up")
+print("=" * 60)
+
+rn = _RN_pick()
+d = MagicMock()
+d.run_script.return_value = "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+manual_inputs = iter([
+    "192.168.1.50", "255.255.255.0", "192.168.1.1", "1.1.1.1",  # attempt 1
+    "x",                                                          # invalid token
+    "n",                                                          # then give up
+])
+with patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=None), \
+     patch("mono_imager.recovery_orchestrator.check_internet_reachable", return_value=False), \
+     patch("builtins.input", side_effect=lambda *_: next(manual_inputs)), \
+     patch("builtins.print"):
+    _invalid_result = rn.resolve(d)
+
+check("invalid token re-prompts, eventual 'n' still gives up", _invalid_result is False)
+
+
+# ============================================================================
 # _startup_network_setup() — runs at launch, before the main menu
 # ============================================================================
 
@@ -290,6 +381,27 @@ check("_setup_recovery_network was called with the bootstrapped device", mock_se
 check("device disconnected afterward", d.disconnect.called)
 
 
+print()
+print("=" * 60)
+print("_startup_network_setup(): resolve fails -> prints fallback pointer, no crash")
+print("=" * 60)
+
+app = make_app()
+d = MagicMock()
+_printed = []
+with patch.object(app, "_select_port", return_value="COM5"), \
+     patch("serial.Serial", return_value=MagicMock()), \
+     patch("mono_imager.flash_orchestrator.phase1_bootstrap", return_value=d), \
+     patch.object(app, "_setup_recovery_network", return_value=False), \
+     patch("builtins.input", return_value=""), \
+     patch("builtins.print", side_effect=lambda *a, **k: _printed.append(" ".join(str(x) for x in a))):
+    app._startup_network_setup()
+
+check("device disconnected even when resolve() returns False", d.disconnect.called)
+check("fallback pointer mentions CLI console", any("CLI only" in p for p in _printed))
+check("fallback pointer mentions USB", any("USB" in p for p in _printed))
+
+
 # ============================================================================
 # get_journey() forwards device_net to every journey unconditionally
 # ============================================================================
@@ -340,6 +452,84 @@ with patch.object(RecoveryNetwork, "_select_iface") as _sel, \
 check("no prompt when only one LOWER_UP port actually leases", not _sel.called)
 check("resolve() succeeds on the port that leased", _ok is True)
 check("the leased port (eth3) is the one recorded", rn.config.get("iface") == "eth3")
+
+
+# ============================================================================
+# _copper_first(): copper (eth0-2) sorts before SFP (eth3-4)
+# ============================================================================
+
+print()
+print("=" * 60)
+print("_copper_first(): copper (eth0-2) sorts before SFP (eth3-4)")
+print("=" * 60)
+
+from mono_imager.device_net import _copper_first
+
+check("SFP-only list is untouched", _copper_first(["eth3", "eth4"]) == ["eth3", "eth4"])
+check("copper-only list is untouched", _copper_first(["eth1", "eth0"]) == ["eth1", "eth0"])
+check("mixed: SFP-detected-first is reordered copper-first",
+      _copper_first(["eth4", "eth0"]) == ["eth0", "eth4"])
+check("mixed multi: relative order within each group preserved",
+      _copper_first(["eth3", "eth2", "eth4", "eth0"]) == ["eth2", "eth0", "eth3", "eth4"])
+check("already copper-first list unaffected (matches #19 test fixture)",
+      _copper_first(["eth1", "eth3", "eth4"]) == ["eth1", "eth3", "eth4"])
+check("empty list", _copper_first([]) == [])
+
+
+# ============================================================================
+# resolve(): copper-first ordering is actually used for DHCP-probe order
+# ============================================================================
+
+print()
+print("=" * 60)
+print("resolve(): copper tried before SFP even when SFP detected first (Bug A)")
+print("=" * 60)
+
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth4: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+)
+_try_order = []
+def _dhcp_track_order(dev, iface, *a, **k):
+    _try_order.append(iface)
+    return None
+rn = RecoveryNetwork()
+with patch("mono_imager.recovery_orchestrator.try_dhcp", side_effect=_dhcp_track_order), \
+     patch("builtins.input", return_value=""), \
+     patch("builtins.print"):
+    rn.resolve(d)
+check("DHCP probed eth0 (copper) before eth4 (SFP) despite detection order",
+      _try_order == ["eth0", "eth4"])
+
+
+# ============================================================================
+# resolve(): copper-first ordering also applies to manual-entry apply order
+# ============================================================================
+
+print()
+print("=" * 60)
+print("resolve(): manual entry also tries copper before SFP (Bug A)")
+print("=" * 60)
+
+d = MagicMock()
+d.run_script.return_value = (
+    "2: eth3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n"
+    "3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\nRC=0"
+)
+_apply_order = []
+def _apply_track(self, d, iface, net):
+    _apply_order.append(iface)
+    return False
+rn = RecoveryNetwork()
+manual_inputs = iter(["192.168.1.50", "255.255.255.0", "192.168.1.1", "1.1.1.1", "n"])
+with patch.object(RecoveryNetwork, "_apply", _apply_track), \
+     patch("mono_imager.recovery_orchestrator.try_dhcp", return_value=None), \
+     patch("builtins.input", side_effect=lambda *_: next(manual_inputs)), \
+     patch("builtins.print"):
+    rn.resolve(d)
+check("manual-entry apply tried eth1 (copper) before eth3 (SFP)",
+      _apply_order == ["eth1", "eth3"])
 
 
 # ============================================================================
@@ -400,6 +590,35 @@ with patch.object(RecoveryNetwork, "_select_iface", return_value="eth0") as _moc
     _ok = rn.resolve(d)
 check("resolve() calls _select_iface when multiple ports are live", _mock_sel.called)
 check("resolve() succeeds after the user picks a port", _ok is True)
+
+
+# ============================================================================
+# _select_iface(prompt_reason=): generic framing for the retry-loop 'pick' path
+# ============================================================================
+
+print()
+print("=" * 60)
+print("_select_iface(prompt_reason=): generic framing for the retry-loop 'pick' path")
+print("=" * 60)
+
+rn = RecoveryNetwork()
+d = MagicMock()
+_printed = []
+with patch("builtins.input", return_value="1"), \
+     patch("builtins.print", side_effect=lambda *a, **k: _printed.append(" ".join(str(x) for x in a))):
+    _chosen = rn._select_iface(d, ["eth0", "eth3"], prompt_reason="pick")
+check("prompt_reason='pick' still returns the chosen port", _chosen == "eth0")
+check("prompt_reason='pick' does not print the #19 multi-uplink framing",
+      not any("Multiple Ethernet ports have a live link" in p for p in _printed))
+
+rn = RecoveryNetwork()
+d = MagicMock()
+_printed = []
+with patch("builtins.input", return_value="1"), \
+     patch("builtins.print", side_effect=lambda *a, **k: _printed.append(" ".join(str(x) for x in a))):
+    rn._select_iface(d, ["eth0", "eth3"])
+check("default prompt_reason still shows the #19 multi-uplink framing",
+      any("Multiple Ethernet ports have a live link" in p for p in _printed))
 
 
 # ============================================================================

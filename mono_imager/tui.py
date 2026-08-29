@@ -1137,7 +1137,11 @@ class MonoImager:
             return
 
         try:
-            self._setup_recovery_network(d)
+            if not self._setup_recovery_network(d):
+                print()
+                print("  ⚠ Network setup was not completed. You can still use 'CLI only")
+                print("    (serial)' (option 4) from the main menu, or flash an OS image")
+                print("    over USB, without the device's own network being set up.")
         finally:
             d.disconnect()
 
