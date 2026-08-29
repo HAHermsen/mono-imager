@@ -14,7 +14,7 @@ __author__ = "H.A. Hermsen"
 import serial
 import time
 import logging
-from typing import Callable, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1157,25 +1157,13 @@ class SerialDevice:
             verbose(f"Failed to boot staging Linux: {e}", "error")
             return False
 
-    def _wait_for_root_shell(self, timeout: float, label: str,
-                              extra_ok: Optional[Callable[[str], bool]] = None,
-                              extra_ok_label: str = "") -> bool:
+    def _wait_for_root_shell(self, timeout: float, label: str) -> bool:
         """
         Shared retry loop behind login_recovery()/login_staging(): send
         a bare Enter, read back whatever comes, and check for a root
         shell prompt ("root@...#"), reconnecting the serial port first
         if it dropped since the last attempt. Backs off 0.5s -> 5s
         (doubling) between attempts, up to timeout seconds total.
-
-        extra_ok: an additional success predicate (checked against the
-        raw decoded response) for callers that accept more than a bare
-        root prompt — login_staging() also accepts RECOVERY_PROMPT, in
-        case the device never actually reached staging Linux but IS at
-        a usable recovery shell. In practice RECOVERY_PROMPT (b"root@
-        recovery:~# ") already contains both "root@" and "#", so the
-        primary check matches first and this branch is unreachable;
-        kept for clarity of intent rather than because it currently
-        changes behavior.
         """
         verbose(f"Verifying {label} login...")
 
@@ -1203,9 +1191,6 @@ class SerialDevice:
                 if "root@" in response and "#" in response:
                     verbose(f"✓ Logged into {label} (attempt {attempt})")
                     return True
-                if extra_ok and extra_ok(response):
-                    verbose(f"✓ {extra_ok_label} (attempt {attempt})")
-                    return True
 
                 verbose(f"{label} login attempt {attempt} — retrying in {backoff:.1f}s", "debug")
                 time.sleep(backoff)
@@ -1224,12 +1209,15 @@ class SerialDevice:
         Confirm we are at a root shell in the staging Linux environment.
         Checks for any 'root@<hostname>#' prompt — not locked to 'root@recovery'.
         Called after boot_linux_staging() in the staging-boot path.
+
+        RECOVERY_PROMPT was previously checked here as a separate,
+        looser fallback for "device is at a usable recovery shell even
+        if staging Linux itself never came up" — removed because it was
+        provably dead: RECOVERY_PROMPT (b"root@recovery:~# ") already
+        contains both "root@" and "#", so the check above always
+        matches first.
         """
-        return self._wait_for_root_shell(
-            timeout, "staging Linux",
-            extra_ok=lambda response: self.RECOVERY_PROMPT in response.encode(),
-            extra_ok_label="Recovery Linux available",
-        )
+        return self._wait_for_root_shell(timeout, "staging Linux")
 
     def login_recovery(self, timeout: float = 30) -> bool:
         """
