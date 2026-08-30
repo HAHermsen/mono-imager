@@ -348,6 +348,41 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
     return buffer.decode("utf-8", errors="replace")
 
 
+def sync_device_clock(d: SerialDevice, timeout: float = 15.0) -> bool:
+    """
+    Best-effort NTP time sync in the recovery shell, via busybox
+    ntpd's one-shot query mode (-q: set the clock and exit, -n: stay
+    in the foreground so run_script can wait on it).
+
+    Recovery Linux has no RTC battery, so it always boots to some
+    arbitrary/epoch clock. `firmware update` downloads over HTTPS and
+    verifies the TLS chain, which OpenSSL rejects outright — "certificate
+    is not yet valid (9)" — whenever the device's clock sits behind the
+    cert's notBefore date. Confirmed on real hardware (#23): network
+    connectivity was fine (ping/DNS both passed) and the legacy curl+dd
+    fallback (no TLS) succeeded, isolating clock skew as the cause.
+
+    Best-effort by design: logs and returns False on any failure rather
+    than raising. NTP (UDP/123) is usually allowed even where it isn't
+    guaranteed, but if it's blocked/unreachable this shouldn't block
+    `firmware update` from getting its fair shot anyway — the clock
+    might already be close enough — and the legacy fallback remains the
+    safety net either way.
+    """
+    try:
+        output = d.run_script(
+            "ntpd -q -n -p pool.ntp.org 2>&1; echo RC=$?",
+            marker="sync_device_clock", exec_timeout=timeout,
+        )
+    except RuntimeError as e:
+        logger.warning(f"sync_device_clock: run_script failed: {e}")
+        return False
+    ok = "RC=0" in output
+    if not ok:
+        logger.warning(f"sync_device_clock: ntpd did not report success — output:\n{output}")
+    return ok
+
+
 def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
                          idle_timeout: float = 30.0, max_total: float = 900.0) -> bool:
     """
@@ -359,6 +394,14 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     Requires real internet access on the device's network — this is
     a hard, documented prerequisite for both paths, not something
     this tool can route around.
+
+    Syncs the device's clock via sync_device_clock() first — see #23:
+    without it, a recovery-shell boot with a stale/epoch clock makes
+    this command's own TLS verification fail with "certificate is not
+    yet valid", indistinguishable at a glance from a real network/cert
+    problem. Best-effort; not gated on, since a sync failure doesn't
+    necessarily mean the clock is bad enough to break verification, and
+    the legacy curl+dd fallback (no TLS) is the safety net either way.
 
     Uses the device's own default `firmware update` mode — no source
     flag — which downloads from https://firmware.mono.si itself,
@@ -403,6 +446,9 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
             overridden by tests, which use a fake serial source that
             never naturally goes idle for 30 real seconds.
     """
+    # Step 0: best-effort NTP sync before anything TLS-verified runs (#23).
+    sync_device_clock(d)
+
     # Step 1: Detect which medium we're booting from (so we know which to flash)
     #
     # BUG FIXED: this used to grep `root=` out of /proc/cmdline, with a
