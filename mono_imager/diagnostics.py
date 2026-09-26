@@ -237,7 +237,7 @@ def test_usb(port: str) -> bool:
     """
     import logging
     from mono_imager.flash_orchestrator import phase1_bootstrap
-    from mono_imager.journeys.usb_utils import check_usb_size, find_image_on_usb
+    from mono_imager.journeys.usb_utils import check_usb_size, find_image_on_usb, mount_usb_stick
 
     logger = logging.getLogger(__name__)
 
@@ -257,22 +257,21 @@ def test_usb(port: str) -> bool:
     mounted    = False
 
     try:
-        try:
-            d.send_command(f"mkdir -p {usb_mount}", timeout=5)
-            response, _mnt_err = with_spinner(
-                d.send_command, f"mount {usb_device}1 {usb_mount} 2>&1; echo RC=$?",
-                timeout=15, message="Mounting USB stick..."
-            )
-            if _mnt_err:
-                raise _mnt_err
-            mounted = "RC=0" in response
-            if not mounted:
-                response = d.send_command(f"mount {usb_device} {usb_mount} 2>&1; echo RC=$?", timeout=15)
-                mounted = "RC=0" in response
-        except Exception as e:
-            mounted, response = False, str(e)
+        # Mount whichever partition holds an image of ANY supported OS,
+        # not blindly sda1 — a GUID stick's sda1 is the EFI partition (#26).
+        mount_result, _mnt_err = with_spinner(
+            mount_usb_stick, d, usb_device, usb_mount,
+            ["OPNsense", "OpenWRT", "Armbian"],
+            message="Mounting USB stick..."
+        )
+        if _mnt_err:
+            logger.warning(f"USB mount failed: {_mnt_err}")
+            part = None
+        else:
+            part = mount_result[0]
+        mounted = part is not None
 
-        if not console.check(results, f"USB mounted ({usb_device} -> {usb_mount})", mounted,
+        if not console.check(results, f"USB mounted ({part or usb_device} -> {usb_mount})", mounted,
                               "" if mounted else "no USB stick detected, or it's not FAT32/exFAT formatted"):
             input("\n  Press Enter to continue...")
             return False

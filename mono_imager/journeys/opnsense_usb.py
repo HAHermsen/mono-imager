@@ -20,7 +20,7 @@ import logging
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
 from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
-from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size
+from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
 from mono_imager.journeys.opnsense_lan import _uboot_steps_opnsense_lan
 from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
@@ -55,16 +55,14 @@ def step_confirm_dip_nor(ctx: StepContext) -> bool:
 def step_mount_usb(ctx: StepContext) -> bool:
     d = ctx.device
     try:
-        d.send_command(f"mkdir -p {ctx.usb_mount}", timeout=5)
+        # Mount whichever partition holds the image, not blindly sda1 (#26).
         with Spinner("Mounting USB stick..."):
-            response = d.send_command(f"mount {ctx.usb_device}1 {ctx.usb_mount} 2>&1; echo RC=$?", timeout=15)
-            ok = "RC=0" in response
-            if not ok:
-                response = d.send_command(f"mount {ctx.usb_device} {ctx.usb_mount} 2>&1; echo RC=$?", timeout=15)
-                ok = "RC=0" in response
+            part, _has_image, detail = mount_usb_stick(d, ctx.usb_device, ctx.usb_mount, [OS])
+        ok = part is not None
         if ok:
             check_usb_size(d, ctx.usb_mount)
-        return step(0, f"USB mounted ({ctx.usb_device} -> {ctx.usb_mount})", ok, response[-100:] if not ok else "")
+        return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
+                    detail[-100:] if not ok else "")
     except Exception as e:
         return step(0, "USB mount", False, str(e))
 
