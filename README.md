@@ -2,7 +2,7 @@
 
 Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — no manual `dd`/`tftp` fiddling required.
 
-Version: **1.3.1** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
+Version: **1.4.0** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
 ---
 
@@ -78,7 +78,7 @@ Every menu appends to a continuous, scrolling transcript instead of clearing the
 
 ```
 ------------------------------------------------------------
-mono-imager 1.3.1 - 192.168.1.50/24 via 192.168.1.1 (DNS 1.1.1.1) - dhcp
+mono-imager 1.4.0 - 192.168.1.50/24 via 192.168.1.1 (DNS 1.1.1.1) - dhcp
 ```
 
 before showing its own prompt or choices. Two screens were already scrolling before this branch existed — the live flash-progress view and the final result screen — specifically so their output stays visible for debugging; every other menu now follows the same pattern for consistency.
