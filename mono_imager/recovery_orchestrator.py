@@ -354,177 +354,137 @@ def sync_device_clock(d: SerialDevice, timeout: float = 15.0) -> bool:
     ntpd's one-shot query mode (-q: set the clock and exit, -n: stay
     in the foreground so run_script can wait on it).
 
-    Recovery Linux has no RTC battery, so it always boots to some
-    arbitrary/epoch clock. `firmware update` downloads over HTTPS and
-    verifies the TLS chain, which OpenSSL rejects outright — "certificate
-    is not yet valid (9)" — whenever the device's clock sits behind the
-    cert's notBefore date. Confirmed on real hardware (#23): network
-    connectivity was fine (ping/DNS both passed) and the legacy curl+dd
-    fallback (no TLS) succeeded, isolating clock skew as the cause.
+    Recovery Linux can boot with a stale clock. `firmware update`
+    downloads over HTTPS with TLS verification (meta-mono removed
+    `curl -k` from the tool on 2026-04-11), which OpenSSL rejects
+    outright — "certificate is not yet valid" — whenever the device's
+    clock sits behind the cert's notBefore date. Confirmed on real
+    hardware (#23).
 
-    Best-effort by design: logs and returns False on any failure rather
-    than raising. NTP (UDP/123) is usually allowed even where it isn't
-    guaranteed, but if it's blocked/unreachable this shouldn't block
-    `firmware update` from getting its fair shot anyway — the clock
-    might already be close enough — and the legacy fallback remains the
-    safety net either way.
+    Best-effort by design: returns False on any failure rather than
+    raising. The result is now shown on the console, together with the
+    device's resulting UTC time (#24), instead of only in the log file —
+    so a user can see whether the clock was actually set before the
+    TLS-verified download runs.
     """
+    console_logger.info("  Syncing device clock via NTP (pool.ntp.org)...")
     try:
         output = d.run_script(
-            "ntpd -q -n -p pool.ntp.org 2>&1; echo RC=$?",
+            "ntpd -q -n -p pool.ntp.org 2>&1; echo RC=$?; "
+            "date -u '+DEVICE_TIME=%Y-%m-%d %H:%M:%S UTC'",
             marker="sync_device_clock", exec_timeout=timeout,
         )
     except RuntimeError as e:
         logger.warning(f"sync_device_clock: run_script failed: {e}")
+        console_logger.info(f"  ⚠ NTP sync could not run ({e}) — continuing with the current clock.")
         return False
     ok = "RC=0" in output
-    if not ok:
+    m = re.search(r"DEVICE_TIME=([0-9-]+ [0-9:]+ UTC)", output)
+    now = m.group(1) if m else "unknown"
+    if ok:
+        console_logger.info(f"  ✓ Clock synced — device time {now}")
+    else:
         logger.warning(f"sync_device_clock: ntpd did not report success — output:\n{output}")
+        console_logger.info(
+            f"  ⚠ NTP sync failed — device time {now}. If it is wrong, the "
+            "HTTPS download may fail with 'certificate is not yet valid'."
+        )
     return ok
 
 
-def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
-                         idle_timeout: float = 30.0, max_total: float = 900.0) -> bool:
+# --- firmware tool capabilities / helpers (#24) ---------------------------
+#
+# Facts below are taken from the official tool's source,
+# we-are-mono/meta-mono recipes-support/firmware-tools/files/firmware:
+#   - `update` options: --usb, --from PATH, --url URL, --preserve-env
+#     (--from/--usb/--preserve-env all added 2026-04-18). Default mode is a
+#     FULL REWRITE: the target's U-Boot env resets to firmware defaults.
+#     Before 2026-04-18 the tool always backed up + restored the env and
+#     rejected unknown options ("ERROR: Unknown option").
+#   - Files: firmware-<emmc|qspi>-gateway-dk.bin + .bin.sig, fetched from
+#     https://firmware.mono.si with basic auth mono:<MAC of the first
+#     interface `ip -o link` lists with an ether address>.
+#   - The .bin is ALWAYS verified against /etc/firmware/firmware-signing.pub
+#     (openssl dgst -sha256 -verify) before flashing — which is why
+#     downloading it ourselves with `curl -k` is safe: TLS only protects
+#     the transport, the signature check protects what gets flashed.
+#   - U-Boot env: QSPI = MTD partition labelled "uboot-env", 0x2000 bytes at
+#     offset 0; eMMC = /dev/mmcblk0, 0x2000 bytes at offset 0x300000.
+
+FIRMWARE_BASE_URL = "https://firmware.mono.si"
+FIRMWARE_MACHINE  = "gateway-dk"
+MANUAL_FW_DIR     = "/tmp/mono_imager_fw"
+
+UBOOT_ENV_SIZE        = 0x2000
+UBOOT_ENV_EMMC_OFFSET = 0x300000
+UBOOT_ENV_STASH       = "/tmp/mono_imager_uboot_env.bin"
+
+# curl/openssl wording for a TLS failure caused by a wrong device clock
+# (or TLS in general) — the case NTP re-sync + retry can actually fix.
+_TLS_ERROR_RE = re.compile(
+    r"certificate is not yet valid|certificate has expired|"
+    r"SSL certificate problem|curl: \((?:35|60)\)",
+    re.IGNORECASE,
+)
+
+
+def default_preserve_env(target: str) -> bool:
     """
-    Run the modern `firmware update` command and confirm it reported
-    success. This command downloads, verifies, and flashes the OTHER
-    medium than the one currently booted (per docs: auto-detects boot
-    source, never overwrites what you're currently running from).
+    Default for the "preserve U-Boot env?" choice, per target medium.
 
-    Requires real internet access on the device's network — this is
-    a hard, documented prerequisite for both paths, not something
-    this tool can route around.
+    eMMC: False. Preserving on an eMMC flash restores the device's OLD eMMC
+    env (e.g. a prior Armbian env with no "recovery" command) over the new
+    firmware's env — that wiped the "recovery" command option 3 (NOR
+    update) needs to boot recovery from eMMC ("run recovery -> not
+    defined"). NOR (qspi): True — NOR carries the boot settings
+    (e.g. OPNsense's bootcmd) the user normally wants to keep.
+    """
+    return target != "emmc"
 
-    Syncs the device's clock via sync_device_clock() first — see #23:
-    without it, a recovery-shell boot with a stale/epoch clock makes
-    this command's own TLS verification fail with "certificate is not
-    yet valid", indistinguishable at a glance from a real network/cert
-    problem. Best-effort; not gated on, since a sync failure doesn't
-    necessarily mean the clock is bad enough to break verification, and
-    the legacy curl+dd fallback (no TLS) is the safety net either way.
 
-    Uses the device's own default `firmware update` mode — no source
-    flag — which downloads from https://firmware.mono.si itself,
-    verifies, and flashes. Confirmed via `firmware update --help` on
-    real hardware that this (not `--from`) is the documented primary
-    path; `--from` is for offline/USB use with pre-staged files.
+def is_tls_error(output: str) -> bool:
+    """True if `firmware update` output shows a TLS/certificate failure."""
+    return bool(_TLS_ERROR_RE.search(output or ""))
 
-    We used to pre-download .bin/.sig ourselves via curl and call
-    `firmware update --from /tmp/firmware`, but that hit a 401 from
-    the server that our plain curl couldn't get past (confirmed by
-    cat'ing the "downloaded" file on real hardware — it was the
-    401 error body, not firmware). Letting the tool do its own
-    download sidesteps whatever auth/headers it needs.
 
-    NOTE: the interactive "Type 'yes' to proceed" confirmation prompt
-    still appears in this mode too — confirmed on real hardware.
-    auto_confirm_text/auto_confirm_response are passed to
-    _stream_command() to answer it, rather than letting the command
-    self-abort after its own timeout.
+def firmware_tool_caps(d: SerialDevice) -> dict:
+    """
+    Which `firmware update` options this device's tool supports, from
+    `firmware help`. Returns {"preserve_env": bool, "from": bool}.
 
-    Uses _stream_command() because the real command can run for several
-    real minutes (download via curl + verify + flash) — see _stream_command()'s
-    docstring. Once streaming settles, the exit code is confirmed with
-    a short, separate run_script() call (run_script() is fine for that
-    — it's a trivial, non-interactive command).
+    Only downgrades when the help text was actually read (contains
+    "Usage: firmware") and the option is absent — an unreadable/odd
+    response keeps the current assumption (modern tool, both supported)
+    rather than guessing the device is old.
+    """
+    caps = {"preserve_env": True, "from": True}
+    try:
+        out = d.run_script("firmware help 2>&1", marker="fw_tool_caps", exec_timeout=10)
+    except RuntimeError as e:
+        logger.warning(f"firmware_tool_caps: run_script failed: {e}")
+        return caps
+    if "Usage: firmware" in out:
+        caps["preserve_env"] = "--preserve-env" in out
+        caps["from"] = "--from" in out
+    logger.info(f"firmware_tool_caps: {caps}")
+    return caps
+
+
+def _run_firmware_cmd(d: SerialDevice, fw_cmd: str, on_output, idle_timeout: float,
+                      max_total: float):
+    """
+    Stream one `firmware update ...` invocation, auto-answering its
+    "Type 'yes' to proceed" prompt, and judge the result.
+    Returns (success, output).
 
     NOTE: confirmed on real hardware that exit code alone isn't a
-    reliable success signal — a self-aborted run (prompt timed out
-    with nothing answering it) still reported RC=0 despite printing
-    "Aborted." and flashing nothing. The streamed output is checked
-    for "Aborted" explicitly, on top of the RC check, and is always
-    logged in full so a human can review it (signature verified,
-    flash complete, etc.) regardless of which check fires.
-
-    Args:
-        d: connected SerialDevice, at the recovery shell.
-        on_output: optional callback(text_chunk) for live progress —
-            e.g. tui.py can print chunks as they arrive instead of
-            the caller seeing nothing for several minutes.
-        idle_timeout, max_total: passed straight to _stream_command();
-            defaults match the values proven on real hardware. Only
-            overridden by tests, which use a fake serial source that
-            never naturally goes idle for 30 real seconds.
+    reliable success signal — a self-aborted run (prompt timed out with
+    nothing answering it) still reported RC=0 despite printing
+    "Aborted." and flashing nothing; "ERROR:" (die()) is likewise a hard
+    failure. The tool's own "Firmware update complete" line is a
+    definitive success signal and skips the slow `echo RC=$?` round-trip
+    (~20 s of run_script hops).
     """
-    # Step 0: best-effort NTP sync before anything TLS-verified runs (#23).
-    sync_device_clock(d)
-
-    # Step 1: Detect which medium we're booting from (so we know which to flash)
-    #
-    # BUG FIXED: this used to grep `root=` out of /proc/cmdline, with a
-    # failure-fallback of `root=/dev/mmcblk0p1` — a string that itself
-    # contains "mmcblk0". That made a detection FAILURE indistinguishable
-    # from a successful eMMC-boot detection: both silently resolved to
-    # target="qspi". Worse, `root=` isn't actually a reliable signal for
-    # current boot medium on this board even when the grep succeeds — the
-    # recovery kernel's cmdline can carry a static root= value that doesn't
-    # track which physical media was actually booted from.
-    #
-    # The board's own U-Boot env already sets an unambiguous signal for
-    # this instead: `boot_medium=emmc` / `boot_medium=qspi`, baked into
-    # bootargs by the "emmc" and "recovery" U-Boot boot commands
-    # respectively (see printenv on real hardware). Keying off that
-    # instead removes the ambiguity entirely.
-    try:
-        boot_output = d.run_script(
-            "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
-            marker="detect_boot_source", exec_timeout=5
-        )
-    except RuntimeError as e:
-        logger.warning(f"run_firmware_update: could not detect boot source: {e}")
-        # Default: assume booted from NOR, so flash eMMC
-        target = "emmc"
-    else:
-        if "boot_medium=emmc" in boot_output:
-            target = "qspi"
-        elif "boot_medium=qspi" in boot_output:
-            target = "emmc"
-        else:
-            # Neither value present — detection genuinely inconclusive.
-            # Don't guess silently: log it plainly and fall back to the
-            # same safe default as the exception path above.
-            logger.warning(
-                f"run_firmware_update: boot_medium not found in cmdline "
-                f"(got: {boot_output!r}) — defaulting to emmc target"
-            )
-            target = "emmc"
-
-    logger.info(f"run_firmware_update: will flash {target} (auto-detected by device)")
-
-    # Step 2: Run firmware update, auto-confirming the device's own
-    # "Type 'yes' to proceed" prompt.
-    #
-    # BUG FIXED: we used to pre-download .bin/.sig ourselves via curl
-    # and call `firmware update --from /tmp/firmware`. That hit a 401
-    # from https://firmware.mono.si that our plain curl couldn't get
-    # past — confirmed on real hardware (`cat`'d the "downloaded" file,
-    # it was a 26-byte "401 Authorization Required" body, not firmware).
-    #
-    # Confirmed via `firmware update --help` on real hardware: the
-    # tool's own default mode (no source flag) downloads from
-    # https://firmware.mono.si itself — that's the documented primary
-    # path, not --from (which is for offline/USB use with pre-staged
-    # files). Letting the tool do its own download instead of routing
-    # around it with our own curl sidesteps whatever auth/headers it
-    # needs that we were never going to replicate correctly.
-    #
-    # BUG FIXED (separate issue): the --from path was also assumed to
-    # make the confirmation prompt fully non-interactive, but real
-    # hardware showed the "Type 'yes' to proceed" prompt still
-    # appears regardless. auto_confirm_text/auto_confirm_response
-    # were already built into _stream_command() for exactly this,
-    # just never passed in at this call site. Wiring them up here.
-    #
-    # --preserve-env: passed for NOR flashes, but NOT for eMMC flashes.
-    # Preserving on an eMMC flash restores the device's OLD eMMC U-Boot
-    # env (e.g. a prior Armbian env with no "recovery" command) over the
-    # freshly flashed firmware's env - that wiped the "recovery" U-Boot
-    # command option 3 (NOR update) needs to boot recovery from eMMC,
-    # causing "run recovery -> not defined". Dropping it on the eMMC
-    # flash lets the new firmware's env (with "recovery") survive.
-    # Tradeoff: MAC/serial etc. now come from the new eMMC image instead
-    # of being carried over.
-    fw_cmd = "firmware update" if target == "emmc" else "firmware update --preserve-env"
     output = _stream_command(
         d, fw_cmd,
         idle_timeout=idle_timeout, max_total=max_total,
@@ -537,13 +497,6 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     error_output = "ERROR:" in output
     completed    = "Firmware update complete" in output
 
-    # FAST PATH: the tool's own "Firmware update complete" line is a
-    # definitive success signal. Trust it and SKIP the slow `echo RC=$?`
-    # round-trip - that goes through run_script (write temp file, verify
-    # byte count, exec, delete), each serial hop carrying a ~5s wait, which
-    # added ~20s of dead time after the flash had already finished. Only
-    # fall back to the exit-code check when the completion line is absent
-    # (e.g. an unexpected firmware build that does not print it).
     if completed:
         rc_output = "RC=0 (inferred from 'Firmware update complete')"
     else:
@@ -553,11 +506,8 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
             logger.warning(f"run_firmware_update: could not verify exit code: {e}")
             rc_output = ""
 
-    # RC=0 alone isn't a reliable success signal: "Aborted." (confirm-prompt
-    # self-abort) and "ERROR:" (e.g. "Cannot detect boot medium" on old
-    # U-Boot) both exit 0, so they are hard failures regardless of RC.
     success = ("RC=0" in rc_output) and not aborted and not error_output
-    logger.info(f"firmware update — full streamed output:\n{output}")
+    logger.info(f"{fw_cmd} — full streamed output:\n{output}")
     if aborted:
         logger.error(
             "firmware update printed 'Aborted.' — the confirmation prompt "
@@ -566,17 +516,220 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
         )
     elif error_output:
         logger.error(
-            "firmware update printed 'ERROR:' — it failed before doing "
-            "anything (likely old U-Boot without boot_medium= on kernel "
-            "cmdline). Legacy curl+dd fallback will be used instead."
+            "firmware update printed 'ERROR:' — it stopped before or during "
+            "the flash (see the streamed output above for the reason)."
         )
     elif not success:
         logger.error(
             f"firmware update did not report RC=0 (got: {rc_output!r}) — "
             "review the streamed output above to confirm what actually happened."
         )
-    return success
+    return success, output
 
+
+def _manual_download(d: SerialDevice, target: str) -> bool:
+    """
+    Fetch firmware-<target>-gateway-dk.bin + .bin.sig into MANUAL_FW_DIR
+    with `curl -k`, using the same mono:<MAC> auth and MAC detection as
+    the official tool (a plain unauthenticated curl got a 401 before).
+    -k only skips TLS verification of the transport; the tool still
+    verifies the signature before flashing (see block comment above).
+    """
+    fw = f"firmware-{target}-{FIRMWARE_MACHINE}.bin"
+    script = (
+        f"rm -rf {MANUAL_FW_DIR} && mkdir -p {MANUAL_FW_DIR} && cd {MANUAL_FW_DIR} && "
+        r"mac=$(ip -o link show | grep -m1 'ether' | sed 's|.*ether \([^ ]*\).*|\1|') && "
+        f'curl -kfsS -u "mono:$mac" -o {fw} {FIRMWARE_BASE_URL}/{fw} && '
+        f'curl -kfsS -u "mono:$mac" -o {fw}.sig {FIRMWARE_BASE_URL}/{fw}.sig; '
+        "echo DL_RC=$?"
+    )
+    try:
+        out = d.run_script(script, marker="manual_fw_download", exec_timeout=300)
+    except RuntimeError as e:
+        logger.error(f"_manual_download: run_script failed: {e}")
+        return False
+    ok = "DL_RC=0" in out
+    if not ok:
+        logger.error(f"_manual_download: download failed — output:\n{out}")
+    return ok
+
+
+def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
+                         idle_timeout: float = 30.0, max_total: float = 900.0,
+                         preserve_env: Optional[bool] = None) -> bool:
+    """
+    Flash the OTHER medium than the one booted (the tool auto-detects
+    boot_medium= and never overwrites what you're running from) via the
+    modern `firmware` tool, degrading gracefully and deterministically
+    (#24):
+
+      0. NTP clock sync, result shown on the console.
+      1. `firmware update [--preserve-env]` — the tool downloads itself
+         (TLS-verified).
+      2. If that failed with a TLS/certificate error: WARN, re-sync NTP,
+         retry once.
+      3. If it still failed and the tool supports --from: download .bin
+         and .bin.sig ourselves with `curl -k` (signature still verified
+         by the tool) and run `firmware update --from DIR [--preserve-env]`
+         — keeps the tool, and therefore the env choice, in charge.
+
+    The legacy curl+dd / curl+flashcp path is NOT part of this ladder: it
+    rewrites the env region regardless, so it only runs from the menu
+    flows after an explicit user confirmation (see _run_medium_update()).
+
+    Args:
+        preserve_env: keep the target's U-Boot env (--preserve-env).
+            None = default_preserve_env(target) — the historical policy
+            (eMMC: no, NOR: yes), used by the OS journeys.
+        on_output: optional callback(text_chunk) for live progress.
+        idle_timeout, max_total: passed to _stream_command(); only
+            overridden by tests.
+
+    Requires real internet access on the device's network — a hard,
+    documented prerequisite.
+    """
+    # Step 0: best-effort NTP sync before anything TLS-verified runs (#23).
+    sync_device_clock(d)
+
+    # Step 1: which medium are we booted from -> which one gets flashed.
+    # Keys off boot_medium= (set by U-Boot's "emmc"/"recovery" boot
+    # commands) — the same signal the tool itself uses. The old root=
+    # grep made a detection FAILURE indistinguishable from an eMMC boot.
+    try:
+        boot_output = d.run_script(
+            "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
+            marker="detect_boot_source", exec_timeout=5
+        )
+    except RuntimeError as e:
+        logger.warning(f"run_firmware_update: could not detect boot source: {e}")
+        target = "emmc"  # default: assume booted from NOR, so flash eMMC
+    else:
+        if "boot_medium=emmc" in boot_output:
+            target = "qspi"
+        elif "boot_medium=qspi" in boot_output:
+            target = "emmc"
+        else:
+            logger.warning(
+                f"run_firmware_update: boot_medium not found in cmdline "
+                f"(got: {boot_output!r}) — defaulting to emmc target"
+            )
+            target = "emmc"
+
+    logger.info(f"run_firmware_update: will flash {target} (auto-detected by device)")
+
+    if preserve_env is None:
+        preserve_env = default_preserve_env(target)
+
+    # Build flags from what this device's tool actually supports. A tool
+    # older than 2026-04-18 has no --preserve-env and dies on it — but it
+    # always preserves the env anyway, so plain `firmware update` gives
+    # the "preserve" outcome there and "wipe" is simply unavailable.
+    caps = firmware_tool_caps(d)
+    flags = ""
+    if preserve_env:
+        if caps["preserve_env"]:
+            flags = " --preserve-env"
+        else:
+            console_logger.info("  (Older firmware tool: it always preserves the U-Boot env — no flag needed.)")
+    elif not caps["preserve_env"]:
+        console_logger.info(
+            "  ⚠ Older firmware tool: it cannot wipe the U-Boot env — "
+            "the existing env will be kept."
+        )
+    console_logger.info(f"  U-Boot env on {target}: {'preserved' if preserve_env or not caps['preserve_env'] else 'reset to factory defaults'}")
+
+    # Tier 1: the tool's own download.
+    ok, output = _run_firmware_cmd(d, f"firmware update{flags}", on_output, idle_timeout, max_total)
+    if ok:
+        return True
+
+    # Tier 2: TLS error -> re-sync the clock and retry once.
+    if is_tls_error(output):
+        console_logger.info("  ⚠ WARN: TLS/certificate error from firmware.mono.si — "
+                            "re-syncing the clock and retrying once...")
+        logger.warning("run_firmware_update: TLS error detected, NTP re-sync + retry")
+        sync_device_clock(d)
+        ok, output = _run_firmware_cmd(d, f"firmware update{flags}", on_output, idle_timeout, max_total)
+        if ok:
+            return True
+
+    # Tier 3: our own curl -k download, flashed by the tool via --from.
+    if not caps["from"]:
+        console_logger.info("  ⚠ This firmware tool has no --from option — manual-download retry skipped.")
+        return False
+    console_logger.info("  ⚠ WARN: 'firmware update' failed — downloading firmware manually "
+                        "(curl -k; the tool still verifies the signature)...")
+    if not _manual_download(d, target):
+        console_logger.info("  ❌ Manual firmware download failed.")
+        return False
+    ok, _output = _run_firmware_cmd(
+        d, f"firmware update --from {MANUAL_FW_DIR}{flags}", on_output, idle_timeout, max_total,
+    )
+    if ok:
+        console_logger.info("  ✓ Flashed via 'firmware update --from' (manual download).")
+    return ok
+
+
+# --- U-Boot env stash/restore for the legacy path (#24) -------------------
+
+def stash_uboot_env(d: SerialDevice, target: str) -> Optional[str]:
+    """
+    Copy the target medium's raw U-Boot env region to UBOOT_ENV_STASH
+    before a legacy curl+dd / curl+flashcp rewrite, using the same
+    locations and size as the official tool's --preserve-env (see the
+    block comment above). Returns the env device ("/dev/mtdN" or
+    "/dev/mmcblk0") on success, None on failure (caller must warn).
+    """
+    if target == "qspi":
+        script = (
+            'e=""\n'
+            'for s in /sys/class/mtd/mtd[0-9]*; do\n'
+            '  [ "$(cat "$s/name" 2>/dev/null)" = "uboot-env" ] || continue\n'
+            '  e="/dev/$(basename "$s")"; break\n'
+            'done\n'
+            f'if [ -n "$e" ] && dd if="$e" of={UBOOT_ENV_STASH} bs={UBOOT_ENV_SIZE} count=1 2>/dev/null '
+            f'&& [ "$(wc -c < {UBOOT_ENV_STASH})" -eq {UBOOT_ENV_SIZE} ]; then echo "STASH_OK:$e"; '
+            'else echo STASH_FAIL; fi\n'
+        )
+    else:
+        script = (
+            f"if dd if=/dev/mmcblk0 of={UBOOT_ENV_STASH} bs=1 skip={UBOOT_ENV_EMMC_OFFSET} "
+            f"count={UBOOT_ENV_SIZE} 2>/dev/null && "
+            f'[ "$(wc -c < {UBOOT_ENV_STASH})" -eq {UBOOT_ENV_SIZE} ]; '
+            'then echo "STASH_OK:/dev/mmcblk0"; else echo STASH_FAIL; fi\n'
+        )
+    try:
+        out = d.run_script(script, marker="stash_uboot_env", exec_timeout=60)
+    except RuntimeError as e:
+        logger.error(f"stash_uboot_env: run_script failed: {e}")
+        return None
+    m = re.search(r"STASH_OK:(/dev/(?:mtd[0-9]+|mmcblk0))", out)
+    if not m:
+        logger.error(f"stash_uboot_env: failed — output:\n{out}")
+        return None
+    return m.group(1)
+
+
+def restore_uboot_env_region(d: SerialDevice, target: str, env_dev: str) -> bool:
+    """Write UBOOT_ENV_STASH back to env_dev (see stash_uboot_env())."""
+    if target == "qspi":
+        if not re.fullmatch(r"/dev/mtd[0-9]+", env_dev):
+            return False
+        cmd = f"flashcp {UBOOT_ENV_STASH} {env_dev} && echo RESTORE_OK || echo RESTORE_FAIL"
+    else:
+        cmd = (
+            f"dd if={UBOOT_ENV_STASH} of=/dev/mmcblk0 bs=1 seek={UBOOT_ENV_EMMC_OFFSET} 2>/dev/null "
+            "&& sync && echo RESTORE_OK || echo RESTORE_FAIL"
+        )
+    try:
+        out = d.run_script(cmd, marker="restore_uboot_env", exec_timeout=60)
+    except RuntimeError as e:
+        logger.error(f"restore_uboot_env_region: run_script failed: {e}")
+        return False
+    ok = "RESTORE_OK" in out
+    if not ok:
+        logger.error(f"restore_uboot_env_region: failed — output:\n{out}")
+    return ok
 
 
 def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> bool:
@@ -739,13 +892,15 @@ def legacy_flash_nor(d: SerialDevice, mac: str) -> bool:
 # caller (tui.py) is responsible for any additional pacing/messaging
 # around these calls, not for driving the wait itself.
 
-def phase_modern_flash_emmc(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None) -> bool:
+def phase_modern_flash_emmc(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
+                            preserve_env: Optional[bool] = None) -> bool:
     """
     Modern path, step 1: from NOR-booted recovery, run `firmware
     update` to flash eMMC. Returns True on confirmed success.
     """
     console_logger.info("Running 'firmware update' to flash eMMC...")
-    ok = step(1, "Flash eMMC via 'firmware update'", run_firmware_update(d, on_output=on_output))
+    ok = step(1, "Flash eMMC via 'firmware update'",
+              run_firmware_update(d, on_output=on_output, preserve_env=preserve_env))
     return ok
 
 
@@ -762,14 +917,16 @@ def phase_modern_verify_emmc_boot(d: SerialDevice, timeout: float = 90) -> bool:
     return ok
 
 
-def phase_modern_flash_nor(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None) -> bool:
+def phase_modern_flash_nor(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
+                           preserve_env: Optional[bool] = None) -> bool:
     """
     Modern path, step 3: from eMMC-booted recovery, run `firmware
     update` again — it auto-targets NOR this time since eMMC is now
     the active boot source. Returns True on confirmed success.
     """
     console_logger.info("Running 'firmware update' to flash NOR...")
-    ok = step(3, "Flash NOR via 'firmware update'", run_firmware_update(d, on_output=on_output))
+    ok = step(3, "Flash NOR via 'firmware update'",
+              run_firmware_update(d, on_output=on_output, preserve_env=preserve_env))
     return ok
 
 
@@ -782,30 +939,50 @@ def phase_modern_verify_nor_boot(d: SerialDevice, timeout: float = 90) -> bool:
     return ok
 
 
-def phase_legacy_flash_emmc(d: SerialDevice) -> bool:
+def _legacy_flash_with_env(d: SerialDevice, target: str, flash_fn, env_dev: Optional[str]) -> bool:
+    """
+    Run a legacy flash (curl+dd / curl+flashcp — both rewrite the env
+    region) and, if env_dev is set (stash_uboot_env() succeeded
+    beforehand), write the stashed env back afterwards (#24).
+    """
+    ok = flash_fn()
+    if ok and env_dev:
+        if restore_uboot_env_region(d, target, env_dev):
+            console_logger.info(f"  ✓ U-Boot env restored ({env_dev})")
+        else:
+            console_logger.info(f"  ⚠ Flash OK, but restoring the U-Boot env to {env_dev} FAILED — "
+                                "env is at factory defaults.")
+    return ok
+
+
+def phase_legacy_flash_emmc(d: SerialDevice, env_dev: Optional[str] = None) -> bool:
     """
     Legacy path, step 1: get the device's real MAC, then flash eMMC
-    via curl+dd per the documented legacy procedure.
+    via curl+dd per the documented legacy procedure. env_dev: see
+    _legacy_flash_with_env().
     """
     mac = get_device_mac(d)
     if mac is None:
         return step(1, "Flash eMMC (legacy curl+dd)", False, "could not determine device MAC address")
     console_logger.info(f"Device MAC: {mac}")
     console_logger.info("Downloading and flashing eMMC (legacy path)...")
-    ok = step(1, "Flash eMMC (legacy curl+dd)", legacy_flash_emmc(d, mac))
+    ok = step(1, "Flash eMMC (legacy curl+dd)",
+              _legacy_flash_with_env(d, "emmc", lambda: legacy_flash_emmc(d, mac), env_dev))
     return ok
 
 
-def phase_legacy_flash_nor(d: SerialDevice) -> bool:
+def phase_legacy_flash_nor(d: SerialDevice, env_dev: Optional[str] = None) -> bool:
     """
-    Legacy path, step 2: same MAC, flash NOR via curl+flashcp.
+    Legacy path, step 2: same MAC, flash NOR via curl+flashcp. env_dev:
+    see _legacy_flash_with_env().
     """
     mac = get_device_mac(d)
     if mac is None:
         return step(2, "Flash NOR (legacy curl+flashcp)", False, "could not determine device MAC address")
     console_logger.info(f"Device MAC: {mac}")
     console_logger.info("Downloading and flashing NOR (legacy path)...")
-    ok = step(2, "Flash NOR (legacy curl+flashcp)", legacy_flash_nor(d, mac))
+    ok = step(2, "Flash NOR (legacy curl+flashcp)",
+              _legacy_flash_with_env(d, "qspi", lambda: legacy_flash_nor(d, mac), env_dev))
     return ok
 
 
@@ -843,22 +1020,94 @@ _MEDIUM_CONFIG = {
     "emmc": {
         "boot_medium":   "qspi",   # boot from NOR recovery so 'firmware update' targets eMMC
         "label":         "eMMC",
+        "target":        "emmc",   # firmware tool's name for the flashed medium
         "tool_name":     "curl+dd",
-        "modern_flash":  lambda d, on_output: phase_modern_flash_emmc(d, on_output=on_output),
-        "legacy_flash":  lambda d: phase_legacy_flash_emmc(d),
+        "modern_flash":  lambda d, on_output, preserve_env: phase_modern_flash_emmc(d, on_output=on_output, preserve_env=preserve_env),
+        "legacy_flash":  lambda d, env_dev: phase_legacy_flash_emmc(d, env_dev=env_dev),
         "legacy_message": "Flashing eMMC (legacy curl+dd)...",
         "legacy_only_extra_note": None,
     },
     "nor": {
         "boot_medium":   "emmc",   # boot from eMMC recovery so 'firmware update' targets NOR
         "label":         "NOR",
+        "target":        "qspi",
         "tool_name":     "curl+flashcp",
-        "modern_flash":  lambda d, on_output: phase_modern_flash_nor(d, on_output=on_output),
-        "legacy_flash":  lambda d: phase_legacy_flash_nor(d),
+        "modern_flash":  lambda d, on_output, preserve_env: phase_modern_flash_nor(d, on_output=on_output, preserve_env=preserve_env),
+        "legacy_flash":  lambda d, env_dev: phase_legacy_flash_nor(d, env_dev=env_dev),
         "legacy_message": "Flashing NOR (legacy curl+flashcp)...",
         "legacy_only_extra_note": "  (No DIP-switch flip needed for this path.)",
     },
 }
+
+
+
+# --- Interactive choices for the menu update flows (#24) ------------------
+# Only _run_medium_update() (menu options 2/3) prompts; the OS journeys call
+# run_firmware_update() non-interactively with the default env policy.
+
+def _ask_yes_no(question: str, default: bool) -> bool:
+    """input()-based Y/n prompt; empty answer (or EOF) = default."""
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"  {question} {hint}: ").strip().lower()
+    except EOFError:
+        return default
+    if not answer:
+        return default
+    return answer in ("y", "yes", "j", "ja")
+
+
+def ask_preserve_env(target: str, label: str) -> bool:
+    """Ask whether to keep the target's U-Boot env; default per target."""
+    default = default_preserve_env(target)
+    console_logger.info("")
+    if target == "emmc":
+        console_logger.info("  U-Boot env: default is NOT to preserve on eMMC — an old eMMC env")
+        console_logger.info("  (e.g. from Armbian) can lack the 'recovery' command the NOR update")
+        console_logger.info("  (option 3) needs. Preserve it if an OS on eMMC depends on it.")
+    else:
+        console_logger.info("  U-Boot env: default is to preserve on NOR — it holds your boot")
+        console_logger.info("  settings (e.g. OPNsense's bootcmd). Not preserving resets it to")
+        console_logger.info("  factory defaults.")
+    choice = _ask_yes_no(f"Preserve the {label} U-Boot environment?", default)
+    logger.info(f"ask_preserve_env: target={target} preserve={choice}")
+    return choice
+
+
+def _confirm_legacy_fallback(cfg: dict, preserve_env: bool) -> bool:
+    """Explicit consent before the legacy last resort (default: No)."""
+    console_logger.info("")
+    console_logger.info(f"  ⚠ The firmware tool could not update {cfg['label']} (all retries failed).")
+    console_logger.info(f"  Last resort: legacy {cfg['tool_name']}, which bypasses the tool and")
+    console_logger.info("  rewrites the U-Boot env region.")
+    if preserve_env:
+        console_logger.info("  The env will be stashed first and written back afterwards.")
+    else:
+        console_logger.info("  The U-Boot env WILL be reset to factory defaults.")
+    return _ask_yes_no(f"Run the legacy {cfg['tool_name']} fallback?", False)
+
+
+def _run_legacy(d: SerialDevice, cfg: dict, preserve_env: bool) -> bool:
+    """
+    Legacy flash with the env choice applied: stash the env region
+    first when preserving; if that stash fails, WARN and ask before
+    flashing anyway (env would be lost).
+    """
+    env_dev = None
+    if preserve_env:
+        env_dev = stash_uboot_env(d, cfg["target"])
+        if env_dev:
+            console_logger.info(f"  ✓ U-Boot env stashed from {env_dev}")
+        else:
+            console_logger.info("  ⚠ WARN: could not stash the U-Boot env — flashing now will reset")
+            console_logger.info("    it to factory defaults.")
+            if not _ask_yes_no("Flash anyway and lose the U-Boot env?", False):
+                return False
+    ok, _leg_err = with_spinner(cfg["legacy_flash"], d, env_dev, message=cfg["legacy_message"])
+    if _leg_err:
+        logger.error(f"legacy flash raised: {_leg_err}")
+        return False
+    return bool(ok)
 
 
 def _run_medium_update(
@@ -870,9 +1119,13 @@ def _run_medium_update(
     """
     Shared flow behind run_emmc_update()/run_nor_update(): bootstrap
     into the recovery shell for the OTHER medium, detect modern vs.
-    legacy firmware tool, resolve the device network, then flash the
-    target medium via the modern `firmware update` (falling back to
-    the legacy curl-based path if that fails or isn't available).
+    legacy firmware tool, resolve the device network, ask whether to
+    preserve the target's U-Boot env, then flash the target medium via
+    the modern `firmware update` ladder (run_firmware_update(): NTP,
+    TLS retry, curl -k + --from). The legacy curl-based path runs only
+    when the device has no usable tool, or — after an explicit y/N —
+    as the last resort; either way the env choice is applied via
+    stash_uboot_env()/restore_uboot_env_region() (#24).
     Prints its own step-by-step report before returning.
 
     This ~90-line bootstrap/detect/flash/fallback sequence used to be
@@ -913,20 +1166,23 @@ def _run_medium_update(
         if not setup_network(d):
             return print_report()
 
+        # One env choice per run, honoured by every tier below (#24):
+        # the modern tool (--preserve-env) and the legacy path (manual
+        # stash + restore of the env region).
+        preserve_env = ask_preserve_env(cfg["target"], cfg["label"])
+
         if is_modern:
             console_logger.info("")
             console_logger.info("  Modern firmware tool detected.")
             console_logger.info("")
-            ok = cfg["modern_flash"](d, on_output)
+            ok = cfg["modern_flash"](d, on_output, preserve_env)
             if not ok:
-                console_logger.info("")
-                console_logger.info(f"  ⚠ Modern 'firmware update' failed — falling back to legacy {cfg['tool_name']}...")
-                ok, _leg_err = with_spinner(
-                    cfg["legacy_flash"], d,
-                    message=cfg["legacy_message"]
-                )
-                if _leg_err:
-                    ok = False
+                # Last resort only, and only with consent: the legacy path
+                # bypasses the tool and rewrites the env region itself.
+                if not _confirm_legacy_fallback(cfg, preserve_env):
+                    console_logger.info(f"  ❌ Update of {cfg['label']} aborted — nothing further flashed.")
+                    return print_report()
+                ok = _run_legacy(d, cfg, preserve_env)
                 if not ok:
                     console_logger.info(f"  ❌ Legacy fallback also failed for {cfg['label']}.")
                     return print_report()
@@ -937,12 +1193,7 @@ def _run_medium_update(
             if cfg["legacy_only_extra_note"]:
                 console_logger.info(cfg["legacy_only_extra_note"])
             console_logger.info("")
-            ok, _leg_err = with_spinner(
-                cfg["legacy_flash"], d,
-                message=cfg["legacy_message"]
-            )
-            if _leg_err:
-                ok = False
+            ok = _run_legacy(d, cfg, preserve_env)
             if not ok:
                 return print_report()
 
