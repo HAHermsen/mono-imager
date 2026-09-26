@@ -878,10 +878,17 @@ class MonoImager:
         print()
         print("=" * 60)
         if self.flash_success:
+            # Journey-specific (#25): OPNsense stays on NOR — telling every
+            # OS to flip to eMMC sent OPNsense users into recovery Linux.
+            from mono_imager.journeys import final_dip, DIP_LABELS
+            dip = final_dip(self.os_name)
             print("✅ Flashing complete!")
             print()
             print("  ⚡ NEXT STEP: Set DIP Switch ⚡")
-            print("  Move the DIP switch to: LEFT (eMMC)")
+            print(f"  Move the DIP switch to: {DIP_LABELS[dip]}")
+            if dip == "NOR":
+                print(f"  ({self.os_name} boots via NOR's U-Boot — do NOT flip to eMMC,")
+                print("   eMMC's U-Boot has factory defaults and boots recovery Linux.)")
             print()
             print("  Then power-cycle the device.")
             print("  It will boot with the new firmware.")

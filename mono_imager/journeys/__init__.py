@@ -22,6 +22,30 @@ _FLASH_TARGETS = {
     "Armbian":  "/dev/mmcblk0",
 }
 
+# Final DIP-switch position per OS, shown on tui.py's end-of-flash screen
+# (#25). OPNsense boots from NOR: its U-Boot env (bootcmd "run opnsense ||
+# run recovery") is saved to NOR's env, while the journey's closing
+# `firmware update` rewrites eMMC's firmware region with a factory-default
+# env (no `opnsense` var) — so an eMMC boot falls through to recovery.
+# OpenWRT and Armbian both end on eMMC per their documented procedures.
+_FINAL_DIP = {
+    "OPNsense": "NOR",
+    "OpenWRT":  "EMMC",
+    "Armbian":  "EMMC",
+}
+
+# Human-readable label for each DIP position (physical switch direction).
+DIP_LABELS = {
+    "NOR":  "RIGHT (NOR)",
+    "EMMC": "LEFT (eMMC)",
+}
+
+
+def final_dip(os_name) -> str:
+    """Final DIP position ("NOR" or "EMMC") for os_name; "EMMC" if unknown
+    (the previous hardcoded behaviour of the end-of-flash screen)."""
+    return _FINAL_DIP.get(os_name, "EMMC")
+
 # --- Image / OS format guard --------------------------------------------
 # Each journey feeds its downloaded image to a specific decompressor before
 # dd (opnsense: bzip2 always; openwrt: gunzip on .gz else raw; armbian: xz

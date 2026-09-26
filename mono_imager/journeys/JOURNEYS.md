@@ -242,6 +242,7 @@ Output:
 
 **New OS, same flash behaviour as existing OS:**
 - Add flash target to `_FLASH_TARGETS` in `journeys/__init__.py`
+- Add final DIP position to `_FINAL_DIP` in `journeys/__init__.py` (shown on the end-of-flash screen; defaults to eMMC)
 - Create `journeys/<os>_lan.py` and `journeys/<os>_usb.py`
 - Tag or import steps that apply to the new OS
 
