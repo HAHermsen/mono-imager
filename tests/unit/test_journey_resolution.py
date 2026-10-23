@@ -143,7 +143,7 @@ print("discovered_journeys()")
 print("=" * 60)
 
 discovered = discovered_journeys()
-check("discovered_journeys returns 6 entries", len(discovered) == 6)
+check("discovered_journeys returns 8 entries (6 + VyOS net/netemmc, #28)", len(discovered) == 8)
 for os_name in SUPPORTED_OS:
     for transfer in SUPPORTED_TRANSFER:
         check(

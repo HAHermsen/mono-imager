@@ -1,6 +1,6 @@
 # mono-imager
 
-Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — no manual `dd`/`tftp` fiddling required.
+Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — or installs VyOS — no manual `dd`/`tftp` fiddling required.
 
 Version: **1.4.1** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
@@ -19,7 +19,10 @@ mono-imager automates the full flashing procedure for the Mono Gateway hardware:
 - Falls back to a legacy `curl`+`dd`/`flashcp` path automatically on older devices that don't have the modern `firmware update` tool.
 - Prints a step-by-step pass/fail report for every operation, plus a full log file.
 
-Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each available via **LAN** or **USB** transfer.
+Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each available via **LAN** or **USB** transfer — and **VyOS** (the [LS1046A port](https://github.com/mihakralj/vyos-ls1046a-build)):
+
+- **VyOS via LAN → USB stick in the Mono**: you point it at the `.iso` on your PC; it is sent to the Mono, written to the USB stick in the Mono (read back to confirm), live-booted, and installed to eMMC with VyOS's own `install image` — mono-imager answers the installer's questions (eMMC as the target, serial console, your chosen password). DIP stays on NOR afterwards. New in 1.5.0: built and tested without hardware (simulated device); the first real run is still to come.
+- **VyOS via LAN → eMMC staging (EXPERIMENTAL, not yet tested on hardware)**: same, without a USB stick — the ISO is staged on the eMMC and booted with `toram`; it stops before installing if the live system is not running from RAM.
 
 ## What it does **NOT** do (and never will)
 

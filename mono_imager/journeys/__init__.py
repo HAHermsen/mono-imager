@@ -20,6 +20,7 @@ _FLASH_TARGETS = {
     "OPNsense": "/dev/mmcblk0",
     "OpenWRT":  "/dev/mmcblk0",
     "Armbian":  "/dev/mmcblk0",
+    "VyOS":     "/dev/mmcblk0",   # installed by VyOS's own `install image`
 }
 
 # Final DIP-switch position per OS, shown on tui.py's end-of-flash screen
@@ -28,10 +29,13 @@ _FLASH_TARGETS = {
 # `firmware update` rewrites eMMC's firmware region with a factory-default
 # env (no `opnsense` var) — so an eMMC boot falls through to recovery.
 # OpenWRT and Armbian both end on eMMC per their documented procedures.
+# VyOS: its installer writes bootcmd 'run vyos || run recovery' into NOR's
+# U-Boot env (vyos-postinstall, fw_setenv) — so it boots via NOR too.
 _FINAL_DIP = {
     "OPNsense": "NOR",
     "OpenWRT":  "EMMC",
     "Armbian":  "EMMC",
+    "VyOS":     "NOR",
 }
 
 # Human-readable label for each DIP position (physical switch direction).
@@ -141,18 +145,33 @@ def discovered_journeys() -> list[tuple[str, str]]:
     return sorted(seen)
 
 
+def _journey_attr(os_name: str, transfer: str, attr: str, default):
+    """Optional module-level attribute of journeys/<os>_<transfer>.py."""
+    import sys
+    mod = sys.modules.get(f"mono_imager.journeys.{os_name.lower()}_{transfer}")
+    return getattr(mod, attr, default) if mod else default
+
+
 def get_firmware_prompt(os_name: str, transfer: str) -> str:
     """
     Return the firmware file prompt string for the given OS+transfer.
     Defined in each journey file as FIRMWARE_PROMPT.
     Falls back to a generic prompt if not defined.
     """
-    import sys
-    module_name = f"mono_imager.journeys.{os_name.lower()}_{transfer}"
-    mod = sys.modules.get(module_name)
-    if mod and hasattr(mod, "FIRMWARE_PROMPT"):
-        return mod.FIRMWARE_PROMPT
-    return "Type the full path (or drag-n-drop) of the firmware file:"
+    return _journey_attr(os_name, transfer, "FIRMWARE_PROMPT",
+                         "Type the full path (or drag-n-drop) of the firmware file:")
+
+
+def get_transfer_label(os_name: str, transfer: str) -> str:
+    """Menu text for the transfer method — TRANSFER_LABEL in the journey
+    file, else the transfer name itself ("lan", "usb")."""
+    return _journey_attr(os_name, transfer, "TRANSFER_LABEL", transfer)
+
+
+def get_journey_notice(os_name: str, transfer: str) -> str:
+    """Optional NOTICE text a journey file wants shown before the image
+    path is asked (e.g. VyOS: "check your ISO's source yourself")."""
+    return _journey_attr(os_name, transfer, "NOTICE", "")
 
 
 def get_journey(

@@ -24,7 +24,18 @@ OpenWRT  + lan   →  5 steps
 OpenWRT  + usb   →  6 steps
 Armbian  + lan   →  6 steps
 Armbian  + usb   →  6 steps
+VyOS     + net      → 10 steps   (LAN -> USB stick in the Mono)
+VyOS     + netemmc  → 12 steps   (LAN -> eMMC staging, EXPERIMENTAL)
 ```
+
+VyOS (#28) is different from the other OSes: mono-imager does not dd an
+OS image onto the eMMC itself. It writes the VyOS ISO to a USB stick in
+the Mono (or stages it on the eMMC), live-boots it, and drives VyOS's own
+`install image` over serial. Shared code: `journeys/_vyos.py` (scripts,
+ISO/FAT32/boot.scr reading, serial expect helpers, the installer
+dialogue) and `journeys/_vyos_steps.py` (step implementations). The
+journey files may set `TRANSFER_LABEL` (menu text) and `NOTICE` (shown
+before the image path is asked) next to `FIRMWARE_PROMPT`.
 
 OpenWRT and Armbian both follow the official documented procedure
 (we-are-mono/docs) as of the last update: eMMC's own firmware/
@@ -69,6 +80,8 @@ Current journey files:
 - `journeys/openwrt_usb.py`
 - `journeys/opnsense_lan.py`
 - `journeys/opnsense_usb.py`
+- `journeys/vyos_net.py`
+- `journeys/vyos_netemmc.py`
 
 ---
 
@@ -119,9 +132,9 @@ ctx.has("firmware_source")        # check — True if the key exists
 
 ## Adding a new OS
 
-Say you want to add **VyOS** with both LAN and USB support.
+Say you want to add **MyOS** with both LAN and USB support.
 
-VyOS flashes to the whole eMMC (`/dev/mmcblk0`) and reboots — identical to Armbian. So you need zero new steps. Just:
+MyOS flashes to the whole eMMC (`/dev/mmcblk0`) and reboots — identical to Armbian. So you need zero new steps. Just:
 
 **Step 1: Add the flash target** in `journeys/__init__.py`:
 
@@ -130,15 +143,15 @@ _FLASH_TARGETS = {
     "OPNsense": "/dev/mmcblk0",
     "OpenWRT":  "/dev/mmcblk0",   # whole disk, per current doc
     "Armbian":  "/dev/mmcblk0",
-    "VyOS":     "/dev/mmcblk0",   # ← add this
+    "MyOS":     "/dev/mmcblk0",   # ← add this
 }
 ```
 
-**Step 2: Create journey files** `journeys/vyos_lan.py` and `journeys/vyos_usb.py`.
+**Step 2: Create journey files** `journeys/myos_lan.py` and `journeys/myos_usb.py`.
 
-Tag existing steps with `"VyOS"` wherever they apply, or import and re-register steps from an existing journey file (see `openwrt_usb.py` importing `_uboot_steps_openwrt_lan` from `openwrt_lan.py` as an example).
+Tag existing steps with `"MyOS"` wherever they apply, or import and re-register steps from an existing journey file (see `openwrt_usb.py` importing `_uboot_steps_openwrt_lan` from `openwrt_lan.py` as an example).
 
-Done. `FlowRunner` now builds correct journeys for `VyOS + lan` and `VyOS + usb` automatically.
+Done. `FlowRunner` now builds correct journeys for `MyOS + lan` and `MyOS + usb` automatically.
 
 ---
 

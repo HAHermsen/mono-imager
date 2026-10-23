@@ -153,9 +153,10 @@ def show_flash_confirmation(
     print("  |   +-------------+      |  flashed now [OK]  |    |")
     print("  |                        +-------------------+     |")
     print("  |                                                  |")
-    if os_name == "OPNsense":
+    from mono_imager.journeys import final_dip
+    if final_dip(os_name) == "NOR":
         print("  | After flashing: keep the DIP switch RIGHT        |")
-        print("  | (NOR). OPNsense boots via NOR itself, which      |")
+        print(f"  | (NOR). {os_name:<8} boots via NOR itself, which      |")
         print("  | loads the OS from eMMC — no DIP flip needed.     |")
     else:
         print("  | After flashing, the DIP switch picks which one   |")

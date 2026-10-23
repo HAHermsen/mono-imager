@@ -461,8 +461,9 @@ class MonoImager:
         journeys = discovered_journeys()  # [(os_name, transfer), ...]
 
         print("  Select OS and flash method:")
+        from mono_imager.journeys import get_transfer_label
         for i, (os_name, transfer) in enumerate(journeys, 1):
-            print(f"    {i}) {os_name} via {transfer}")
+            print(f"    {i}) {os_name} via {get_transfer_label(os_name, transfer)}")
         back_idx = len(journeys) + 1
         print(f"    {back_idx}) Back")
         print("  (Type 'exit!' at any prompt to escape to main menu)")
@@ -524,7 +525,11 @@ class MonoImager:
             firmware_path     = Path(".")
             firmware_display  = "auto-detected from USB stick (16 GB min. recommended)"
         else:
-            from mono_imager.journeys import get_firmware_prompt
+            from mono_imager.journeys import get_firmware_prompt, get_journey_notice
+            notice = get_journey_notice(os_name, transfer)
+            if notice:
+                print(notice)
+                print()
             firmware_prompt = get_firmware_prompt(os_name, transfer)
             firmware_raw = self.safe_input(f"  {firmware_prompt} ")
             if firmware_raw is None:
