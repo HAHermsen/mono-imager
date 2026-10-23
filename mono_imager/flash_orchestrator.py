@@ -477,15 +477,15 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     verbose("=" * 60)
     console_logger.info("Connecting to device...")
 
-    # Step 1: Device detected
+    # Step 1: Port present (only checks the OS lists it; Step 2 proves a device answers)
     try:
         known, other = detect_serial_ports()
         all_ports    = known + other
         found        = any(p.device == port for p in all_ports)
-        if not step(1, f"Device detected on {port}", found, "" if found else "port not in list"):
+        if not step(1, f"Port {port} present", found, "" if found else "port not in list"):
             return None
     except RuntimeError as e:
-        step(1, f"Device detected on {port}", False, str(e))
+        step(1, f"Port {port} present", False, str(e))
         return None
 
     # Step 2: Connect

@@ -429,37 +429,28 @@ class MonoImager:
 
     def menu_network_auto_config(self):
         """
-        Fully-auto path — matches tests/test_verify_flash_auto.py
-        exactly. Only the firmware file is asked; the serial port is
-        auto-detected (first port found), host IP is auto-detected,
-        device IP is auto-derived from it, HTTP port defaults to 8080,
-        flash target defaults to /dev/mmcblk0.
+        Fully-auto path. Only the firmware file is asked; the serial
+        port is the one chosen at launch (self.serial_port). If none
+        was chosen this session, the normal port picker runs: it
+        auto-selects a single port and asks when there are several
+        (#27 — never just the first port in the list). Host IP is
+        auto-detected, device IP is auto-derived from it, HTTP port
+        defaults to 8080, flash target defaults to /dev/mmcblk0.
         """
         from mono_imager import flash_orchestrator as core
-        from mono_imager.config import detect_serial_ports
 
         self.print_screen_divider()
         print("  Fully Auto")
         print()
 
-        try:
-            known, other = detect_serial_ports()
-            all_ports = known + other
-        except Exception as e:
-            print(f"  ❌ Port auto-detection failed: {e}")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.MAIN
-            return
-
-        if not all_ports:
-            print("  ❌ No serial port detected. Connect the device, or")
-            print("  use Manual mode to specify one.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
-            return
-
-        port = all_ports[0].device
-        print(f"  Auto-detected port: {port} ({all_ports[0].description})")
+        port = self.serial_port
+        if port:
+            print(f"  Serial port: {port} (chosen at launch)")
+        else:
+            port = self._select_port(auto_select_single=True, allow_back=True, save_on_select=True)
+            if port is None:
+                self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
+                return
         print()
         print("  ℹ️  Images over ~3GB auto-switch to streaming flash mode (slower, no local copy).")
         print()
@@ -1136,6 +1127,10 @@ class MonoImager:
             print()
             print("  tty device could not be opened, did you run this script with sudo?")
             sys.exit(1)
+
+        # Remember the launch choice for this session, so later menus
+        # (Fully Auto, tests) use it instead of re-picking (#27).
+        self.serial_port = port
 
         d = core.phase1_bootstrap(port, 115200)
         if d is None:
