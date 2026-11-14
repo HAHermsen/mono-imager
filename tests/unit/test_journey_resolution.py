@@ -69,17 +69,18 @@ EXPECTED = {
         "Re-image eMMC firmware (firmware update)",
         "Reboot into OPNsense",
     ],
+    # OpenWRT: whole-disk image in two dd passes (partition table, then
+    # 32 MiB onward) — no fdisk step since the official-procedure rewrite
+    # (see journeys/FIRMWARE_VS_OS_IMAGE.md).
     ("OpenWRT", "lan"): [
         "Device network ready",
         "Start HTTP server",
         "Verify firmware reachable",
-        "Partition eMMC (fdisk)",
         "Flash OpenWRT image (dd)",
         "Firmware update (eMMC bootloader)",
     ],
     ("OpenWRT", "usb"): [
         "Device network ready",
-        "Partition eMMC (fdisk)",
         "Mount USB stick",
         "Detect firmware file on USB",
         "Flash OpenWRT image (dd)",
@@ -222,7 +223,7 @@ print("=" * 60)
 
 EXPECTED_TARGETS = {
     "OPNsense": "/dev/mmcblk0",
-    "OpenWRT":  "/dev/mmcblk0p1",
+    "OpenWRT":  "/dev/mmcblk0",     # whole disk (was p1 before the official-procedure rewrite)
     "Armbian":  "/dev/mmcblk0",
 }
 
@@ -277,7 +278,7 @@ runner_usb = get_journey(
 ctx_usb = runner_usb.ctx
 check("ctx.usb_device set correctly",        ctx_usb.usb_device == "/dev/sdb")
 check("ctx.usb_mount set correctly",         ctx_usb.usb_mount == "/mnt/stick")
-check("ctx.flash_target is /dev/mmcblk0p1", ctx_usb.flash_target == "/dev/mmcblk0p1")
+check("ctx.flash_target is /dev/mmcblk0", ctx_usb.flash_target == "/dev/mmcblk0")
 
 
 # ============================================================================

@@ -38,8 +38,8 @@ This isn't a workaround for OPNsense — it's the literal documented sequence (e
 
 `step_flash_openwrt` (`openwrt_lan.py` / `openwrt_usb.py`) writes the whole
 OpenWRT image to `/dev/mmcblk0` via two `dd` passes, per docs.mono.si
-"Installing OpenWRT": `bs=512 count=8` writes just the first 4KiB (the
-image's own GPT/partition table), then `bs=1M skip=32 seek=32` writes
+"Installing OpenWRT": `bs=512 count=8` (`PT_DD_ARGS`) writes just the first 4KiB (the
+image's own GPT/partition table), then `bs=1M skip=32 seek=32` (`BULK_DD_ARGS`) writes
 everything from the 32MiB mark onward. Neither pass touches offset
 4KiB-32MiB — the firmware region is never read from the image or
 written to the device.
@@ -59,6 +59,18 @@ region *populated* the first time.
 
 ---
 
+### VyOS — the installer leaves the firmware region alone
+
+VyOS is installed by its own `install image` (see `_vyos.py`), not by `dd`. The LS1046A port keeps 4KiB-64MiB free on the eMMC (its INSTALL.md "eMMC Partition Layout"), so Mono's firmware region is never written. The EXPERIMENTAL eMMC staging path (`vyos_netemmc.py`) also stages the ISO at 64MiB and writes only the partition table in the first 4KiB.
+
+### eMMC snapshot / restore (#29)
+
+A snapshot copies the whole eMMC, firmware region included; its SHA-256 is recorded separately in `manifest.json`. A same-board restore skips 4KiB-32MiB when this board's firmware region is already identical, and writes it otherwise. Clone mode (snapshot from another Mono) never writes 4KiB-32MiB — it runs `firmware update` first to provision this board, then writes 0-4KiB and 32MiB onward, the same split as the OpenWRT pattern below.
+
+The pre-snapshot GPT check knows about this constraint: an OS image whose own GPT entry array runs past 4KiB has that tail overwritten by Mono's firmware (Armbian, OPNsense), so its entry CRC no longer matches. That is reported as a warning, not an error.
+
+---
+
 ## Summary
 
 | OS | Flash target | Touches 0–32MiB during flash? | `firmware update` purpose |
@@ -66,5 +78,8 @@ region *populated* the first time.
 | Armbian | `/dev/mmcblk0` (whole disk) | Yes — overwritten | Restore after overwrite |
 | OPNsense | `/dev/mmcblk0` (whole disk) | Yes — erased, then overwritten | Restore after overwrite (documented step) |
 | OpenWRT | `/dev/mmcblk0` (whole disk, GPT rewritten by dd pass 1) | No — 4KiB-32MiB never read/written | Populate reserved region |
+| VyOS | installed by VyOS's `install image` | No — layout keeps 4KiB-64MiB free | Not run by the journey |
+| Snapshot restore (same board) | whole disk | Only when it differs from this board's | Not run |
+| Snapshot restore (clone) | 0-4KiB + 32MiB..end | No | Provision this board |
 
 All three end up with a correctly-populated firmware region by the time the journey completes — Armbian and OPNsense get there by fixing it up afterward, OpenWRT by never breaking it in the first place.

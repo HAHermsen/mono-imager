@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mono-imager: Step Registry (v1.2.10)
+mono-imager: Step Registry
 
 Decorator-based step registry. Steps declare os=, transfer=,
 requires=, produces=. FlowRunner resolves the correct sequence
@@ -23,7 +23,6 @@ ADDING A JOURNEY:
     3. FlowRunner builds the sequence from requires/produces
 
 Author:  H.A. Hermsen
-Version: v1.2.10
 License: GPLv3
 """
 
@@ -31,6 +30,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from pathlib import Path
+
+from mono_imager import constants as C
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class StepContext:
     # Network (used by network journeys)
     host_ip:       str            = ""
     device_ip:     str            = ""
-    http_port:     int            = 8080
+    http_port:     int            = C.HTTP_PORT
     device_mac:    str            = ""
 
     # Device's own recovery-shell network (DHCP or manual), resolved once
@@ -71,11 +72,11 @@ class StepContext:
 
     # Firmware source
     firmware_path: Optional[Path] = None   # local path (network: served; usb: on stick)
-    flash_target:  str            = "/dev/mmcblk0"
+    flash_target:  str            = C.EMMC_DEV
 
     # USB (used by usb journeys)
-    usb_device:    str            = "/dev/sda"   # block device on the Mono Gateway
-    usb_mount:     str            = "/mnt/usb"   # where it gets mounted on-device
+    usb_device:    str            = C.USB_DEV   # block device on the Mono Gateway
+    usb_mount:     str            = C.USB_MOUNT   # where it gets mounted on-device
 
     # Runtime state (produced by steps, consumed by later steps)
     state:         dict           = field(default_factory=dict)

@@ -5,7 +5,6 @@ Provides UART autodetect, USB presence polling, U‑Boot automation,
 recovery boot handling, and firmware flashing utilities
 
 Author:  H.A. Hermsen
-Version: v1.2.10
 License: GPLv3
 """
 
@@ -19,7 +18,58 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 from mono_imager.logging_setup import make_verbose, debug_enabled as _debug_enabled  # noqa: F401
+from mono_imager import constants as C
 verbose = make_verbose(logger)
+
+# --- Tuning — every value below was found on real hardware; see the comments
+#     at the use sites before changing one. Seconds unless noted.
+EACCES = 13                        # errno: permission denied (tty without dialout/sudo)
+DEFAULT_READ_TIMEOUT = 10.0        # pyserial read timeout of a new SerialDevice
+DEFAULT_CMD_TIMEOUT = 5.0          # send_command() when no timeout is given
+PORT_APPEAR_TIMEOUT = 30           # connect(): wait for the port to show up
+PORT_WAIT_DEFAULT_TIMEOUT = 30.0   # wait_for_port() default
+RECONNECT_PORT_TIMEOUT = 20        # _attempt_reconnect()
+RETRY_PORT_TIMEOUT = 10            # _wait_for_root_shell(): per reconnect attempt
+BAUD_PROBE_SETTLE = 0.5            # after poking a baud rate, before reading back
+VERIFY_SHELL_TIMEOUT = 5.0
+LINE_SETTLE = 0.3                  # _wait_for_line_idle(): silence that counts as idle
+LINE_IDLE_MAX_WAIT = 5.0
+LINE_IDLE_SHORT_WAIT = 2.0
+POLL_SLEEP = 0.02                  # short poll interval, not a settling sleep
+SCRIPT_WRITE_TIMEOUT = 10.0        # run_script()/launch_script() heredoc write
+AUTOBOOT_DEFAULT_TIMEOUT = 30
+INTERRUPT_PROMPT_TIMEOUT = 5.0     # after the interrupt key, wait for "=>"
+INTERRUPT_KEY_COUNT = 5            # interrupt_autoboot(): keypresses sent
+INTERRUPT_KEY_GAP = 0.1
+INTERRUPT_SETTLE = 0.5
+DIAG_DEFAULT_TIMEOUT = 30
+BOOT_POLL_TIMEOUT = 120.0          # boot_recovery()/boot_linux_staging()
+BOOT_LOG_EVERY_BYTES = 2048        # debug-log the boot output every N bytes
+LOGIN_STEP_TIMEOUT = 5.0           # wait for "Password:" / the shell prompt
+STAGING_LOGIN_SETTLE = 1.0
+STAGING_PW_SETTLE = 0.5
+ARMBIAN_DEFAULT_PASSWORD = b"1234" # Armbian's documented first-boot password
+BACKOFF_START = 0.5                # _wait_for_root_shell() retry back-off
+BACKOFF_MAX = 5.0
+ENTER_SETTLE = 0.3
+PORT_POLL_SLEEP = 0.5
+OUTPUT_DEFAULT_TIMEOUT = 60.0
+OUTPUT_POLL_SLEEP = 0.2
+MS_PER_S = 1000                    # script marker = current time in ms
+
+# pyserial read() sizes (bytes). read(n) returns early on its timeout, so
+# these only bound one read; they are kept exactly as tuned.
+READ_PROMPT = 64
+READ_PASSWORD = 128
+READ_BOOT = 256
+READ_LOGIN_BURST = 512
+READ_CMD = 1024
+READ_DIAG = 4096
+
+# Characters of raw output kept in log lines
+LOG_RAW_TAIL = 60
+LOG_RAW_TAIL_LONG = 120
+LOG_ERROR_TAIL = 500
 
 
 def _is_permission_error(exc) -> bool:
@@ -30,7 +80,7 @@ def _is_permission_error(exc) -> bool:
     """
     if isinstance(exc, PermissionError):
         return True
-    if getattr(exc, "errno", None) == 13:
+    if getattr(exc, "errno", None) == EACCES:
         return True
     return "permission denied" in str(exc).lower()
 
@@ -39,7 +89,7 @@ class SerialDevice:
     """Wrapper for serial communication with Mono Gateway"""
     
     # Standard baud rates to try
-    BAUD_RATES = [115200, 9600, 57600, 38400]
+    BAUD_RATES = C.SERIAL_BAUD_CANDIDATES
     
     # U-Boot prompt patterns
     UBOOT_PROMPTS = [b"=>", b"# "]
@@ -47,7 +97,7 @@ class SerialDevice:
     # Recovery Linux prompt
     RECOVERY_PROMPT = b"root@recovery:~# "
     
-    def __init__(self, port: str, timeout: float = 10.0):
+    def __init__(self, port: str, timeout: float = DEFAULT_READ_TIMEOUT):
         """
         Initialize serial device
         
@@ -62,12 +112,15 @@ class SerialDevice:
         # U-Boot env snapshot from the last phase1_uboot() call — see
         # flash_orchestrator.capture_uboot_env()/restore_uboot_env().
         self.captured_uboot_env: Optional[dict] = None
+        # Serial output of the last boot that wait_for_autoboot() caught
+        # (U-Boot banner + power-on self-test) — for the snapshot inventory.
+        self.last_boot_output: Optional[str] = None
     
     def connect(self, baud_rate: Optional[int] = None) -> bool:
         """
         Connect to device with automatic baud rate detection
         """
-        if not self.wait_for_port(timeout=30):
+        if not self.wait_for_port(timeout=PORT_APPEAR_TIMEOUT):
             verbose(f"Device on {self.port} did not appear — cannot connect", "error")
             return False
 
@@ -90,11 +143,11 @@ class SerialDevice:
 
                 # Test communication
                 self.ser.write(b"\r\n")
-                time.sleep(0.5)
+                time.sleep(BAUD_PROBE_SETTLE)
                 response = self.ser.read_all()
 
                 if response:
-                    verbose(f"Response at {rate} baud: {response[:100]}", "debug")
+                    verbose(f"Response at {rate} baud: {response[:C.LOG_TAIL_SHORT]}", "debug")
 
                 if self._has_prompt(response) or response:
                     self.baud_rate = rate
@@ -124,13 +177,13 @@ class SerialDevice:
         """
         verbose("Attempting auto‑reconnect...")
 
-        if not self.wait_for_port(timeout=20):
+        if not self.wait_for_port(timeout=RECONNECT_PORT_TIMEOUT):
             return False
 
         baud = self.baud_rate
         if baud is None:
             verbose("Baud rate was never successfully detected — falling back to 115200", "warning")
-            baud = 115200
+            baud = C.SERIAL_BAUD
 
         return self.connect(baud)
     
@@ -179,7 +232,7 @@ class SerialDevice:
         response = b""
         while time.time() - start < timeout:
             try:
-                chunk = self.ser.read(64)
+                chunk = self.ser.read(READ_PROMPT)
                 if chunk:
                     response += chunk
                     if b"=>" in response:
@@ -189,7 +242,7 @@ class SerialDevice:
 
         return b"=>" in response
 
-    def verify_recovery_shell(self, timeout: float = 5.0) -> bool:
+    def verify_recovery_shell(self, timeout: float = VERIFY_SHELL_TIMEOUT) -> bool:
         """
         Explicitly confirm the device is CURRENTLY sitting at the
         recovery shell prompt (root@recovery:~#), rather than assuming
@@ -230,7 +283,7 @@ class SerialDevice:
         response = b""
         while time.time() - start < timeout:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     response += chunk
                     if self.RECOVERY_PROMPT in response:
@@ -240,7 +293,7 @@ class SerialDevice:
 
         return self.RECOVERY_PROMPT in response
 
-    def _wait_for_line_idle(self, settle_time: float = 0.3, max_wait: float = 5.0) -> bool:
+    def _wait_for_line_idle(self, settle_time: float = LINE_SETTLE, max_wait: float = LINE_IDLE_MAX_WAIT) -> bool:
         """
         Block until the serial line has been silent (no incoming bytes)
         for at least `settle_time` seconds, or until `max_wait` elapses.
@@ -298,7 +351,7 @@ class SerialDevice:
                 elif time.time() - quiet_since >= settle_time:
                     return True
 
-            time.sleep(0.02)  # short poll interval, not a settling sleep
+            time.sleep(POLL_SLEEP)
 
         return False
     
@@ -324,7 +377,7 @@ class SerialDevice:
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Serial connection not open")
 
-        timeout = timeout or 5.0
+        timeout = timeout or DEFAULT_CMD_TIMEOUT
 
         # Flush stale input before sending
         self.ser.reset_input_buffer()
@@ -340,7 +393,7 @@ class SerialDevice:
         matched_prompt = False
         while time.time() - start_time < timeout:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     response += chunk
                     if wait_for_prompt and self._has_prompt(response):
@@ -366,7 +419,7 @@ class SerialDevice:
         # was the one call site (send_command(), used by capture_uboot_env())
         # still missing it.
         if matched_prompt:
-            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+            self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_SHORT_WAIT)
 
         response_str = response.decode('utf-8', errors='replace').strip()
         
@@ -407,11 +460,11 @@ class SerialDevice:
                 seen.append(line)
         response_str = "\n".join(seen).strip()
         
-        verbose(f"<< {response_str[:200]}", "debug")
+        verbose(f"<< {response_str[:C.LOG_TAIL]}", "debug")
         return response_str
 
     def run_script(self, script_body: str, marker: str = None,
-                    write_timeout: float = 10.0, exec_timeout: float = 60.0) -> str:
+                    write_timeout: float = SCRIPT_WRITE_TIMEOUT, exec_timeout: float = C.SCRIPT_EXEC_TIMEOUT) -> str:
         """
         Execute a (potentially long) shell command safely over a serial
         link that line-wraps and corrupts long echoed lines.
@@ -451,7 +504,7 @@ class SerialDevice:
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Serial connection not open")
 
-        marker = marker or str(int(time.time() * 1000))
+        marker = marker or str(int(time.time() * MS_PER_S))
         remote_path = f"/tmp/mono_imager_{marker}.sh"
         heredoc_tag = f"MONOIMAGER_EOF_{marker}"
 
@@ -477,21 +530,21 @@ class SerialDevice:
         write_response = b""
         while time.time() - start_time < write_timeout:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     write_response += chunk
                     if self._has_prompt(write_response):
                         break
             except serial.SerialException:
                 break
-        verbose(f"<< [run_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}", "debug")
+        verbose(f"<< [run_script:write raw] {len(write_response)} bytes: {write_response[:C.LOG_TAIL_LONG]!r}", "debug")
 
         # Real hardware showed this shell actively redrawing the heredoc
         # echo with ANSI escape sequences (cursor-up, clear-line) — i.e.
         # genuinely still rendering output after the prompt-match fired.
         # Same idle-wait applied here as before the exec step, for the
         # same reason: don't assume "prompt seen" means "device settled."
-        self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
+        self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
 
         # Verify the file landed with the expected byte count before
         # trusting it enough to execute. expected_size = body + newline
@@ -499,7 +552,7 @@ class SerialDevice:
         # before the closing tag, from the f-string above).
         expected_size = len(script_body.encode()) + 1
         size_check = self.send_command(
-            f"wc -c < {remote_path}", wait_for_prompt=True, timeout=5
+            f"wc -c < {remote_path}", wait_for_prompt=True, timeout=C.SHELL_QUICK_TIMEOUT
         )
         verbose(f"<< [run_script:wc-c parsed] {size_check!r}", "debug")
         try:
@@ -532,7 +585,7 @@ class SerialDevice:
         # command, rather than assuming send_command()'s prompt-match
         # return meant the device was fully done. Not a fixed sleep —
         # actively polls in_waiting and only proceeds once truly quiet.
-        line_was_idle = self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
+        line_was_idle = self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
         if not line_was_idle:
             logger.debug(
                 "run_script: line did not settle within 5s before exec — "
@@ -561,7 +614,7 @@ class SerialDevice:
         exec_response = b""
         while time.time() - exec_start < exec_timeout:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     exec_response += chunk
                     verbose(f"<< [run_script:exec raw chunk] {chunk!r}", "debug")
@@ -587,14 +640,14 @@ class SerialDevice:
         # Best-effort cleanup; failure to remove the temp file is not
         # fatal to the caller and is not worth raising over.
         try:
-            self.send_command(f"rm -f {remote_path}", wait_for_prompt=True, timeout=5)
+            self.send_command(f"rm -f {remote_path}", wait_for_prompt=True, timeout=C.SHELL_QUICK_TIMEOUT)
         except Exception as e:
             verbose(f"run_script: cleanup of {remote_path} failed (non-fatal): {e}", "debug")
 
         return result
 
     def launch_script(self, script_body: str, marker: str = None,
-                       write_timeout: float = 10.0) -> str:
+                       write_timeout: float = SCRIPT_WRITE_TIMEOUT) -> str:
         """
         Write a script to the device and START it running, WITHOUT
         waiting for or parsing any serial response from the exec step.
@@ -643,7 +696,7 @@ class SerialDevice:
         if not self.ser or not self.ser.is_open:
             raise RuntimeError("Serial connection not open")
 
-        marker = marker or str(int(time.time() * 1000))
+        marker = marker or str(int(time.time() * MS_PER_S))
         remote_path = f"/tmp/mono_imager_{marker}.sh"
         heredoc_tag = f"MONOIMAGER_EOF_{marker}"
 
@@ -657,23 +710,23 @@ class SerialDevice:
         write_response = b""
         while time.time() - start_time < write_timeout:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     write_response += chunk
                     if self._has_prompt(write_response):
                         break
             except serial.SerialException:
                 break
-        verbose(f"<< [launch_script:write raw] {len(write_response)} bytes: {write_response[:300]!r}", "debug")
+        verbose(f"<< [launch_script:write raw] {len(write_response)} bytes: {write_response[:C.LOG_TAIL_LONG]!r}", "debug")
 
-        self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
+        self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
 
         # Same byte-count verification as run_script() — still refuse
         # to launch an unverified/corrupted script, even though we
         # won't wait for its output afterward.
         expected_size = len(script_body.encode()) + 1
         size_check = self.send_command(
-            f"wc -c < {remote_path}", wait_for_prompt=True, timeout=5
+            f"wc -c < {remote_path}", wait_for_prompt=True, timeout=C.SHELL_QUICK_TIMEOUT
         )
         verbose(f"<< [launch_script:wc-c parsed] {size_check!r}", "debug")
         try:
@@ -695,7 +748,7 @@ class SerialDevice:
 
         verbose(f"✓ launch_script: verified {remote_path} = {actual_size} bytes", "debug")
 
-        self._wait_for_line_idle(settle_time=0.3, max_wait=5.0)
+        self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
 
         # Fire the exec command and DO NOT wait for or parse its
         # response — that's the entire point of this method. The
@@ -734,7 +787,7 @@ class SerialDevice:
         drained = 0
         while time.time() - drain_start < 2.0:
             try:
-                chunk = self.ser.read(1024)
+                chunk = self.ser.read(READ_CMD)
                 if chunk:
                     drained += len(chunk)
             except serial.SerialException:
@@ -743,7 +796,7 @@ class SerialDevice:
 
         return remote_path
     
-    def wait_for_autoboot(self, timeout: float = 30) -> bool:
+    def wait_for_autoboot(self, timeout: float = AUTOBOOT_DEFAULT_TIMEOUT) -> bool:
         """
         Wait for U-Boot autoboot countdown and auto-interrupt
 
@@ -767,16 +820,17 @@ class SerialDevice:
 
                     if b"Hit any key to stop autoboot" in buffer:
                         verbose("✓ Detected autoboot — interrupting and polling for prompt...")
+                        self.last_boot_output = buffer.decode("utf-8", errors="replace")
 
                         # Send interrupt keypress and poll for U-Boot prompt
                         # rather than blindly spamming for a fixed duration
                         interrupt_start = time.time()
-                        interrupt_timeout = 5.0
+                        interrupt_timeout = INTERRUPT_PROMPT_TIMEOUT
                         interrupt_buf = b""
 
                         while time.time() - interrupt_start < interrupt_timeout:
                             self.ser.write(b" ")
-                            chunk = self.ser.read(64)
+                            chunk = self.ser.read(READ_PROMPT)
                             if chunk:
                                 interrupt_buf += chunk
                                 if b"=>" in interrupt_buf:
@@ -785,7 +839,7 @@ class SerialDevice:
 
                         logger.error(
                             f"U-Boot prompt not seen within {interrupt_timeout}s after interrupt — "
-                            f"last bytes: {repr(interrupt_buf[-60:])}"
+                            f"last bytes: {repr(interrupt_buf[-LOG_RAW_TAIL:])}"
                         )
                         return False
 
@@ -795,7 +849,7 @@ class SerialDevice:
         verbose("Autoboot countdown not detected within timeout", "warning")
         return False
 
-    def capture_boot_diagnostics(self, timeout: float = 30) -> Optional[str]:
+    def capture_boot_diagnostics(self, timeout: float = DIAG_DEFAULT_TIMEOUT) -> Optional[str]:
         """
         Capture U-Boot's boot-time diagnostic output (SoC/board identity,
         clock configuration, and the power-on self-test block with
@@ -821,7 +875,7 @@ class SerialDevice:
 
         while time.time() - start_time < timeout:
             try:
-                chunk = self.ser.read(4096)
+                chunk = self.ser.read(READ_DIAG)
                 if chunk:
                     buffer += chunk
                     if b"Hit any key to stop autoboot" in buffer:
@@ -846,11 +900,11 @@ class SerialDevice:
         verbose("Interrupting U-Boot autoboot...")
         
         # Send multiple spaces/enters to interrupt
-        for _ in range(5):
+        for _ in range(INTERRUPT_KEY_COUNT):
             self.ser.write(b" ")
-            time.sleep(0.1)
+            time.sleep(INTERRUPT_KEY_GAP)
         
-        time.sleep(0.5)
+        time.sleep(INTERRUPT_SETTLE)
         response = self.ser.read_all().decode('utf-8', errors='replace')
         
         if self._has_prompt(response.encode()):
@@ -905,7 +959,7 @@ class SerialDevice:
             # used elsewhere in this file for this exact race), then reset,
             # so nothing still in flight can sneak in between the flush and
             # the write.
-            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+            self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_SHORT_WAIT)
             self.ser.reset_input_buffer()
 
             # PRIME THE PROMPT before sending the real command. CONFIRMED
@@ -922,14 +976,14 @@ class SerialDevice:
             prime_start = time.time()
             prime_buf = b""
             while time.time() - prime_start < 2.0:
-                chunk = self.ser.read(64)
+                chunk = self.ser.read(READ_PROMPT)
                 if chunk:
                     prime_buf += chunk
                     if b"=> " in prime_buf:
                         break
                 elif prime_buf:
                     break
-            self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+            self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_SHORT_WAIT)
             self.ser.reset_input_buffer()
 
             # If a boot_medium was requested, set bootargs so the kernel
@@ -942,30 +996,28 @@ class SerialDevice:
             # lands on a clean "=> ".
             if boot_medium:
                 bootargs = (
-                    "console=ttyS0,115200 root=/dev/ram0 "
-                    "earlycon=uart8250,mmio,0x21c0500 "
-                    f"boot_medium={boot_medium}"
+                    f"{C.RECOVERY_BOOTARGS} boot_medium={boot_medium}"
                 )
                 self.ser.write(f'setenv bootargs "{bootargs}"\r\n'.encode())
-                self._wait_for_line_idle(settle_time=0.3, max_wait=2.0)
+                self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_SHORT_WAIT)
                 self.ser.reset_input_buffer()
 
             self.ser.write(b"run recovery\r\n")
 
             poll_start = time.time()
-            poll_timeout = 120.0
+            poll_timeout = BOOT_POLL_TIMEOUT
             poll_buf = b""
             _last_log_len = 0
 
             while time.time() - poll_start < poll_timeout:
-                chunk = self.ser.read(256)
+                chunk = self.ser.read(READ_BOOT)
                 if chunk:
                     poll_buf += chunk
                     tail = poll_buf.decode("utf-8", errors="replace")
 
                     # Periodic debug: show what the device is sending
-                    if len(poll_buf) - _last_log_len > 2048:
-                        verbose(f"  Boot output: {tail[-300:]!r}", "debug")
+                    if len(poll_buf) - _last_log_len > BOOT_LOG_EVERY_BYTES:
+                        verbose(f"  Boot output: {tail[-C.LOG_TAIL_LONG:]!r}", "debug")
                         _last_log_len = len(poll_buf)
 
                     # U-Boot prompt returned — check why before failing.
@@ -996,7 +1048,7 @@ class SerialDevice:
                             )
                             continue
                         verbose("✗ bootm failed — U-Boot prompt returned", "error")
-                        verbose(f"  Output: {tail[-500:]!r}", "error")
+                        verbose(f"  Output: {tail[-LOG_ERROR_TAIL:]!r}", "error")
                         return False
 
                     # Any Linux login prompt (hostname may vary)
@@ -1020,8 +1072,8 @@ class SerialDevice:
                         # prompt) — handle that too.
                         pw_buf = b""
                         pw_start = time.time()
-                        while time.time() - pw_start < 5.0:
-                            chunk = self.ser.read(128)
+                        while time.time() - pw_start < LOGIN_STEP_TIMEOUT:
+                            chunk = self.ser.read(READ_PASSWORD)
                             if chunk:
                                 pw_buf += chunk
                                 if b"assword" in pw_buf:
@@ -1044,8 +1096,8 @@ class SerialDevice:
                         # blank-password login as a real password requirement.
                         response = b""
                         login_start = time.time()
-                        while time.time() - login_start < 5.0:
-                            chunk = self.ser.read(256)
+                        while time.time() - login_start < LOGIN_STEP_TIMEOUT:
+                            chunk = self.ser.read(READ_BOOT)
                             if chunk:
                                 response += chunk
                                 if b"root@" in response and b"#" in response:
@@ -1064,12 +1116,12 @@ class SerialDevice:
 
             verbose(
                 f"✗ Recovery boot timed out after {poll_timeout}s — "
-                f"last output: {poll_buf.decode('utf-8', errors='replace')[-300:]!r}",
+                f"last output: {poll_buf.decode('utf-8', errors='replace')[-C.LOG_TAIL_LONG:]!r}",
                 "error"
             )
             logger.warning(
                 f"Recovery boot prompt not seen within {poll_timeout}s — "
-                f"last {len(poll_buf)} bytes: {repr(poll_buf[-120:])}"
+                f"last {len(poll_buf)} bytes: {repr(poll_buf[-LOG_RAW_TAIL_LONG:])}"
             )
             return False
 
@@ -1096,11 +1148,11 @@ class SerialDevice:
             self.ser.write(b"boot\r\n")
 
             poll_start = time.time()
-            poll_timeout = 120.0
+            poll_timeout = BOOT_POLL_TIMEOUT
             poll_buf = b""
 
             while time.time() - poll_start < poll_timeout:
-                chunk = self.ser.read(256)
+                chunk = self.ser.read(READ_BOOT)
                 if chunk:
                     poll_buf += chunk
                     tail = poll_buf.decode("utf-8", errors="replace")
@@ -1113,8 +1165,8 @@ class SerialDevice:
                     if "login:" in tail:
                         verbose("✓ Staging Linux login prompt — logging in as root...")
                         self.ser.write(b"root\r\n")
-                        time.sleep(1.0)
-                        resp = self.ser.read(512).decode("utf-8", errors="replace")
+                        time.sleep(STAGING_LOGIN_SETTLE)
+                        resp = self.ser.read(READ_LOGIN_BURST).decode("utf-8", errors="replace")
 
                         if "root@" in resp and "#" in resp:
                             verbose("✓ Logged in to staging Linux (empty password)")
@@ -1123,16 +1175,16 @@ class SerialDevice:
                         if "Password" in resp or "password" in resp.lower():
                             # Try empty password first
                             self.ser.write(b"\r\n")
-                            time.sleep(0.5)
-                            r2 = self.ser.read(256).decode("utf-8", errors="replace")
+                            time.sleep(STAGING_PW_SETTLE)
+                            r2 = self.ser.read(READ_BOOT).decode("utf-8", errors="replace")
                             if "root@" in r2 and "#" in r2:
                                 verbose("✓ Logged in to staging Linux (empty password)")
                                 return True
 
                             # Fall back to Armbian default: 1234
-                            self.ser.write(b"1234\r\n")
-                            time.sleep(0.5)
-                            r3 = self.ser.read(256).decode("utf-8", errors="replace")
+                            self.ser.write(ARMBIAN_DEFAULT_PASSWORD + b"\r\n")
+                            time.sleep(STAGING_PW_SETTLE)
+                            r3 = self.ser.read(READ_BOOT).decode("utf-8", errors="replace")
                             if "root@" in r3 and "#" in r3:
                                 verbose("✓ Logged in to staging Linux (password: 1234)")
                                 return True
@@ -1149,7 +1201,7 @@ class SerialDevice:
 
             logger.warning(
                 f"Staging Linux boot prompt not seen within {poll_timeout}s — "
-                f"last {len(poll_buf)} bytes: {repr(poll_buf[-120:])}"
+                f"last {len(poll_buf)} bytes: {repr(poll_buf[-LOG_RAW_TAIL_LONG:])}"
             )
             return False
 
@@ -1169,7 +1221,7 @@ class SerialDevice:
 
         start_time = time.time()
         attempt = 0
-        backoff = 0.5
+        backoff = BACKOFF_START
 
         while time.time() - start_time < timeout:
             attempt += 1
@@ -1177,15 +1229,15 @@ class SerialDevice:
                 # If serial dropped, try to reconnect
                 if not self.ser or not self.ser.is_open:
                     verbose("Serial disconnected — waiting for device to reappear...", "warning")
-                    if not self.wait_for_port(timeout=10):
-                        time.sleep(min(backoff, 5.0))
-                        backoff = min(backoff * 2, 5.0)
+                    if not self.wait_for_port(timeout=RETRY_PORT_TIMEOUT):
+                        time.sleep(min(backoff, BACKOFF_MAX))
+                        backoff = min(backoff * 2, BACKOFF_MAX)
                         continue
-                    self.connect(self.baud_rate or 115200)
+                    self.connect(self.baud_rate or C.SERIAL_BAUD)
 
                 # Send Enter to get a prompt
                 self.ser.write(b"\r\n")
-                time.sleep(0.3)
+                time.sleep(ENTER_SETTLE)
                 response = self.ser.read_all().decode("utf-8", errors="replace")
 
                 if "root@" in response and "#" in response:
@@ -1194,17 +1246,17 @@ class SerialDevice:
 
                 verbose(f"{label} login attempt {attempt} — retrying in {backoff:.1f}s", "debug")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 5.0)
+                backoff = min(backoff * 2, BACKOFF_MAX)
 
             except Exception as e:
                 verbose(f"{label} login attempt {attempt} failed: {e} — retrying in {backoff:.1f}s", "debug")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 5.0)
+                backoff = min(backoff * 2, BACKOFF_MAX)
 
         verbose(f"Failed to verify {label} login after {attempt} attempts", "error")
         return False
 
-    def login_staging(self, timeout: float = 30) -> bool:
+    def login_staging(self, timeout: float = C.LOGIN_TIMEOUT) -> bool:
         """
         Confirm we are at a root shell in the staging Linux environment.
         Checks for any 'root@<hostname>#' prompt — not locked to 'root@recovery'.
@@ -1219,7 +1271,7 @@ class SerialDevice:
         """
         return self._wait_for_root_shell(timeout, "staging Linux")
 
-    def login_recovery(self, timeout: float = 30) -> bool:
+    def login_recovery(self, timeout: float = C.LOGIN_TIMEOUT) -> bool:
         """
         Verify we are logged into recovery Linux (root@recovery prompt).
         Handles the case where boot_recovery already auto-logged in.
@@ -1229,7 +1281,7 @@ class SerialDevice:
         """
         return self._wait_for_root_shell(timeout, "recovery Linux")
 
-    def wait_for_port(self, timeout: float = 30.0) -> bool:
+    def wait_for_port(self, timeout: float = PORT_WAIT_DEFAULT_TIMEOUT) -> bool:
         """
         Wait until the serial port appears (device plugged in or rebooted).
 
@@ -1256,7 +1308,7 @@ class SerialDevice:
                         "error",
                     )
                     return False
-                time.sleep(0.5)
+                time.sleep(PORT_POLL_SLEEP)
 
         verbose(
             f"Device on {self.port} did not appear within {timeout}s. If it is "
@@ -1266,7 +1318,7 @@ class SerialDevice:
         )
         return False
 
-    def wait_for_any_output(self, timeout: float = 60.0) -> bool:
+    def wait_for_any_output(self, timeout: float = OUTPUT_DEFAULT_TIMEOUT) -> bool:
         """
         Wait for the device to send ANY serial output at all, without
         caring what it is — boot log lines, a login prompt, a
@@ -1297,13 +1349,13 @@ class SerialDevice:
         start = time.time()
         while time.time() - start < timeout:
             try:
-                chunk = self.ser.read(256)
+                chunk = self.ser.read(READ_BOOT)
                 if chunk:
                     verbose(f"✓ Device responsive — received {len(chunk)} bytes")
                     return True
             except serial.SerialException:
                 pass
-            time.sleep(0.2)
+            time.sleep(OUTPUT_POLL_SLEEP)
 
         verbose(f"No serial output received within {timeout}s", "error")
         return False

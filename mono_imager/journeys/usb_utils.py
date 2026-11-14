@@ -17,9 +17,15 @@ cannot cache all images simultaneously.
 import re
 
 from mono_imager.flash_orchestrator import verbose
+from mono_imager import constants as C
+
+# --- Tuning (seconds) ---------------------------------------------------------
+MOUNT_SCRIPT_TIMEOUT = 60            # mounts every partition in turn
+SIZE_CHECK_TIMEOUT = 5
+FIND_IMAGE_TIMEOUT = 10
 
 USB_MIN_GB = 16
-USB_MIN_KB = USB_MIN_GB * 1024 * 1024
+USB_MIN_KB = USB_MIN_GB * (C.GIB // C.KIB)   # df -k reports KiB
 
 # (lowercase_prefix, lowercase_suffix, format_tag)
 # More-specific extensions listed first so .img.xz matches before .img.
@@ -110,7 +116,7 @@ def mount_usb_stick(device, usb_device: str, usb_mount: str, os_names):
     try:
         out = device.run_script(
             build_mount_script(usb_device, usb_mount, os_names),
-            marker="usb_mount", exec_timeout=60,
+            marker="usb_mount", exec_timeout=MOUNT_SCRIPT_TIMEOUT,
         )
     except Exception as e:
         return None, False, str(e)
@@ -137,13 +143,13 @@ def check_usb_size(device, usb_mount: str) -> None:
     try:
         out = device.run_script(
             f'df -k "{usb_mount}" | awk \'NR==2 {{print $2}}\'',
-            marker="usb_size_check", exec_timeout=5,
+            marker="usb_size_check", exec_timeout=SIZE_CHECK_TIMEOUT,
         ).strip()
         kb = next((int(l) for l in out.splitlines() if l.strip().isdigit()), None)
         if kb is None:
             verbose("  ⚠ Could not parse USB size from df output", "warning")
             return
-        gb = kb / (1024 * 1024)
+        gb = kb / (C.GIB // C.KIB)
         if kb < USB_MIN_KB:
             verbose(
                 f"  ⚠ USB stick is {gb:.1f} GB — minimum recommended is {USB_MIN_GB} GB "
@@ -193,7 +199,7 @@ def find_image_on_usb(device, usb_mount: str, os_name: str):
     )
 
     try:
-        raw = device.run_script(script, marker="usb_find_image", exec_timeout=10)
+        raw = device.run_script(script, marker="usb_find_image", exec_timeout=FIND_IMAGE_TIMEOUT)
     except Exception as e:
         verbose(f"  ⚠ USB image scan failed: {e}", "warning")
         return None, None

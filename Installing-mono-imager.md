@@ -41,7 +41,9 @@ Type this and press Enter:
 pip install -r requirements.txt
 ```
 
-This installs two small helper packages the tool needs (`pyserial` and `icmplib`).
+This installs the helper packages the tool needs: `pyserial`, `icmplib`, and — on Python older than 3.14 — `zstandard`, used to compress eMMC snapshots (without it they are compressed with gzip, which is slower and bigger).
+
+> **Updating from an older version?** Run this step again after you copy in the new files — 1.7.0 added `zstandard`.
 
 ## Step 3 — Install mono-imager itself
 
@@ -69,7 +71,7 @@ If that doesn't work for any reason, you can run it this way instead, from insid
 python -m mono_imager.cli
 ```
 
-Either way, the tool will connect to your device and show you a menu of options (Flash OS, update firmware, run tests, etc.). Everything from there is menu-driven — you don't need to type any more commands.
+Either way, the tool will connect to your device and show you a menu of options (Flash OS, update firmware, snapshot / restore the eMMC, run tests, etc.). Everything from there is menu-driven — you don't need to type any more commands.
 
 ## Troubleshooting
 

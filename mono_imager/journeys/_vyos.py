@@ -30,6 +30,7 @@ import struct
 import time
 
 from mono_imager.flash_orchestrator import verbose
+from mono_imager import constants as C
 
 # --- Constants ----------------------------------------------------------------
 
@@ -37,20 +38,88 @@ OS = "VyOS"
 
 ISO_TMP   = "/tmp/mono_imager_vyos.iso"     # staging copy in recovery Linux's RAM
 WRITE_LOG = "/tmp/mono_imager_vyos_write.log"
-STICK_DEV = "/dev/sda"                       # the USB stick in the Mono
-EMMC_DEV  = "/dev/mmcblk0"
-SECTOR    = 512
+STICK_DEV = C.USB_DEV                        # the USB stick in the Mono
+EMMC_DEV  = C.EMMC_DEV
+SECTOR    = C.SECTOR_BYTES
 
 # v2 stages the ISO at 64 MiB: the start of VyOS's own reserved firmware
 # zone boundary (INSTALL.md "eMMC Partition Layout": 4 KiB-64 MiB is kept
 # free). Everything mono-imager writes for v2 is beyond Mono's eMMC
 # firmware region (4 KiB-32 MiB) except the partition table itself in
 # the first 4 KiB, which is exactly what every other eMMC OS writes too.
-STAGE_BASE_LBA = 64 * 1024 * 1024 // SECTOR
+STAGE_BASE_LBA = 64 * C.MIB // SECTOR
 
 # Recovery Linux's /tmp is a ~3.8 GB tmpfs (see flash_orchestrator.py's
 # FLASH_SIZE_CAP comment); same 80 % margin. The VyOS ISO is ~571 MiB.
-STAGING_CAP = int(3.8 * 1024**3 * 0.8)
+STAGING_CAP = C.RAM_STAGING_CAP
+
+# --- On-disk formats (MBR, FAT32, U-Boot legacy image) --------------------------
+BOOT_SIGNATURE = b"\x55\xaa"   # MBR / FAT boot sector
+BOOT_SIG_OFFSET = 510
+MBR_TABLE_OFFSET = 446
+MBR_ENTRY_SIZE = 16
+MBR_ENTRIES = 4
+MBR_ENTRY_LBA_OFFSET = 8          # <II start LBA, sector count
+MBR_BOOTABLE = 0x80
+MBR_INACTIVE = 0x00
+MBR_CHS_UNUSED = b"\xfe\xff\xff"
+
+FAT_BPB_OFFSET = 11               # <HBHB bytes/sector, sectors/cluster, reserved, FATs
+FAT_ROOT_ENTRIES_OFFSET = 17      # 0 on FAT32
+FAT32_FAT_SIZE_OFFSET = 36
+FAT32_ROOT_CLUSTER_OFFSET = 44
+FAT_SECTOR_SIZES = (512, 1024, 2048, 4096)
+FAT32_ENTRY_BYTES = 4
+FAT32_CLUSTER_MASK = 0x0FFFFFFF
+FAT32_END_OF_CHAIN = 0x0FFFFFF8
+FAT_FIRST_DATA_CLUSTER = 2
+FAT_MAX_CHAIN = 1_000_000         # loop guard
+DIR_ENTRY_SIZE = 32
+DIR_END = 0x00
+DIR_DELETED = 0xE5
+ATTR_OFFSET = 11
+ATTR_LONG_NAME = 0x0F
+ATTR_VOLUME_ID = 0x08
+DIR_CLUSTER_HI_OFFSET = 20
+DIR_CLUSTER_LO_OFFSET = 26
+DIR_SIZE_OFFSET = 28
+
+UIMAGE_MAGIC = 0x27051956
+UIMAGE_HEADER_LEN = 64
+UIMAGE_TYPE_OFFSET = 30
+UIMAGE_TYPE_SCRIPT = 6            # IH_TYPE_SCRIPT
+UIMAGE_SCRIPT_DATA = 72           # header + one length word + 0 terminator
+
+# --- Console timing (seconds) / buffers -----------------------------------------
+POLL_SLEEP = 0.05
+DRAIN_IDLE = 0.3                  # silence that counts as "drained"
+DRAIN_IDLE_LONG = 0.5
+DRAIN_MAX = 5.0
+DRAIN_SHORT_MAX = 2.0
+DRAIN_CMD_MAX = 3.0
+EXPECT_WINDOW = 2048              # bytes searched for a pattern
+LIVE_BUF = 8192                   # bytes of live-boot output kept
+LIVE_TAIL = 400
+REBOOT_SEND_TIMEOUT = 3
+UBOOT_AFTER_REBOOT_TIMEOUT = 180  # VyOS shutdown + U-Boot banner
+UBOOT_CMD_TIMEOUT = 120.0
+LIVE_BOOT_TIMEOUT = 900.0         # incl. the build's kexec double boot
+UBOOT_BACK_IDLE = 1.5             # idle before "U-Boot prompt came back" counts
+LOGIN_NUDGE_IDLE = 5.0            # idle before an Enter re-prints the login prompt
+LOGIN_NUDGE_EVERY = 15.0
+PASSWORD_PROMPT_TIMEOUT = 15
+SHELL_PROMPT_TIMEOUT = 60
+LIVE_CMD_TIMEOUT = 60.0
+PROMPT_BACK_TIMEOUT = 10
+INSTALL_TIMEOUT = 2400.0
+INSTALL_MAX_ANSWERS = 40
+INSTALL_QUIET = 0.8               # silence before a question is answered
+INSTALL_MAX_INVALID = 3
+TRANSCRIPT_TAIL = 3000
+TRANSCRIPT_TAIL_SHORT = 1500
+PASSWORD_ATTEMPTS = 3
+PRINTABLE_ASCII = (32, 127)       # [lo, hi)
+CTRL_C = "\x03"
 
 LIVE_USER     = "vyos"     # VyOS live default login (INSTALL.md step 3)
 LIVE_PASSWORD = "vyos"
@@ -87,12 +156,12 @@ def ask_vyos_password(read=getpass.getpass, out=print) -> str:
     """
     out("  `install image` sets a new password for the VyOS user 'vyos'.")
     out("  Choose it now — mono-imager types it in for you later.")
-    for _ in range(3):
+    for _ in range(PASSWORD_ATTEMPTS):
         pw = read("  New password for 'vyos': ")
         if not pw:
             out("  ✗ Empty password — try again.")
             continue
-        if not all(32 <= ord(c) < 127 for c in pw):
+        if not all(PRINTABLE_ASCII[0] <= ord(c) < PRINTABLE_ASCII[1] for c in pw):
             out("  ✗ Use plain printable ASCII characters only (it is typed over serial).")
             continue
         if read("  Repeat password: ") != pw:
@@ -109,12 +178,12 @@ def read_mbr(path) -> list:
     valid MBR signature. Each entry: boot, type, start, sectors."""
     with open(path, "rb") as f:
         mbr = f.read(SECTOR)
-    if len(mbr) < SECTOR or mbr[510:512] != b"\x55\xaa":
+    if len(mbr) < SECTOR or mbr[BOOT_SIG_OFFSET:BOOT_SIG_OFFSET + 2] != BOOT_SIGNATURE:
         return []
     entries = []
-    for i in range(4):
-        e = mbr[446 + 16 * i: 446 + 16 * (i + 1)]
-        start, sectors = struct.unpack_from("<II", e, 8)
+    for i in range(MBR_ENTRIES):
+        e = mbr[MBR_TABLE_OFFSET + MBR_ENTRY_SIZE * i: MBR_TABLE_OFFSET + MBR_ENTRY_SIZE * (i + 1)]
+        start, sectors = struct.unpack_from("<II", e, MBR_ENTRY_LBA_OFFSET)
         entries.append({"boot": e[0], "type": e[4], "start": start, "sectors": sectors})
     return entries
 
@@ -153,10 +222,11 @@ def stage_partition_table(layout, base_lba: int = STAGE_BASE_LBA) -> bytes:
     and U-Boot sees the FAT32 boot partition as mmc 0:2.
     """
     def entry(p, boot):
-        return struct.pack("<B3sB3sII", boot, b"\xfe\xff\xff", p["type"],
-                           b"\xfe\xff\xff", base_lba + p["start"], p["sectors"])
+        return struct.pack("<B3sB3sII", boot, MBR_CHS_UNUSED, p["type"],
+                           MBR_CHS_UNUSED, base_lba + p["start"], p["sectors"])
     p1, p2 = layout["p1"], layout["p2"]
-    return (entry(p1, 0x00) + entry(p2, 0x80) + b"\x00" * 32 + b"\x55\xaa")
+    return (entry(p1, MBR_INACTIVE) + entry(p2, MBR_BOOTABLE)
+            + b"\x00" * (MBR_ENTRY_SIZE * (MBR_ENTRIES - 2)) + BOOT_SIGNATURE)
 
 
 def printf_octal(data: bytes) -> str:
@@ -182,14 +252,14 @@ def read_fat32_file(path, part_offset: int, name: str) -> bytes:
                 raise ValueError("FAT32: read past end of file")
             return data
 
-        bs = at(part_offset, 512)
-        if bs[510:512] != b"\x55\xaa":
+        bs = at(part_offset, SECTOR)
+        if bs[BOOT_SIG_OFFSET:BOOT_SIG_OFFSET + 2] != BOOT_SIGNATURE:
             raise ValueError("FAT32: no boot sector signature")
-        bps, spc, rsvd, nfats = struct.unpack_from("<HBHB", bs, 11)
-        root_entries = struct.unpack_from("<H", bs, 17)[0]
-        fatsz = struct.unpack_from("<I", bs, 36)[0]
-        root_clus = struct.unpack_from("<I", bs, 44)[0]
-        if bps not in (512, 1024, 2048, 4096) or spc == 0 or root_entries != 0 or fatsz == 0:
+        bps, spc, rsvd, nfats = struct.unpack_from("<HBHB", bs, FAT_BPB_OFFSET)
+        root_entries = struct.unpack_from("<H", bs, FAT_ROOT_ENTRIES_OFFSET)[0]
+        fatsz = struct.unpack_from("<I", bs, FAT32_FAT_SIZE_OFFSET)[0]
+        root_clus = struct.unpack_from("<I", bs, FAT32_ROOT_CLUSTER_OFFSET)[0]
+        if bps not in FAT_SECTOR_SIZES or spc == 0 or root_entries != 0 or fatsz == 0:
             raise ValueError("FAT32: not a FAT32 boot sector")
 
         fat_off = part_offset + rsvd * bps
@@ -198,31 +268,32 @@ def read_fat32_file(path, part_offset: int, name: str) -> bytes:
 
         def chain(c):
             seen = 0
-            while 2 <= c < 0x0FFFFFF8:
+            while FAT_FIRST_DATA_CLUSTER <= c < FAT32_END_OF_CHAIN:
                 yield c
                 seen += 1
-                if seen > 1_000_000:
+                if seen > FAT_MAX_CHAIN:
                     raise ValueError("FAT32: cluster chain loop")
-                c = struct.unpack("<I", at(fat_off + 4 * c, 4))[0] & 0x0FFFFFFF
+                c = struct.unpack("<I", at(fat_off + FAT32_ENTRY_BYTES * c, FAT32_ENTRY_BYTES))[0] & FAT32_CLUSTER_MASK
 
         def cluster(c):
-            return at(data_off + (c - 2) * cbytes, cbytes)
+            return at(data_off + (c - FAT_FIRST_DATA_CLUSTER) * cbytes, cbytes)
 
         for c in chain(root_clus):
             d = cluster(c)
-            for i in range(0, len(d), 32):
-                e = d[i:i + 32]
-                if e[0] == 0x00:
+            for i in range(0, len(d), DIR_ENTRY_SIZE):
+                e = d[i:i + DIR_ENTRY_SIZE]
+                if e[0] == DIR_END:
                     raise ValueError(f"FAT32: {name} not found in the root directory")
-                if e[0] == 0xE5 or e[11] == 0x0F or e[11] & 0x08:
+                if e[0] == DIR_DELETED or e[ATTR_OFFSET] == ATTR_LONG_NAME or e[ATTR_OFFSET] & ATTR_VOLUME_ID:
                     continue
-                base = e[0:8].decode("ascii", "replace").rstrip()
-                ext = e[8:11].decode("ascii", "replace").rstrip()
+                base = e[0:8].decode("ascii", "replace").rstrip()      # 8.3 name
+                ext = e[8:ATTR_OFFSET].decode("ascii", "replace").rstrip()
                 full = f"{base}.{ext}" if ext else base
                 if full.upper() != want:
                     continue
-                first = (struct.unpack_from("<H", e, 20)[0] << 16) | struct.unpack_from("<H", e, 26)[0]
-                size = struct.unpack_from("<I", e, 28)[0]
+                first = (struct.unpack_from("<H", e, DIR_CLUSTER_HI_OFFSET)[0] << 16) \
+                    | struct.unpack_from("<H", e, DIR_CLUSTER_LO_OFFSET)[0]
+                size = struct.unpack_from("<I", e, DIR_SIZE_OFFSET)[0]
                 out = bytearray()
                 for fc in chain(first):
                     out += cluster(fc)
@@ -237,12 +308,12 @@ def read_fat32_file(path, part_offset: int, name: str) -> bytes:
 def parse_uboot_script(data: bytes) -> str:
     """Text of a mkimage `-T script` image (legacy header, 64 bytes, then
     a length table ending in 0, then the script)."""
-    if len(data) < 72 or struct.unpack_from(">I", data, 0)[0] != 0x27051956:
+    if len(data) < UIMAGE_SCRIPT_DATA or struct.unpack_from(">I", data, 0)[0] != UIMAGE_MAGIC:
         raise ValueError("boot.scr is not a U-Boot legacy image")
-    if data[30] != 6:   # IH_TYPE_SCRIPT
+    if data[UIMAGE_TYPE_OFFSET] != UIMAGE_TYPE_SCRIPT:
         raise ValueError("boot.scr is not a U-Boot script image")
-    length = struct.unpack_from(">I", data, 64)[0]
-    body = data[72:72 + length]
+    length = struct.unpack_from(">I", data, UIMAGE_HEADER_LEN)[0]
+    body = data[UIMAGE_SCRIPT_DATA:UIMAGE_SCRIPT_DATA + length]
     if len(body) != length:
         raise ValueError("boot.scr is truncated")
     return body.decode("utf-8", errors="replace").rstrip("\x00")
@@ -367,21 +438,21 @@ def build_write_script(*, url: str, dev: str, iso_bytes: int, iso_sha256: str,
     ]
     if partition_table:
         s += [
-            f'  dd if=/dev/zero of={dev} bs=512 count=8 conv=notrunc >>"$l" 2>&1',
+            f'  dd if=/dev/zero of={dev} bs={SECTOR} count={C.EMMC_FW_START // SECTOR} conv=notrunc >>"$l" 2>&1',
             '  echo "PT_ZERO_RC=$?" >>"$l"',
             f"  printf '{printf_octal(partition_table)}' | "
-            f'dd of={dev} bs=1 seek=446 conv=notrunc >>"$l" 2>&1',
+            f'dd of={dev} bs=1 seek={MBR_TABLE_OFFSET} conv=notrunc >>"$l" 2>&1',
             '  echo "PT_RC=$?" >>"$l"',
         ]
-    seek_mib = seek_lba * SECTOR // (1024 * 1024)
-    if seek_mib * 1024 * 1024 != seek_lba * SECTOR:
+    seek_mib = seek_lba * SECTOR // C.MIB
+    if seek_mib * C.MIB != seek_lba * SECTOR:
         raise ValueError("seek_lba must be a whole number of MiB")
     seek = f" seek={seek_mib}" if seek_mib else ""
     s += [
         f'  dd if="$f" of={dev} bs=1M{seek} conv=notrunc >>"$l" 2>&1',
         '  echo "DD_RC=$?" >>"$l"',
         '  sync',
-        f'  if dd if={dev} bs=512 skip={seek_lba} count={sectors} 2>/dev/null | cmp -s - "$f"; then',
+        f'  if dd if={dev} bs={SECTOR} skip={seek_lba} count={sectors} 2>/dev/null | cmp -s - "$f"; then',
         '    echo "VERIFY=OK" >>"$l"',
         '  else',
         '    echo "VERIFY=BAD" >>"$l"',
@@ -475,11 +546,11 @@ class Console:
         if n:
             data = self.ser.read(n)
             if data:
-                verbose(f"<< [console] {data[-300:]!r}", "debug")
+                verbose(f"<< [console] {data[-C.LOG_TAIL_LONG:]!r}", "debug")
             return data or b""
         return b""
 
-    def drain(self, idle: float = 0.5, max_wait: float = 5.0) -> bytes:
+    def drain(self, idle: float = DRAIN_IDLE_LONG, max_wait: float = DRAIN_MAX) -> bytes:
         """Read until the line has been quiet for `idle` seconds."""
         buf, start, last = b"", self.clock(), self.clock()
         while self.clock() - start < max_wait:
@@ -490,7 +561,7 @@ class Console:
             elif self.clock() - last >= idle:
                 break
             else:
-                self.sleep(0.05)
+                self.sleep(POLL_SLEEP)
         return buf
 
     def expect(self, patterns, timeout: float):
@@ -501,37 +572,37 @@ class Console:
             chunk = self.read_available()
             if chunk:
                 buf += chunk
-                tail = _clean(buf[-2048:])
+                tail = _clean(buf[-EXPECT_WINDOW:])
                 for i, p in enumerate(patterns):
                     if p.search(tail):
                         return i, buf
             else:
-                self.sleep(0.05)
+                self.sleep(POLL_SLEEP)
         return -1, buf
 
 
 def reboot_to_uboot(device) -> bool:
     """From a recovery-Linux shell: reboot and stop at the U-Boot prompt."""
     try:
-        device.send_command("reboot", wait_for_prompt=False, timeout=3)
+        device.send_command("reboot", wait_for_prompt=False, timeout=REBOOT_SEND_TIMEOUT)
     except Exception as e:
         verbose(f"reboot command failed: {e}", "warning")
         return False
-    return device.wait_for_autoboot(timeout=180)
+    return device.wait_for_autoboot(timeout=UBOOT_AFTER_REBOOT_TIMEOUT)
 
 
-def uboot_run(con: Console, line: str, timeout: float = 120.0):
+def uboot_run(con: Console, line: str, timeout: float = UBOOT_CMD_TIMEOUT):
     """Run one U-Boot command; (ok, output). ok=False on a U-Boot error
     message or when the prompt does not come back."""
-    con.drain(idle=0.3, max_wait=2.0)
+    con.drain(idle=DRAIN_IDLE, max_wait=DRAIN_SHORT_MAX)
     con.write(line + "\r\n")
     idx, data = con.expect([UBOOT_RE], timeout)
     text = _clean(data).decode("utf-8", errors="replace")
     body = text.split("\n", 1)[1] if "\n" in text else ""   # drop the echo
     if idx < 0:
-        return False, text[-300:]
+        return False, text[-C.LOG_TAIL_LONG:]
     bad = [e for e in _UBOOT_ERRORS if e in body]
-    return not bad, body.strip()[-300:]
+    return not bad, body.strip()[-C.LOG_TAIL_LONG:]
 
 
 def uboot_prime(con: Console):
@@ -539,10 +610,10 @@ def uboot_prime(con: Console):
     interrupted (see SerialDevice.boot_recovery) — send a bare Enter
     onto an empty line first."""
     con.write("\r\n")
-    con.drain(idle=0.3, max_wait=2.0)
+    con.drain(idle=DRAIN_IDLE, max_wait=DRAIN_SHORT_MAX)
 
 
-def wait_live_login(con: Console, timeout: float = 900.0,
+def wait_live_login(con: Console, timeout: float = LIVE_BOOT_TIMEOUT,
                     user: str = LIVE_USER, password: str = LIVE_PASSWORD):
     """
     After the boot command: wait for the VyOS live login prompt and log
@@ -558,20 +629,20 @@ def wait_live_login(con: Console, timeout: float = 900.0,
     while con.clock() - start < timeout:
         chunk = con.read_available()
         if chunk:
-            buf = (buf + chunk)[-8192:]
+            buf = (buf + chunk)[-LIVE_BUF:]
             booted = booted or b"Starting kernel" in buf
             last_rx = con.clock()
             continue
-        con.sleep(0.05)
+        con.sleep(POLL_SLEEP)
         idle = con.clock() - last_rx
-        tail = _clean(buf[-400:])
+        tail = _clean(buf[-LIVE_TAIL:])
         if b"Kernel panic" in buf:
             return False, "kernel panic while booting VyOS"
-        if idle >= 1.5 and not booted and UBOOT_RE.search(tail):
+        if idle >= UBOOT_BACK_IDLE and not booted and UBOOT_RE.search(tail):
             return False, "U-Boot prompt came back — the boot command failed: " + \
-                tail.decode("utf-8", "replace")[-200:]
-        if idle >= 5.0 and b"login:" in tail and not LOGIN_RE.search(tail) \
-                and con.clock() - nudged_at > 15.0:
+                tail.decode("utf-8", "replace")[-C.LOG_TAIL:]
+        if idle >= LOGIN_NUDGE_IDLE and b"login:" in tail and not LOGIN_RE.search(tail) \
+                and con.clock() - nudged_at > LOGIN_NUDGE_EVERY:
             # the prompt scrolled away under later console output: an empty
             # line makes getty print a fresh "vyos login: "
             con.write("\r")
@@ -579,37 +650,37 @@ def wait_live_login(con: Console, timeout: float = 900.0,
             continue
         if idle >= 2.0 and LOGIN_RE.search(tail):
             con.write(user + "\r")
-            i, data = con.expect([re.compile(rb"assword: ?$")], 15)
+            i, data = con.expect([re.compile(rb"assword: ?$")], PASSWORD_PROMPT_TIMEOUT)
             if i < 0:
                 # e.g. the build's kexec reboot hit mid-login: whatever came
                 # in instead (possibly the next login prompt) stays in buf
-                buf, last_rx = data[-8192:], con.clock()
+                buf, last_rx = data[-LIVE_BUF:], con.clock()
                 continue
             con.write(password + "\r", secret=True)
-            i, data = con.expect([PROMPT_RE, LOGIN_RE], 60)
+            i, data = con.expect([PROMPT_RE, LOGIN_RE], SHELL_PROMPT_TIMEOUT)
             if i == 0:
                 return True, ""
             verbose("VyOS live login did not complete — waiting for the next login prompt", "warning")
-            buf, last_rx = data[-8192:], con.clock()
+            buf, last_rx = data[-LIVE_BUF:], con.clock()
     return False, f"no VyOS login prompt within {int(timeout)} s"
 
 
 _DONE = "__MI_DONE__"
 
 
-def live_cmd(con: Console, cmd: str, timeout: float = 60.0) -> str:
+def live_cmd(con: Console, cmd: str, timeout: float = LIVE_CMD_TIMEOUT) -> str:
     """
     Run a SHORT command in the VyOS live shell and return its output.
     The end marker is typed as "__MI_""DONE__" so only the command's own
     output (not the echoed command line) contains __MI_DONE__.
     """
-    con.drain(idle=0.3, max_wait=3.0)
+    con.drain(idle=DRAIN_IDLE, max_wait=DRAIN_CMD_MAX)
     con.write(f'{cmd}; echo "__MI_""DONE__"\r')
     i, data = con.expect([re.compile(_DONE.encode() + rb"\r?\n")], timeout)
     text = _clean(data).decode("utf-8", errors="replace")
     if i < 0:
         raise TimeoutError(f"no answer to {cmd!r} within {int(timeout)} s")
-    con.expect([PROMPT_RE], 10)
+    con.expect([PROMPT_RE], PROMPT_BACK_TIMEOUT)
     echo_end = text.rfind('"__MI_""DONE__"')
     if echo_end >= 0:
         nl = text.find("\n", echo_end)
@@ -649,15 +720,15 @@ def _pick_emmc(text: str, prefix: str = "mmcblk"):
     return None
 
 
-def run_install_image(con: Console, password: str, timeout: float = 2400.0,
-                      max_answers: int = 40):
+def run_install_image(con: Console, password: str, timeout: float = INSTALL_TIMEOUT,
+                      max_answers: int = INSTALL_MAX_ANSWERS):
     """
     Drive `install image` in the VyOS live shell. Explicit answers:
     continue=y, RAID-1=n, target=the eMMC (/dev/mmcblk*, never the USB
     stick), delete-all-data=y, password x2, console=S (serial). Any other
     question gets Enter = VyOS's own default. Returns (ok, transcript).
     """
-    con.drain(idle=0.5, max_wait=3.0)
+    con.drain(idle=DRAIN_IDLE_LONG, max_wait=DRAIN_CMD_MAX)
     con.write("install image\r")
     buf = b""
     answered_at = 0
@@ -671,8 +742,8 @@ def run_install_image(con: Console, password: str, timeout: float = 2400.0,
             buf += chunk
             last_rx = con.clock()
             continue
-        con.sleep(0.05)
-        if con.clock() - last_rx < 0.8:
+        con.sleep(POLL_SLEEP)
+        if con.clock() - last_rx < INSTALL_QUIET:
             continue
         pending = _clean(buf[answered_at:]).decode("utf-8", errors="replace")
         full = _clean(buf).decode("utf-8", errors="replace")
@@ -680,15 +751,15 @@ def run_install_image(con: Console, password: str, timeout: float = 2400.0,
             continue
         if PROMPT_RE.search(pending.encode()):
             ok = _SUCCESS in full
-            return ok, full[-3000:]
+            return ok, full[-TRANSCRIPT_TAIL:]
         if answers >= max_answers:
-            con.write("\x03")
-            return False, "too many questions — stopped: " + full[-1500:]
+            con.write(CTRL_C)
+            return False, "too many questions — stopped: " + full[-TRANSCRIPT_TAIL_SHORT:]
         if _INVALID in pending:
             invalid += 1
-            if invalid > 3:
-                con.write("\x03")
-                return False, "the installer kept rejecting answers: " + full[-1500:]
+            if invalid > INSTALL_MAX_INVALID:
+                con.write(CTRL_C)
+                return False, "the installer kept rejecting answers: " + full[-TRANSCRIPT_TAIL_SHORT:]
 
         last_line = pending.rstrip().splitlines()[-1] if pending.strip() else ""
         answer, secret = None, False
@@ -703,7 +774,7 @@ def run_install_image(con: Console, password: str, timeout: float = 2400.0,
         elif _Q_DISK in last_line:
             answer = _pick_emmc(full)
             if answer is None:
-                con.write("\x03")
+                con.write(CTRL_C)
                 return False, "the installer offered no eMMC (/dev/mmcblk*) — stopped before partitioning"
         elif _Q_CONSOLE in last_line:
             answer = "S"
@@ -711,7 +782,7 @@ def run_install_image(con: Console, password: str, timeout: float = 2400.0,
             verbose(f"  install image asked: {last_line.strip()!r} — accepting VyOS's default", "debug")
             answer = ""
         elif _OPEN_Q.search(last_line) and con.clock() - last_rx >= _STUCK_AFTER:
-            con.write("\x03")
+            con.write(CTRL_C)
             return False, f"the installer is waiting for an unexpected question: {last_line.strip()!r}"
         else:
             continue   # still printing (e.g. copying files) — keep waiting

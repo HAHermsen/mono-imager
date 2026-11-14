@@ -1,8 +1,8 @@
 # mono-imager
 
-Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — or installs VyOS — no manual `dd`/`tftp` fiddling required.
+Automated firmware flashing tool for Mono Gateway Routers and the Mono Gateway Development Kit (NXP LS1046A). Talks to the device over a USB-to-UART serial connection, drives U-Boot and its recovery Linux shell, and flashes OpenWRT, Armbian, or OPNsense over LAN or USB — or installs VyOS — no manual `dd`/`tftp` fiddling required. It can also snapshot the whole eMMC and restore it later, to swap between configured OSes.
 
-Version: **1.5.0** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
+Version: **1.7.5** &nbsp;·&nbsp; Author: H.A. Hermsen &nbsp;·&nbsp; License: GPLv3
 
 ---
 
@@ -23,6 +23,21 @@ Supported operating systems: **OpenWRT**, **Armbian**, **OPNsense** — each ava
 
 - **VyOS via LAN → USB stick in the Mono**: you point it at the `.iso` on your PC; it is sent to the Mono, written to the USB stick in the Mono (read back to confirm), live-booted, and installed to eMMC with VyOS's own `install image` — mono-imager answers the installer's questions (eMMC as the target, serial console, your chosen password). DIP stays on NOR afterwards. New in 1.5.0: built and tested without hardware (simulated device); the first real run is still to come.
 - **VyOS via LAN → eMMC staging (EXPERIMENTAL, not yet tested on hardware)**: same, without a USB stick — the ISO is staged on the eMMC and booted with `toram`; it stops before installing if the live system is not running from RAM.
+
+**eMMC snapshot / restore (new in 1.7.0, #29 — first hardware runs in progress)**: configure an OS once, snapshot the whole eMMC, and swap between finished states later — config, SSH host keys and all.
+
+- **Snapshot** copies the entire eMMC bit for bit (no partition parsing) to this PC over LAN, or to a USB stick in the Mono. It is stored as 1 GiB chunks (FAT32-safe) with a `manifest.json` and `SHA256SUMS`, and every chunk is read back from the eMMC (page cache dropped) and must match what was stored. An optional read-only NOR dump can be kept for forensics; it is never restored.
+- **Restore** checks `SHA256SUMS` before a single byte is sent, takes an automatic snapshot of the current eMMC first (so a restore is itself undoable), shows a summary and waits for an explicit `yes`, writes, and re-hashes everything on the device. On a mismatch you can retry or roll back to the auto-snapshot. The firmware region (4 KiB..32 MiB) is skipped when it is already identical.
+- **Own snapshot or someone else's?** Every port's MAC address recorded in the snapshot is compared with the ones this board reports. No match = clone mode, which must be confirmed and comes with a warning: hostname, SSH host keys, IP addresses and MAC-pinned interface settings come along unchanged (mono-imager never edits the OS config), with a hint where that OS keeps them.
+- **Clone mode**: `firmware update` provisions this board first, then only 0..4 KiB and 32 MiB..end are written; a smaller target eMMC is refused, a larger one gets `sgdisk -e` (when the device has it).
+- **Firmware check**: the U-Boot versions of this board (NOR and eMMC) are compared with the snapshot's. A restore never writes NOR firmware, so when this board's NOR is older you are advised to stop and run "Update NOR firmware" first.
+- **Inventory with every snapshot** (`inventory.txt`, key facts in `manifest.json`): date (UTC, NTP-synced over LAN), U-Boot version strings found in NOR and in the eMMC firmware region, firmware tool / recovery kernel / recovery OS, MTD partitions, eMMC chip and wear level, all MAC addresses, RAM, the U-Boot banner and power-on self-test of the boot that was caught, and both U-Boot env sets (NOR and eMMC).
+- **Boots whatever the DIP position (opt-in)**: after a restore, the OS's boot variables (`bootcmd` and everything it runs — never `recovery`) can be copied into the other U-Boot env, so it boots with the DIP switch in either position. One env region is rewritten, read back and compared.
+- **Nothing changes while it copies**: the OS is shut down; recovery Linux runs from RAM and the eMMC is not mounted (the snapshot refuses if it is). A clean `reboot` before the snapshot keeps the filesystems clean; a power-cycle captures a dirty filesystem as-is.
+- **Health check first (read-only, warnings only)**: the GPT is checked at both ends of the disk (headers, CRCs, partitions inside the usable area and not overlapping, backup header consistent and at the real end of the disk), and every ext2/3/4 and FAT partition is checked with `e2fsck -n` / `fsck.vfat -n` when recovery Linux has those tools. The result is stored in `manifest.json`; on errors you decide whether to snapshot anyway. An entry-CRC mismatch caused by Mono's firmware region overlapping the OS image's own GPT (Armbian, OPNsense) is reported as a warning — it boots fine.
+- **No DIP switch in the happy path**: you reboot the running OS cleanly, mono-imager catches U-Boot and loads NOR recovery Linux into RAM (`sf read` + `booti`, nothing saved). Only when that is impossible (blank eMMC, `bootdelay=0`, a U-Boot without `sf`) are you asked to flip the DIP switch to NOR, and back afterwards.
+- **NOR U-Boot env travels with the snapshot**: the 8 KiB `uboot-env` region is read from NOR (read-only, whatever the DIP position) and stored as `nor_env.bin` + readable `nor_env.txt`. On a same-board restore, if NOR's env differs, you are offered to write it back — the only time snapshot/restore writes NOR, and only that env region, never the firmware; it is read back and compared. Clone mode never offers it (the env holds the other board's settings, such as MAC addresses). Declined, the restore prints the `setenv` commands the OS needs instead.
+- LAN snapshots are compressed on the PC (zstd when available: Python 3.14+, or `pip install zstandard`; gzip otherwise), so recovery Linux needs no zstd. USB snapshots are compressed on the device with the best tool it has (zstd, gzip, or none).
 
 ## What it does **NOT** do (and never will)
 
@@ -81,7 +96,7 @@ Every menu appends to a continuous, scrolling transcript instead of clearing the
 
 ```
 ------------------------------------------------------------
-mono-imager 1.5.0 - 192.168.1.50/24 via 192.168.1.1 (DNS 1.1.1.1) - dhcp
+mono-imager 1.7.5 - 192.168.1.50/24 via 192.168.1.1 (DNS 1.1.1.1) - dhcp
 ```
 
 before showing its own prompt or choices. Two screens were already scrolling before this branch existed — the live flash-progress view and the final result screen — specifically so their output stays visible for debugging; every other menu now follows the same pattern for consistency.
@@ -97,7 +112,9 @@ before showing its own prompt or choices. Two screens were already scrolling bef
 6) Test LAN connection        — full network resolve + reach the host HTTP server
 7) Test USB stick             — confirm a USB stick mounts and has usable images
 8) Show Device Stats          — read and display U-Boot boot diagnostics
-9) Exit
+9) Snapshot eMMC              — whole eMMC -> this PC (LAN) or a USB stick in the Mono
+10) Restore eMMC              — snapshot -> whole eMMC (auto-snapshot first)
+11) Exit
 ```
 
 Flashing an OS (option 1) walks through: pick the serial port, pick the OS + transfer method (LAN or USB), point it at a firmware file (or let it auto-detect one from a plugged-in USB stick), confirm a pre-flash summary, then watch the flash run with live progress and a final pass/fail report.
@@ -108,6 +125,7 @@ Flashing an OS (option 1) walks through: pick the serial port, pick the OS + tra
 mono_imager/
   cli.py                    entry point (argument parsing, logging setup)
   tui.py                    menu-driven application controller
+  constants.py              shared hardware facts and defaults (serial, paths, eMMC/NOR layout, timeouts)
   flash_orchestrator.py     bootstrap phases + LAN/USB flash-journey execution
   recovery_orchestrator.py  eMMC/NOR-only firmware update flows, modern/legacy detection
   step_registry.py          declarative @register_step journey system
@@ -116,6 +134,11 @@ mono_imager/
   console.py                terminal rendering (pure presentation layer)
   uboot_parse.py            U-Boot boot-output parsing (identity + self-test)
   diagnostics.py            Test Serial / Test LAN / Test USB menu logic
+  snapshot.py               eMMC snapshot/restore: format, planning, recovery-Linux scripts
+  snapshot_server.py        streaming HTTP upload/serve for LAN snapshot/restore
+  snapshot_orchestrator.py  Snapshot eMMC / Restore eMMC journeys
+  inventory.py              platform inventory kept with every snapshot, U-Boot version compare
+  uboot_env.py              raw U-Boot env regions: parse, rebuild, boot-variable closure
   journeys/                 one file per OS+transfer flashing journey
     JOURNEYS.md              journey system docs + how to add a new journey
     FIRMWARE_VS_OS_IMAGE.md  eMMC firmware-region-vs-OS-image offset explainer

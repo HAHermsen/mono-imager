@@ -37,8 +37,9 @@ import re
 from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
 from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
-from mono_imager.journeys.openwrt_lan import _uboot_steps_openwrt_lan
+from mono_imager.journeys.openwrt_lan import _uboot_steps_openwrt_lan, PT_DD_ARGS, BULK_DD_ARGS
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
+from mono_imager import constants as C
 from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def step_mount_usb(ctx: StepContext) -> bool:
         if ok:
             check_usb_size(d, ctx.usb_mount)
         return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
-                    detail[-100:] if not ok else "")
+                    detail[-C.LOG_TAIL_SHORT:] if not ok else "")
     except Exception as e:
         return step(0, "USB mount", False, str(e))
 
@@ -110,8 +111,8 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     console_logger.info("Flashing OpenWRT — writing both dd passes...")
     script = (
         f"{prep}"
-        f'{{ dd if="{img_path}" of={ctx.flash_target} bs=512 count=8; '
-        f'dd if="{img_path}" of={ctx.flash_target} bs=1M skip=32 seek=32; }} '
+        f'{{ dd if="{img_path}" of={ctx.flash_target} {PT_DD_ARGS}; '
+        f'dd if="{img_path}" of={ctx.flash_target} {BULK_DD_ARGS}; }} '
         f"> /tmp/mono_imager_flash.log 2>&1; "
         f"sync; "
         + (f"rm -f {_STAGED_IMG}; " if fmt == "img.gz" else "")
@@ -119,7 +120,7 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     )
     response, err = with_spinner(
         d.run_script, script, marker="flash_dd",
-        exec_timeout=600, message="Flashing OpenWRT"
+        exec_timeout=C.FLASH_TIMEOUT, message="Flashing OpenWRT"
     )
     if err:
         return step(0, "OpenWRT flash (dd, both passes)", False, str(err))
@@ -129,16 +130,16 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
 
     if len(matches) < 2:
         return step(0, "OpenWRT flash (dd, both passes)", False,
-                    f"expected 2 'records out' lines, got {len(matches)}: {(response or '')[-300:]}")
+                    f"expected 2 'records out' lines, got {len(matches)}: {(response or '')[-C.LOG_TAIL_LONG:]}")
 
-    pt_bytes = int(matches[0][0]) * 512 + int(matches[0][1])
-    bulk_bytes = int(matches[1][0]) * 1024 * 1024 + int(matches[1][1])
+    pt_bytes = int(matches[0][0]) * C.SECTOR_BYTES + int(matches[0][1])
+    bulk_bytes = int(matches[1][0]) * C.MIB + int(matches[1][1])
 
-    step(0, "OpenWRT partition table (dd bs=512 count=8)", pt_bytes > 0,
-         response[-200:] if pt_bytes == 0 else "")
+    step(0, f"OpenWRT partition table (dd {PT_DD_ARGS})", pt_bytes > 0,
+         response[-C.LOG_TAIL:] if pt_bytes == 0 else "")
     ok = pt_bytes > 0 and bulk_bytes > 0 and not has_error
-    step(0, f"OpenWRT image (dd bs=1M skip=32 seek=32, {bulk_bytes // 1024 // 1024} MB)",
-         ok, response[-200:] if not ok else "")
+    step(0, f"OpenWRT image (dd {BULK_DD_ARGS}, {bulk_bytes // C.MIB} MB)",
+         ok, response[-C.LOG_TAIL:] if not ok else "")
     return ok
 
 
@@ -146,7 +147,7 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
 def step_unmount_usb(ctx: StepContext) -> bool:
     try:
         with Spinner("Unmounting USB stick..."):
-            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=15)
+            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
         return step(0, f"USB unmounted ({ctx.usb_mount})", True)
     except Exception as e:
         verbose(f"⚠ USB unmount warning: {e}", "warning")

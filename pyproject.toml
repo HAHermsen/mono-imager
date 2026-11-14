@@ -26,6 +26,8 @@ version = {attr = "mono_imager.__version__"}
 mono-imager = "mono_imager.cli:main"
 
 [project.optional-dependencies]
+# zstd for LAN eMMC snapshots on Python < 3.14 (3.14+ has compression.zstd; gzip otherwise)
+zstd = ["zstandard>=0.22; python_version < '3.14'"]
 dev = [
     "pytest>=7",
     "ruff",

@@ -15,12 +15,14 @@ import importlib
 import pkgutil
 from pathlib import Path
 
+from mono_imager import constants as C
+
 # Flash targets per OS — single source of truth used by journeys and tui.py
 _FLASH_TARGETS = {
-    "OPNsense": "/dev/mmcblk0",
-    "OpenWRT":  "/dev/mmcblk0",
-    "Armbian":  "/dev/mmcblk0",
-    "VyOS":     "/dev/mmcblk0",   # installed by VyOS's own `install image`
+    "OPNsense": C.EMMC_DEV,
+    "OpenWRT":  C.EMMC_DEV,
+    "Armbian":  C.EMMC_DEV,
+    "VyOS":     C.EMMC_DEV,   # installed by VyOS's own `install image`
 }
 
 # Final DIP-switch position per OS, shown on tui.py's end-of-flash screen
@@ -62,6 +64,7 @@ _CONTAINER_MAGIC = {
     "xz":    b"\xfd7zXZ\x00",
     "zip":   b"PK\x03\x04",
 }
+_MAGIC_PROBE_BYTES = max(len(m) for m in _CONTAINER_MAGIC.values())   # longest magic (xz: 6)
 
 
 def detect_container(path) -> str:
@@ -69,7 +72,7 @@ def detect_container(path) -> str:
     'bzip2' | 'gzip' | 'xz' | 'zip' | 'raw' (raw = none recognised)."""
     try:
         with open(path, "rb") as f:
-            head = f.read(6)
+            head = f.read(_MAGIC_PROBE_BYTES)
     except OSError:
         return "raw"
     for name, magic in _CONTAINER_MAGIC.items():
@@ -181,11 +184,11 @@ def get_journey(
     host_ip:       str  = "",
     device_ip:     str  = "",
     firmware_path        = None,
-    http_port:     int  = 8080,
+    http_port:     int  = C.HTTP_PORT,
     device_mac:    str  = "",
     flash_target:  str  = "",
-    usb_device:    str  = "/dev/sda",
-    usb_mount:     str  = "/mnt/usb",
+    usb_device:    str  = C.USB_DEV,
+    usb_mount:     str  = C.USB_MOUNT,
     device_net           = None,
 ):
     """
@@ -208,7 +211,7 @@ def get_journey(
         http_port     = http_port,
         device_mac    = device_mac,
         firmware_path = firmware_path,
-        flash_target  = flash_target or _FLASH_TARGETS.get(os_name, "/dev/mmcblk0"),
+        flash_target  = flash_target or _FLASH_TARGETS.get(os_name, C.EMMC_DEV),
         usb_device    = usb_device,
         usb_mount     = usb_mount,
         device_net    = device_net,

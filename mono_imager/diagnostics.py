@@ -26,6 +26,14 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from mono_imager import console
+from mono_imager import constants as C
+
+# --- Tuning (seconds) ---------------------------------------------------------
+CONNECT_READ_TIMEOUT = 5
+RUN_RECOVERY_SEND_TIMEOUT = 3
+RECOVERY_BOOT_WAIT = 60              # Test Serial: wait for login / shell
+LOGIN_SETTLE = 1
+SHELL_SETTLE = 0.5
 from mono_imager.spinner import with_spinner, Spinner
 
 
@@ -43,25 +51,25 @@ def test_serial(port: str) -> bool:
 
     print()
     print(f"  Port:  {port}")
-    print("  Baud:  115200")
+    print(f"  Baud:  {C.SERIAL_BAUD}")
     print()
 
     results = []
 
-    d = SerialDevice(port, timeout=5)
-    connected = console.check(results, "Connect at 115200 baud", d.connect(115200))
+    d = SerialDevice(port, timeout=CONNECT_READ_TIMEOUT)
+    connected = console.check(results, f"Connect at {C.SERIAL_BAUD} baud", d.connect(C.SERIAL_BAUD))
     if not connected:
         input("\n  Press Enter to continue...")
         return False
 
     try:
         print()
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         print("  ⚡  POWER CYCLE YOUR DEVICE NOW  ⚡")
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         print()
         autoboot_ok, autoboot_err = with_spinner(
-            d.wait_for_autoboot, timeout=60,
+            d.wait_for_autoboot, timeout=C.AUTOBOOT_TIMEOUT,
             message="Waiting for U-Boot autoboot interrupt..."
         )
         if autoboot_err:
@@ -71,7 +79,7 @@ def test_serial(port: str) -> bool:
             input("\n  Press Enter to continue...")
             return connected
 
-        response = d.send_command("printenv ethact", timeout=5)
+        response = d.send_command("printenv ethact", timeout=C.UBOOT_QUICK_TIMEOUT)
         console.check(results, "U-Boot responds to commands",
                        bool(response.strip()),
                        response.strip() if response.strip() else "no response")
@@ -79,23 +87,23 @@ def test_serial(port: str) -> bool:
         booted = False
         buffer = b""
         with Spinner("Booting recovery Linux..."):
-            d.send_command("run recovery", wait_for_prompt=False, timeout=3)
+            d.send_command("run recovery", wait_for_prompt=False, timeout=RUN_RECOVERY_SEND_TIMEOUT)
             start = time.time()
-            while time.time() - start < 60:
+            while time.time() - start < RECOVERY_BOOT_WAIT:
                 byte = d.ser.read(1)
                 if byte:
                     buffer += byte
                     if b"root@recovery" in buffer or b"login:" in buffer:
                         if b"login:" in buffer and b"root@recovery" not in buffer:
                             d.ser.write(b"root\r\n")
-                            time.sleep(1)
+                            time.sleep(LOGIN_SETTLE)
                         booted = True
                         break
         console.check(results, "Recovery Linux booted", booted)
 
         if booted:
             d.ser.write(b"\r\n")
-            time.sleep(0.5)
+            time.sleep(SHELL_SETTLE)
             waiting = d.ser.in_waiting
             response = d.ser.read(waiting) if waiting else b""
             at_shell = b"root@recovery" in buffer or b"root@recovery" in response
@@ -105,7 +113,7 @@ def test_serial(port: str) -> bool:
         d.disconnect()
 
     print()
-    print("  " + "─" * 56)
+    print("  " + "─" * C.BOX_RULE_WIDTH)
     total  = len(results)
     passed = sum(results)
     if passed == total:
@@ -145,7 +153,7 @@ def test_lan(
     )
 
     print("  Test LAN Connection")
-    print("  " + "─" * 56)
+    print("  " + "─" * C.BOX_RULE_WIDTH)
     print()
 
     results = []
@@ -154,7 +162,7 @@ def test_lan(
     print("  Rebooting device into recovery Linux...")
     soft_reboot(port)
 
-    d = phase1_bootstrap(port, 115200)
+    d = phase1_bootstrap(port, C.SERIAL_BAUD)
     if not console.check(results, "Device in recovery shell", d is not None):
         input("\n  Press Enter to continue...")
         return None
@@ -171,7 +179,7 @@ def test_lan(
         device_net = get_device_net() or {}
         device_ip = device_net.get("ip")
 
-        http_port = 18080
+        http_port = C.LANTEST_HTTP_PORT
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tf:
             _tf.write(b"LAN_TEST")
             tmp = pathlib.Path(_tf.name)
@@ -191,7 +199,7 @@ def test_lan(
         try:
             d.launch_script(check_script, marker="lantest")
             report, _rep_err = with_spinner(
-                wait_for_report, "lantest", timeout=15.0,
+                wait_for_report, "lantest", timeout=C.REPORT_TIMEOUT,
                 message="Waiting for device HTTP report..."
             )
             device_sees_host = report is not None and "200" in report
@@ -203,7 +211,7 @@ def test_lan(
 
         _curl_detail = (
             "" if device_sees_host else
-            "device's network is up but can't reach the host — either port 18080 is "
+            "device's network is up but can't reach the host — either port " f"{C.LANTEST_HTTP_PORT} is "
             "blocked (allow Python.exe through Windows Defender Firewall) or the cable "
             "doesn't connect to the SAME router/switch as the host"
         )
@@ -214,7 +222,7 @@ def test_lan(
             d.disconnect()
 
     print()
-    print("  " + "─" * 56)
+    print("  " + "─" * C.BOX_RULE_WIDTH)
     passed_count = sum(results)
     total        = len(results)
     if passed_count == total:
@@ -242,12 +250,12 @@ def test_usb(port: str) -> bool:
     logger = logging.getLogger(__name__)
 
     print("  Test USB Stick")
-    print("  " + "─" * 56)
+    print("  " + "─" * C.BOX_RULE_WIDTH)
     print()
 
     results = []
 
-    d = phase1_bootstrap(port, 115200)
+    d = phase1_bootstrap(port, C.SERIAL_BAUD)
     if not console.check(results, "Device in recovery shell", d is not None):
         input("\n  Press Enter to continue...")
         return False
@@ -294,14 +302,14 @@ def test_usb(port: str) -> bool:
 
     finally:
         try:
-            d.send_command(f"umount {usb_mount} 2>&1; sync", timeout=15)
+            d.send_command(f"umount {usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
         except Exception as e:
             print(f"⚠ USB unmount warning: {e}", flush=True)
             logger.warning(f"USB unmount warning: {e}")
         d.disconnect()
 
     print()
-    print("  " + "─" * 56)
+    print("  " + "─" * C.BOX_RULE_WIDTH)
     passed_count = sum(results)
     total        = len(results)
     if passed_count == total:

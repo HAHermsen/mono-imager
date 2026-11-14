@@ -26,6 +26,7 @@ from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
 from mono_imager.journeys.armbian_lan import _flip_to_emmc_and_verify, _refresh_firmware_and_finish
+from mono_imager import constants as C
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def step_mount_usb(ctx: StepContext) -> bool:
         if ok:
             check_usb_size(d, ctx.usb_mount)
         return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
-                    detail[-100:] if not ok else "")
+                    detail[-C.LOG_TAIL_SHORT:] if not ok else "")
     except Exception as e:
         return step(0, "USB mount", False, str(e))
 
@@ -82,14 +83,14 @@ def step_flash_armbian(ctx: StepContext) -> bool:
         )
         console_logger.info("Flashing Armbian from USB — this takes several minutes...")
 
-    response, err = with_spinner(d.run_script, flash_script, marker="flash_dd", exec_timeout=600, message="Flashing Armbian")
+    response, err = with_spinner(d.run_script, flash_script, marker="flash_dd", exec_timeout=C.FLASH_TIMEOUT, message="Flashing Armbian")
     if err:
         return step(0, "Armbian flash executed", False, str(err))
     has_records = "records in" in response and "records out" in response
     has_error   = "error" in response.lower() or "failed" in response.lower()
     step(0, "Armbian flash executed", True)
-    step(0, "dd records in/out confirmed", has_records, response[-200:] if not has_records else "")
-    step(0, "No errors", not has_error, response[-200:] if has_error else "")
+    step(0, "dd records in/out confirmed", has_records, response[-C.LOG_TAIL:] if not has_records else "")
+    step(0, "No errors", not has_error, response[-C.LOG_TAIL:] if has_error else "")
     return has_records and not has_error
 
 
@@ -97,7 +98,7 @@ def step_flash_armbian(ctx: StepContext) -> bool:
 def step_unmount_usb(ctx: StepContext) -> bool:
     try:
         with Spinner("Unmounting USB stick..."):
-            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=15)
+            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
         return step(0, f"USB unmounted ({ctx.usb_mount})", True)
     except Exception as e:
         verbose(f"⚠ USB unmount warning: {e}", "warning")
@@ -111,11 +112,11 @@ def step_unmount_usb(ctx: StepContext) -> bool:
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["usb_unmounted"], produces=["emmc_boot_verified"], label="Flip DIP to eMMC and verify boot")
 def step_flip_to_emmc_and_verify(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * C.DIVIDER_WIDTH)
     return _flip_to_emmc_and_verify(ctx)
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_boot_verified"], produces=["rebooted"], label="Refresh eMMC firmware (NOR round-trip)")
 def step_refresh_firmware(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * C.DIVIDER_WIDTH)
     return _refresh_firmware_and_finish(ctx)

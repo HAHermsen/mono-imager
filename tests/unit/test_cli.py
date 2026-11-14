@@ -324,15 +324,18 @@ for opt, method in [("5", "menu_test_serial"), ("6", "menu_test_lan"), ("7", "me
         app.menu_main()
     check(f"option {opt} -> {method}() called", mock_method.called)
 
-# Quit is option 9
+check_main_transition("9", MenuState.SNAPSHOT,             "option 9 -> SNAPSHOT")
+check_main_transition("10", MenuState.RESTORE,             "option 10 -> RESTORE")
+
+# Quit is option 11
 app = make_app()
-with patch("builtins.input", return_value="9"), patch("builtins.print"):
+with patch("builtins.input", return_value="11"), patch("builtins.print"):
     try:
         app.menu_main()
     except SystemExit as e:
-        check("option 9 -> sys.exit(0)", e.code == 0)
+        check("option 11 -> sys.exit(0)", e.code == 0)
     else:
-        check("option 9 -> sys.exit(0)", False)
+        check("option 11 -> sys.exit(0)", False)
 
 # Invalid input stays in MAIN (no crash, no transition)
 app = make_app()

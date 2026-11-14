@@ -39,6 +39,9 @@ import threading
 from mono_imager.step_registry import register_step, StepContext
 from mono_imager.spinner import with_spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, wait_for_report
+from mono_imager import constants as C
+
+RELAY_POLL_SLEEP = 0.05     # live serial relay while waiting for the user
 from mono_imager.journeys import _common  # also provides shared _step_http_server_start / _step_firmware_reachable
 
 logger = logging.getLogger(__name__)
@@ -92,14 +95,14 @@ def step_flash_armbian(ctx: StepContext) -> bool:
         d.launch_script(flash_script, marker="step07_flash")
     except Exception as e:
         return step(0, "Armbian flash launched", False, str(e))
-    raw, err = with_spinner(wait_for_report, "07", timeout=600.0, message="Flashing Armbian")
+    raw, err = with_spinner(wait_for_report, "07", timeout=C.FLASH_TIMEOUT, message="Flashing Armbian")
     if err or raw is None:
         return step(0, "Armbian flash (dd)", False, str(err) if err else "no report-back from device in 600s")
     has_records = "records in" in raw and "records out" in raw
     has_error   = "error" in raw.lower() or "failed" in raw.lower()
     step(0, "Armbian flash executed", True)
-    step(0, "dd records in/out confirmed", has_records, raw[-200:] if not has_records else "")
-    step(0, "No errors", not has_error, raw[-200:] if has_error else "")
+    step(0, "dd records in/out confirmed", has_records, raw[-C.LOG_TAIL:] if not has_records else "")
+    step(0, "No errors", not has_error, raw[-C.LOG_TAIL:] if has_error else "")
     return has_records and not has_error
 
 
@@ -141,9 +144,9 @@ def _pause_with_live_serial(ctx: StepContext, prompt: str) -> None:
                         sys.stdout.write(chunk.decode("utf-8", errors="replace"))
                         sys.stdout.flush()
                 else:
-                    time.sleep(0.05)
+                    time.sleep(RELAY_POLL_SLEEP)
             except Exception:
-                time.sleep(0.05)
+                time.sleep(RELAY_POLL_SLEEP)
 
     t = threading.Thread(target=relay, daemon=True)
     t.start()
@@ -175,9 +178,9 @@ def _flip_to_emmc_and_verify(ctx: StepContext) -> bool:
     actually something to look at instead of a blank console.
     """
     console_logger.info("")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     console_logger.info("  ⚡ FLIP THE DIP SWITCH TO eMMC, THEN POWER-CYCLE ⚡")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     _pause_with_live_serial(ctx, "  Once Armbian has booted, press Enter to continue...")
     return step(0, "DIP flipped to eMMC — boot confirmed by user", True)
 
@@ -200,13 +203,13 @@ def _refresh_firmware_and_finish(ctx: StepContext) -> bool:
     """
     d = ctx.device
     console_logger.info("")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     console_logger.info("  ⚡ FLIP THE DIP SWITCH TO NOR, THEN POWER-CYCLE ⚡")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     input("  Press Enter once you've done that...")
 
     interrupted, _err = with_spinner(
-        d.wait_for_autoboot, timeout=60,
+        d.wait_for_autoboot, timeout=C.AUTOBOOT_TIMEOUT,
         message="Waiting for U-Boot autoboot interrupt..."
     )
     if _err or not interrupted:
@@ -214,14 +217,14 @@ def _refresh_firmware_and_finish(ctx: StepContext) -> bool:
                     str(_err) if _err else "autoboot message not seen within 60s")
 
     booted, _err = with_spinner(
-        d.boot_recovery, boot_medium="qspi",
+        d.boot_recovery, boot_medium=C.BOOT_MEDIUM_NOR,
         message="Booting recovery Linux..."
     )
     if _err or not booted:
         return step(0, "Recovery Linux booted (NOR)", False, str(_err) if _err else "")
 
     logged_in, _err = with_spinner(
-        d.login_recovery, timeout=30,
+        d.login_recovery, timeout=C.LOGIN_TIMEOUT,
         message="Logging into recovery shell..."
     )
     if _err or not logged_in:
@@ -250,20 +253,20 @@ def _refresh_firmware_and_finish(ctx: StepContext) -> bool:
     # nothing further to gate on; hand off the instruction (tui.py's
     # own end-of-flash screen repeats a version of it too) and finish.
     console_logger.info("")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     console_logger.info("  ⚡ FLIP THE DIP SWITCH BACK TO eMMC, THEN POWER-CYCLE ⚡")
     console_logger.info("  It will boot Armbian from eMMC with the refreshed firmware.")
-    console_logger.info("=" * 60)
+    console_logger.info("=" * C.DIVIDER_WIDTH)
     return step(0, "Firmware refresh complete — flip DIP to eMMC and power-cycle", True)
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["emmc_boot_verified"], label="Flip DIP to eMMC and verify boot")
 def step_flip_to_emmc_and_verify(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Flip DIP to eMMC and verify boot"); verbose("=" * C.DIVIDER_WIDTH)
     return _flip_to_emmc_and_verify(ctx)
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_boot_verified"], produces=["rebooted"], label="Refresh eMMC firmware (NOR round-trip)")
 def step_refresh_firmware(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Refresh eMMC firmware (NOR round-trip)"); verbose("=" * C.DIVIDER_WIDTH)
     return _refresh_firmware_and_finish(ctx)

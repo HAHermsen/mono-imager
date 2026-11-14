@@ -22,6 +22,7 @@ from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger
 from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
 from mono_imager.journeys.opnsense_lan import _uboot_steps_opnsense_lan
+from mono_imager import constants as C
 from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ def step_mount_usb(ctx: StepContext) -> bool:
         if ok:
             check_usb_size(d, ctx.usb_mount)
         return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
-                    detail[-100:] if not ok else "")
+                    detail[-C.LOG_TAIL_SHORT:] if not ok else "")
     except Exception as e:
         return step(0, "USB mount", False, str(e))
 
@@ -99,14 +100,14 @@ def step_flash_opnsense(ctx: StepContext) -> bool:
             f"cat /tmp/mono_imager_flash.log"
         )
         console_logger.info("Flashing OPNsense from USB — this takes several minutes...")
-    response, err = with_spinner(d.run_script, flash_script, marker="flash_dd", exec_timeout=1200, message="Flashing OPNsense (bzip2 | dd)")
+    response, err = with_spinner(d.run_script, flash_script, marker="flash_dd", exec_timeout=C.FLASH_TIMEOUT_SLOW, message="Flashing OPNsense (bzip2 | dd)")
     if err:
         return step(0, "OPNsense flash executed", False, str(err))
     has_records = "records in" in response and "records out" in response
     has_error   = "error" in response.lower() or "failed" in response.lower()
     step(0, "OPNsense flash executed", True)
-    step(0, "dd records in/out confirmed", has_records, response[-200:] if not has_records else "")
-    step(0, "No errors", not has_error, response[-200:] if has_error else "")
+    step(0, "dd records in/out confirmed", has_records, response[-C.LOG_TAIL:] if not has_records else "")
+    step(0, "No errors", not has_error, response[-C.LOG_TAIL:] if has_error else "")
     return has_records and not has_error
 
 
@@ -114,7 +115,7 @@ def step_flash_opnsense(ctx: StepContext) -> bool:
 def step_unmount_usb(ctx: StepContext) -> bool:
     try:
         with Spinner("Unmounting USB stick..."):
-            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=15)
+            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
         return step(0, f"USB unmounted ({ctx.usb_mount})", True)
     except Exception as e:
         verbose(f"⚠ USB unmount warning: {e}", "warning")
@@ -124,9 +125,9 @@ def step_unmount_usb(ctx: StepContext) -> bool:
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["device_mac_known"], label="Detect device MAC address")
 def step_detect_mac(ctx: StepContext) -> bool:
     d = ctx.device
-    iface = (ctx.device_net or {}).get("iface", "eth0")
+    iface = (ctx.device_net or {}).get("iface", C.DEFAULT_ETH_IFACE)
     try:
-        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=5)
+        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=C.SHELL_QUICK_TIMEOUT)
         mac = result.strip()
         if mac and mac != "unknown" and ":" in mac:
             ctx.device_mac = mac
@@ -160,7 +161,7 @@ def step_reboot(ctx: StepContext) -> bool:
     console_logger.info("  DIP stays RIGHT (NOR). No action needed.")
     console_logger.info("")
     try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
+        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=C.REBOOT_CMD_TIMEOUT)
     except Exception as e:
         verbose(f"⚠ Reboot warning: {e}", "warning")
     return step(0, "Reboot sent — OPNsense booting from eMMC", True)

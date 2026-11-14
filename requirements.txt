@@ -2,3 +2,5 @@
 # This file is for pip install -r convenience only; keep in sync with Pyproject.toml.
 pyserial>=3.5
 icmplib>=3.0
+# Optional: zstd for LAN eMMC snapshots on Python < 3.14 (gzip is used without it)
+zstandard>=0.22; python_version < "3.14"

@@ -18,6 +18,15 @@ import logging
 from typing import Optional
 
 from mono_imager.spinner import with_spinner
+from mono_imager import constants as C
+
+# --- Limits / tuning (seconds) --------------------------------------------------
+MAX_PREFIX_LEN = 32                  # IPv4 prefix length
+IPV4_OCTETS = 4
+OCTET_MAX = 255
+ETH_SCRIPT_TIMEOUT = 10              # bring ports up/down, read link state
+ETH_RECHECK_TIMEOUT = 5
+NET_APPLY_TIMEOUT = 20               # ip addr/route + resolv.conf
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +43,12 @@ def netmask_to_prefix(value: str) -> Optional[str]:
     if not value:
         return None
     if "." not in value:
-        return value if value.isdigit() and 0 <= int(value) <= 32 else None
+        return value if value.isdigit() and 0 <= int(value) <= MAX_PREFIX_LEN else None
     try:
         octets = [int(o) for o in value.split(".")]
     except ValueError:
         return None
-    if len(octets) != 4 or any(not 0 <= o <= 255 for o in octets):
+    if len(octets) != IPV4_OCTETS or any(not 0 <= o <= OCTET_MAX for o in octets):
         return None
     bits = "".join(f"{o:08b}" for o in octets)
     if "01" in bits:  # a 0 followed by a 1 means the mask isn't contiguous
@@ -105,8 +114,8 @@ class RecoveryNetwork:
         # LOWER_UP is never set until each candidate is brought up first.
         # Combined into a single round trip — each costs real seconds.
         try:
-            bring_up_cmd = "; ".join(f"ip link set eth{n} up 2>/dev/null" for n in range(5))
-            d.run_script(bring_up_cmd, marker="recovery_eth_up", exec_timeout=10)
+            bring_up_cmd = "; ".join(f"ip link set eth{n} up 2>/dev/null" for n in range(C.ETH_IFACE_COUNT))
+            d.run_script(bring_up_cmd, marker="recovery_eth_up", exec_timeout=ETH_SCRIPT_TIMEOUT)
         except Exception as e:
             print(f"  ❌ Failed to bring up Ethernet ports: {e}")
             return False
@@ -118,7 +127,7 @@ class RecoveryNetwork:
             ip_output, _eth_err = with_spinner(
                 d.run_script,
                 "for i in 1 2 3 4; do ip link show | grep -q LOWER_UP && break; sleep 0.5; done; ip link show",
-                marker="recovery_eth_check", exec_timeout=10,
+                marker="recovery_eth_check", exec_timeout=ETH_SCRIPT_TIMEOUT,
                 message="Detecting active Ethernet port..."
             )
             if _eth_err:
@@ -129,7 +138,7 @@ class RecoveryNetwork:
                 print("     Plug an Ethernet cable into any RJ-45 jack (not the SFP+ cages).")
                 print()
                 input("  Press Enter once the cable is plugged in...")
-                ip_output = d.run_script("ip link show", marker="recovery_eth_check_retry", exec_timeout=5)
+                ip_output = d.run_script("ip link show", marker="recovery_eth_check_retry", exec_timeout=ETH_RECHECK_TIMEOUT)
                 ifaces = _copper_first(core.parse_active_eth_ifaces(ip_output))
                 if not ifaces:
                     print("  ❌ Still no Ethernet port with a cable detected.")
@@ -262,7 +271,7 @@ class RecoveryNetwork:
             f"{dns_cmd}; echo RC=$?"
         )
         try:
-            output = d.run_script(net_cmd, marker="recovery_net_setup", exec_timeout=20)
+            output = d.run_script(net_cmd, marker="recovery_net_setup", exec_timeout=NET_APPLY_TIMEOUT)
         except RuntimeError as e:
             print(f"  ❌ Network setup failed on {iface}: {e}")
             return False
@@ -331,10 +340,10 @@ class RecoveryNetwork:
                 chosen = None
         # Set every other eth* port down (not just the live ones) so no
         # ambiguous carrier or route can survive downstream.
-        others = [f"eth{n}" for n in range(5) if f"eth{n}" != chosen]
+        others = [f"eth{n}" for n in range(C.ETH_IFACE_COUNT) if f"eth{n}" != chosen]
         down_cmd = "; ".join(f"ip link set {n} down 2>/dev/null" for n in others)
         try:
-            d.run_script(down_cmd, marker="recovery_eth_down_unused", exec_timeout=10)
+            d.run_script(down_cmd, marker="recovery_eth_down_unused", exec_timeout=ETH_SCRIPT_TIMEOUT)
         except Exception as e:
             print(f"  ⚠ Could not set the other ports down: {e}")
         print(f"  Using {chosen}; the other Ethernet ports were set down.")
@@ -369,7 +378,7 @@ class RecoveryNetwork:
             if not device_ip:
                 print("  ❌ Device IP is required.")
                 return None
-            if not (cidr.isdigit() and 0 <= int(cidr) <= 32):
+            if not (cidr.isdigit() and 0 <= int(cidr) <= MAX_PREFIX_LEN):
                 print(f"  ❌ Invalid CIDR prefix '/{cidr}': expected /0 to /32.")
                 return None
             prefix = cidr

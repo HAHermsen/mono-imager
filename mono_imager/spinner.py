@@ -21,7 +21,6 @@ Design constraints:
     garbled escape codes or boxes into the user's terminal.
 
 Author:  H.A. Hermsen
-Version: v1.2.10
 License: GPLv3
 """
 
@@ -31,6 +30,11 @@ import time
 import threading
 from itertools import cycle
 from typing import Any, Callable, Tuple, Optional
+
+FRAME_INTERVAL = 0.15        # seconds between spinner frames
+JOIN_TIMEOUT = 1             # seconds to wait for the spinner thread on exit
+CLEAR_PADDING = 8            # extra columns wiped when the spinner line is cleared
+SECONDS_PER_MINUTE = 60
 
 
 
@@ -136,9 +140,9 @@ class Spinner:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=1)
+            self._thread.join(timeout=JOIN_TIMEOUT)
         elapsed = self._elapsed_str()
-        sys.stdout.write("\r" + " " * (len(self.message) + len(elapsed) + 8) + "\r")
+        sys.stdout.write("\r" + " " * (len(self.message) + len(elapsed) + CLEAR_PADDING) + "\r")
         sys.stdout.write(_SHOW_CURSOR)
         sys.stdout.flush()
 
@@ -146,7 +150,7 @@ class Spinner:
         if self._started is None:
             return ""
         secs = int(time.monotonic() - self._started)
-        m, s = divmod(secs, 60)
+        m, s = divmod(secs, SECONDS_PER_MINUTE)
         return f"{m}:{s:02d}"
 
     def _spin(self):
@@ -156,7 +160,7 @@ class Spinner:
             elapsed = self._elapsed_str()
             sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}  {elapsed}")
             sys.stdout.flush()
-            time.sleep(0.15)
+            time.sleep(FRAME_INTERVAL)
 
 
 def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tuple[Any, Optional[Exception]]:

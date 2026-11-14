@@ -69,6 +69,7 @@ You never write that sequence by hand. It falls out of the `requires`/`produces`
 | `mono_imager/journeys/__init__.py` | Auto-discovery, `get_journey()`, `discovered_journeys()`, flash targets |
 | `mono_imager/journeys/<os>_<transfer>.py` | Step implementations — one file per OS/transfer pair |
 | `mono_imager/journeys/usb_utils.py` | Shared USB file detection helpers |
+| `mono_imager/constants.py` | Shared hardware facts and cross-module defaults (see "Constants" at the end) |
 | `mono_imager/journeys/_common.py` | Shared steps reused across journeys (e.g. "Device network ready") — leading `_` means it's not auto-discovered; a journey file must explicitly `import` it to trigger its `@register_step` calls |
 
 To add or modify journey steps, edit or create the appropriate `journeys/<os>_<transfer>.py` file. Everything else (`flash_orchestrator.py`, `tui.py`, etc.) is infrastructure you don't touch when adding journeys.
@@ -287,3 +288,42 @@ When adding journeys, you never need to edit:
 - `step_registry.py` — only touch this to add fields to `StepContext`
 
 All journey logic lives in the per-OS/transfer files under `journeys/`.
+
+---
+
+## eMMC snapshot / restore (#29) — not a step-registry journey
+
+`Snapshot eMMC` and `Restore eMMC` (main menu 9 and 10) are not OS journeys,
+so they are not registered here and do not appear in the "Flash OS" list.
+They live in `mono_imager/snapshot_orchestrator.py` (flows),
+`mono_imager/snapshot.py` (format, planning, recovery-Linux scripts) and
+`mono_imager/snapshot_server.py` (streaming LAN upload/serve), and reuse
+the same building blocks: `phase1_uboot()`, `SerialDevice.boot_recovery()`
+/ `run_script()` / `launch_script()`, the `/report` channel,
+`RecoveryNetwork` and `run_firmware_update()` (clone mode only).
+
+Reaching recovery: NOR recovery Linux is loaded into RAM from whichever
+U-Boot is running (`sf read` DTB @ 0x500000 + gzip kernel @ 0xa00000,
+`booti`, `boot_medium=qspi`, no `saveenv`). U-Boot can swallow the first
+character right after the autoboot interrupt, so every command goes
+through `_uboot_cmd()` (empty line to re-sync, one retry). The DIP switch
+is only asked for when that still fails.
+
+Before a snapshot: `health_check()` (GPT at both disk ends, read-only
+`e2fsck -n` / `fsck.vfat -n`) and `read_nor_env()` (NOR `uboot-env`,
+read-only). Everything a snapshot records besides the eMMC bytes is in
+the `Capture` dataclass. NOR is written only by
+`offer_nor_env_restore()`: same board, explicit opt-in, env region only.
+`collect_inventory()` (inventory.py) records the platform; `firmware_gate()`
+compares U-Boot versions before a restore; `S.mac_match()` compares every
+port's MAC (clone mode + `clone_warning()`, the OS config is never edited);
+`offer_dual_boot()` copies the OS's boot variables into the other env
+(uboot_env.py) so it boots whatever the DIP position.
+
+## Constants
+
+Hardware facts and values shared by several modules (serial settings,
+device paths, eMMC/NOR layout, U-Boot RAM addresses, image magic, common
+timeouts) live in `mono_imager/constants.py` (imported as `C`). Values
+tuned for one module are named constants at the top of that module. Add
+new numbers the same way rather than as literals in the code.

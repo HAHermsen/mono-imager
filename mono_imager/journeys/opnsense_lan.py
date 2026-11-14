@@ -20,6 +20,9 @@ from mono_imager.step_registry import register_step, register_uboot_steps, StepC
 from mono_imager.spinner import with_spinner, Spinner
 from mono_imager.flash_orchestrator import step, verbose, console_logger, wait_for_report
 from mono_imager.journeys import _common  # also provides shared _step_http_server_start / _step_firmware_reachable
+from mono_imager import constants as C
+
+EMMC_ERASE_TIMEOUT = 120             # `mmc erase` of the whole eMMC takes ~60 s
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +39,14 @@ def _uboot_steps_opnsense_lan(device) -> bool:
     """
     verbose("Setting U-Boot env for OPNsense...")
     try:
-        device.send_command("setenv bootcmd_bak ${bootcmd}", timeout=10)
-        device.send_command('setenv bootcmd "run opnsense || run recovery"', timeout=10)
+        device.send_command("setenv bootcmd_bak ${bootcmd}", timeout=C.UBOOT_CMD_TIMEOUT)
+        device.send_command('setenv bootcmd "run opnsense || run recovery"', timeout=C.UBOOT_CMD_TIMEOUT)
         device.send_command(
             'setenv opnsense "mmc dev 0; load mmc 0:1 0x82000000 kernel.img; '
             'load mmc 0:1 0x88000000 dtb/mono-gateway-dk.dtb; booti 0x82000000 - 0x88000000"',
-            timeout=10
+            timeout=C.UBOOT_CMD_TIMEOUT
         )
-        device.send_command("saveenv", timeout=15)
+        device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
         step(0, "U-Boot env set for OPNsense", True)
     except Exception as e:
         verbose(f"✗ U-Boot env set failed: {e}", "error")
@@ -52,15 +55,15 @@ def _uboot_steps_opnsense_lan(device) -> bool:
     print("  Erasing eMMC (OPNsense requirement)...")
     try:
         response, _erase_err = with_spinner(
-            device.send_command, "mmc erase 0 3b48000", timeout=120,
+            device.send_command, f"mmc erase 0 {C.EMMC_ERASE_SECTORS_HEX}", timeout=EMMC_ERASE_TIMEOUT,
             message="Erasing eMMC (this takes ~60s)..."
         )
         if _erase_err:
             raise _erase_err
         if "error" in response.lower():
-            verbose(f"✗ eMMC erase failed: {response[-100:]}", "error")
+            verbose(f"✗ eMMC erase failed: {response[-C.LOG_TAIL_SHORT:]}", "error")
             return False
-        step(0, "eMMC erase (mmc erase 0 3b48000)", True)
+        step(0, f"eMMC erase (mmc erase 0 {C.EMMC_ERASE_SECTORS_HEX})", True)
     except Exception as e:
         verbose(f"✗ eMMC erase exception: {e}", "error")
         return False
@@ -113,23 +116,23 @@ def step_flash_opnsense(ctx: StepContext) -> bool:
         d.launch_script(flash_script, marker="step07_flash")
     except Exception as e:
         return step(0, "OPNsense flash launched", False, str(e))
-    raw, err = with_spinner(wait_for_report, "07", timeout=1200.0, message="Flashing OPNsense (bzip2 | dd)")
+    raw, err = with_spinner(wait_for_report, "07", timeout=C.FLASH_TIMEOUT_SLOW, message="Flashing OPNsense (bzip2 | dd)")
     if err or raw is None:
         return step(0, "OPNsense flash (bzip2 | dd)", False, str(err) if err else "no report-back from device in 1200s")
     has_records = "records in" in raw and "records out" in raw
     has_error   = "error" in raw.lower() or "failed" in raw.lower()
     step(0, "OPNsense flash executed", True)
-    step(0, "dd records in/out confirmed", has_records, raw[-200:] if not has_records else "")
-    step(0, "No errors", not has_error, raw[-200:] if has_error else "")
+    step(0, "dd records in/out confirmed", has_records, raw[-C.LOG_TAIL:] if not has_records else "")
+    step(0, "No errors", not has_error, raw[-C.LOG_TAIL:] if has_error else "")
     return has_records and not has_error
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["device_mac_known"], label="Detect device MAC address")
 def step_detect_mac(ctx: StepContext) -> bool:
     d = ctx.device
-    iface = (ctx.device_net or {}).get("iface", "eth0")
+    iface = (ctx.device_net or {}).get("iface", C.DEFAULT_ETH_IFACE)
     try:
-        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=5)
+        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=C.SHELL_QUICK_TIMEOUT)
         mac = result.strip()
         if mac and mac != "unknown" and ":" in mac:
             ctx.device_mac = mac
@@ -163,7 +166,7 @@ def step_reboot(ctx: StepContext) -> bool:
     console_logger.info("  DIP stays RIGHT (NOR). No action needed.")
     console_logger.info("")
     try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=5)
+        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=C.REBOOT_CMD_TIMEOUT)
     except Exception as e:
         verbose(f"⚠ Reboot warning: {e}", "warning")
     return step(0, "Reboot sent — OPNsense booting from eMMC", True)

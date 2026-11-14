@@ -32,7 +32,6 @@ since mixing two different orchestrators' results in one shared list
 is exactly the stale-state bug class fixed earlier this session.
 
 Author:  H.A. Hermsen
-Version: v1.2.9
 License: GPLv3
 """
 
@@ -46,6 +45,26 @@ from typing import Optional, Callable
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner
 from mono_imager.step_tracker import StepTracker
+from mono_imager import constants as C
+
+# --- Tuning (seconds unless noted) ----------------------------------------------
+CMDLINE_TIMEOUT = 5                  # cat /proc/cmdline
+INTERNET_CHECK_TIMEOUT = 15
+DHCP_TIMEOUT = 12
+STREAM_IDLE_TIMEOUT = 30.0           # firmware tool: silence that means "done"
+STREAM_MAX_TOTAL = 900.0             # firmware tool: hard ceiling
+STREAM_POLL_INTERVAL = 0.01          # 10 ms polling loop
+STREAM_MARKER_GRACE = 0.3            # after a done marker the result is known
+STREAM_READ_BYTES = 256
+CLOCK_SYNC_TIMEOUT = 15.0
+FW_HELP_TIMEOUT = 10
+FW_RC_TIMEOUT = 10
+MANUAL_DOWNLOAD_TIMEOUT = 300
+BOOT_SOURCE_TIMEOUT = 5
+ENV_STASH_TIMEOUT = 60
+VERIFY_BOOT_TIMEOUT = 60
+VERIFY_BOOT_MODERN_TIMEOUT = 90
+LEGACY_FLASH_TIMEOUT = 300
 
 logger = logging.getLogger(__name__)
 # Must match logging_setup.py's "mono_imager.console" exactly — that's the
@@ -110,7 +129,7 @@ def detect_modern_firmware_tool(d: SerialDevice) -> Optional[bool]:
     # without it the command prints "ERROR: Cannot detect boot medium"
     # and exits immediately (confirmed on real hardware with old U-Boot).
     try:
-        cmdline = d.run_script("cat /proc/cmdline", marker="check_cmdline", exec_timeout=5)
+        cmdline = d.run_script("cat /proc/cmdline", marker="check_cmdline", exec_timeout=CMDLINE_TIMEOUT)
     except RuntimeError:
         cmdline = ""
 
@@ -133,7 +152,7 @@ def detect_modern_firmware_tool(d: SerialDevice) -> Optional[bool]:
     return True
 
 
-def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
+def get_device_mac(d: SerialDevice, interface: str = C.DEFAULT_ETH_IFACE) -> Optional[str]:
     """
     Get the device's real MAC address from `ip a`, parsed — never
     assumed or asked of the user (avoids transcription errors). Tries
@@ -154,7 +173,7 @@ def get_device_mac(d: SerialDevice, interface: str = "eth0") -> Optional[str]:
 
 def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
                               host: str = "firmware.mono.si",
-                              ping_ip: str = "8.8.8.8", timeout: int = 15) -> bool:
+                              ping_ip: str = C.INTERNET_PROBE_IP, timeout: int = INTERNET_CHECK_TIMEOUT) -> bool:
     """
     Validate real WAN connectivity in two INDEPENDENT checks, so a failure
     points at the layer that is actually broken (issue #16):
@@ -215,7 +234,7 @@ def check_internet_reachable(d: SerialDevice, gateway: Optional[str] = None,
     return True
 
 
-def try_dhcp(d: SerialDevice, iface: str = "eth0", timeout: int = 12) -> Optional[dict]:
+def try_dhcp(d: SerialDevice, iface: str = C.DEFAULT_ETH_IFACE, timeout: int = DHCP_TIMEOUT) -> Optional[dict]:
     """
     Bring up `iface` and request a lease via udhcpc, then read back
     whatever the lease actually produced (IP/prefix, default gateway,
@@ -272,8 +291,8 @@ def try_dhcp(d: SerialDevice, iface: str = "eth0", timeout: int = 12) -> Optiona
 
 # --- Modern path: `firmware update` -------------------------------------
 
-def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
-                     max_total: float = 900.0, auto_confirm_response: str = None,
+def _stream_command(d: SerialDevice, command: str, idle_timeout: float = STREAM_IDLE_TIMEOUT,
+                     max_total: float = STREAM_MAX_TOTAL, auto_confirm_response: str = None,
                      on_output: Optional[Callable[[str], None]] = None,
                      done_markers: Optional[list] = None) -> str:
     """
@@ -308,9 +327,9 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
     buffer = b""
     last_byte_time = time.time()
     overall_start = time.time()
-    poll_interval = 0.01  # 10ms polling loop
+    poll_interval = STREAM_POLL_INTERVAL
     marker_seen_at = None  # set once a done_marker appears in the output
-    marker_grace = 0.3     # after a done marker the result is known - stop almost immediately
+    marker_grace = STREAM_MARKER_GRACE
 
     while True:
         now = time.time()
@@ -330,7 +349,7 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
 
         # Non-blocking: check if data is available without waiting
         if d.ser.in_waiting > 0:
-            chunk = d.ser.read(256)
+            chunk = d.ser.read(STREAM_READ_BYTES)
             if chunk:
                 text = chunk.decode("utf-8", errors="replace")
                 if on_output:
@@ -348,7 +367,7 @@ def _stream_command(d: SerialDevice, command: str, idle_timeout: float = 30.0,
     return buffer.decode("utf-8", errors="replace")
 
 
-def sync_device_clock(d: SerialDevice, timeout: float = 15.0) -> bool:
+def sync_device_clock(d: SerialDevice, timeout: float = CLOCK_SYNC_TIMEOUT) -> bool:
     """
     Best-effort NTP time sync in the recovery shell, via busybox
     ntpd's one-shot query mode (-q: set the clock and exit, -n: stay
@@ -415,8 +434,8 @@ FIRMWARE_BASE_URL = "https://firmware.mono.si"
 FIRMWARE_MACHINE  = "gateway-dk"
 MANUAL_FW_DIR     = "/tmp/mono_imager_fw"
 
-UBOOT_ENV_SIZE        = 0x2000
-UBOOT_ENV_EMMC_OFFSET = 0x300000
+UBOOT_ENV_SIZE        = C.UBOOT_ENV_SIZE
+UBOOT_ENV_EMMC_OFFSET = C.UBOOT_ENV_EMMC_OFFSET
 UBOOT_ENV_STASH       = "/tmp/mono_imager_uboot_env.bin"
 
 # curl/openssl wording for a TLS failure caused by a wrong device clock
@@ -459,7 +478,7 @@ def firmware_tool_caps(d: SerialDevice) -> dict:
     """
     caps = {"preserve_env": True, "from": True}
     try:
-        out = d.run_script("firmware help 2>&1", marker="fw_tool_caps", exec_timeout=10)
+        out = d.run_script("firmware help 2>&1", marker="fw_tool_caps", exec_timeout=FW_HELP_TIMEOUT)
     except RuntimeError as e:
         logger.warning(f"firmware_tool_caps: run_script failed: {e}")
         return caps
@@ -501,7 +520,7 @@ def _run_firmware_cmd(d: SerialDevice, fw_cmd: str, on_output, idle_timeout: flo
         rc_output = "RC=0 (inferred from 'Firmware update complete')"
     else:
         try:
-            rc_output = d.run_script("echo RC=$?", marker="firmware_update_rc", exec_timeout=10)
+            rc_output = d.run_script("echo RC=$?", marker="firmware_update_rc", exec_timeout=FW_RC_TIMEOUT)
         except RuntimeError as e:
             logger.warning(f"run_firmware_update: could not verify exit code: {e}")
             rc_output = ""
@@ -544,7 +563,7 @@ def _manual_download(d: SerialDevice, target: str) -> bool:
         "echo DL_RC=$?"
     )
     try:
-        out = d.run_script(script, marker="manual_fw_download", exec_timeout=300)
+        out = d.run_script(script, marker="manual_fw_download", exec_timeout=MANUAL_DOWNLOAD_TIMEOUT)
     except RuntimeError as e:
         logger.error(f"_manual_download: run_script failed: {e}")
         return False
@@ -555,7 +574,7 @@ def _manual_download(d: SerialDevice, target: str) -> bool:
 
 
 def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
-                         idle_timeout: float = 30.0, max_total: float = 900.0,
+                         idle_timeout: float = STREAM_IDLE_TIMEOUT, max_total: float = STREAM_MAX_TOTAL,
                          preserve_env: Optional[bool] = None) -> bool:
     """
     Flash the OTHER medium than the one booted (the tool auto-detects
@@ -598,7 +617,7 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     try:
         boot_output = d.run_script(
             "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
-            marker="detect_boot_source", exec_timeout=5
+            marker="detect_boot_source", exec_timeout=BOOT_SOURCE_TIMEOUT
         )
     except RuntimeError as e:
         logger.warning(f"run_firmware_update: could not detect boot source: {e}")
@@ -699,7 +718,7 @@ def stash_uboot_env(d: SerialDevice, target: str) -> Optional[str]:
             'then echo "STASH_OK:/dev/mmcblk0"; else echo STASH_FAIL; fi\n'
         )
     try:
-        out = d.run_script(script, marker="stash_uboot_env", exec_timeout=60)
+        out = d.run_script(script, marker="stash_uboot_env", exec_timeout=ENV_STASH_TIMEOUT)
     except RuntimeError as e:
         logger.error(f"stash_uboot_env: run_script failed: {e}")
         return None
@@ -722,7 +741,7 @@ def restore_uboot_env_region(d: SerialDevice, target: str, env_dev: str) -> bool
             "&& sync && echo RESTORE_OK || echo RESTORE_FAIL"
         )
     try:
-        out = d.run_script(cmd, marker="restore_uboot_env", exec_timeout=60)
+        out = d.run_script(cmd, marker="restore_uboot_env", exec_timeout=ENV_STASH_TIMEOUT)
     except RuntimeError as e:
         logger.error(f"restore_uboot_env_region: run_script failed: {e}")
         return False
@@ -732,7 +751,7 @@ def restore_uboot_env_region(d: SerialDevice, target: str, env_dev: str) -> bool
     return ok
 
 
-def verify_boot_source(d: SerialDevice, expected: str, timeout: float = 60) -> bool:
+def verify_boot_source(d: SerialDevice, expected: str, timeout: float = VERIFY_BOOT_TIMEOUT) -> bool:
     """
     Initiate a reboot, then confirm the device booted from the expected
     medium by watching for U-Boot's own confirmation line, exactly as
@@ -842,7 +861,7 @@ def legacy_flash_emmc(d: SerialDevice, mac: str) -> bool:
         f"echo RC=$?"
     )
     try:
-        output = d.run_script(cmd, marker="legacy_emmc", exec_timeout=300)
+        output = d.run_script(cmd, marker="legacy_emmc", exec_timeout=LEGACY_FLASH_TIMEOUT)
     except RuntimeError as e:
         logger.error(f"legacy_flash_emmc: run_script failed: {e}")
         return False
@@ -869,7 +888,7 @@ def legacy_flash_nor(d: SerialDevice, mac: str) -> bool:
         f"echo RC=$?"
     )
     try:
-        output = d.run_script(cmd, marker="legacy_nor", exec_timeout=300)
+        output = d.run_script(cmd, marker="legacy_nor", exec_timeout=LEGACY_FLASH_TIMEOUT)
     except RuntimeError as e:
         logger.error(f"legacy_flash_nor: run_script failed: {e}")
         return False
@@ -904,7 +923,7 @@ def phase_modern_flash_emmc(d: SerialDevice, on_output: Optional[Callable[[str],
     return ok
 
 
-def phase_modern_verify_emmc_boot(d: SerialDevice, timeout: float = 90) -> bool:
+def phase_modern_verify_emmc_boot(d: SerialDevice, timeout: float = VERIFY_BOOT_MODERN_TIMEOUT) -> bool:
     """
     Modern path, step 2: after the user flips the DIP switch to eMMC
     and reboots, confirm the device actually booted from eMMC by
@@ -930,7 +949,7 @@ def phase_modern_flash_nor(d: SerialDevice, on_output: Optional[Callable[[str], 
     return ok
 
 
-def phase_modern_verify_nor_boot(d: SerialDevice, timeout: float = 90) -> bool:
+def phase_modern_verify_nor_boot(d: SerialDevice, timeout: float = VERIFY_BOOT_MODERN_TIMEOUT) -> bool:
     """
     Modern path, step 4: after the user flips the DIP switch back to
     NOR and reboots, confirm the device actually booted from NOR.
@@ -1144,7 +1163,7 @@ def _run_medium_update(
         # NOTE: no auto soft-reboot here. phase1_uboot()'s own
         # "POWER CYCLE NOW" prompt drives the reboot, so we don't send a
         # silent reset that would contradict that on-screen instruction.
-        d = core.phase1_bootstrap(port, 115200, boot_medium=cfg["boot_medium"])
+        d = core.phase1_bootstrap(port, C.SERIAL_BAUD, boot_medium=cfg["boot_medium"])
         if d is None:
             console_logger.info("")
             console_logger.info("  ❌ Could not bootstrap into the recovery shell.")
@@ -1255,9 +1274,9 @@ def print_report() -> bool:
     the standard logger/console_logger rather than referencing a
     log_file path.
     """
-    logger.info("=" * 60)
+    logger.info("=" * C.DIVIDER_WIDTH)
     logger.info("Recovery Report")
-    logger.info("=" * 60)
+    logger.info("=" * C.DIVIDER_WIDTH)
     passed = sum(1 for _, _, p, _ in results if p)
     total = len(results)
     for num, desc, p, reason in results:
@@ -1266,7 +1285,7 @@ def print_report() -> bool:
         if reason:
             line += f"\n           {reason}"
         logger.info(line)
-    logger.info("-" * 60)
+    logger.info("-" * C.DIVIDER_WIDTH)
     verdict = "OK" if total > 0 and passed == total else "NOK"
     logger.info(f"Result: {verdict} ({passed}/{total} steps passed)")
 

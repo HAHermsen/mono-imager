@@ -18,6 +18,12 @@ from mono_imager.spinner import with_spinner
 from mono_imager.step_registry import StepContext
 from mono_imager.journeys import _vyos as V
 from mono_imager.journeys import _common
+from mono_imager import constants as C
+
+STICK_PROBE_TIMEOUT = 20
+ISO_WRITE_TIMEOUT = 1800.0           # send + write + read back the ISO
+UBOOT_LINE_PREVIEW = 60              # characters of a U-Boot line shown on failure
+TRANSCRIPT_TAIL = 1500               # installer transcript kept in the debug log
 
 
 def _ask(prompt: str) -> str:
@@ -44,7 +50,7 @@ def step_check_iso(ctx: StepContext) -> bool:
         return step(0, "ISO file readable", False, str(e))
     if size > V.STAGING_CAP:
         return step(0, "ISO fits in recovery Linux's RAM", False,
-                    f"{size / 1024**3:.2f} GB is above the {V.STAGING_CAP / 1024**3:.2f} GB staging limit")
+                    f"{size / C.GIB:.2f} GB is above the {V.STAGING_CAP / C.GIB:.2f} GB staging limit")
     if size % V.SECTOR:
         return step(0, "ISO size is whole 512-byte sectors", False, f"{size} bytes")
     sha, err = with_spinner(V.sha256_file, path, message="Fingerprinting the ISO (SHA-256)...")
@@ -52,8 +58,8 @@ def step_check_iso(ctx: StepContext) -> bool:
         return step(0, "ISO file readable", False, str(err))
     ctx.set("iso_bytes", size)
     ctx.set("iso_sha256", sha)
-    verbose(f"  ISO: {path.name}, {size / 1024**2:.0f} MiB, SHA-256 {sha}")
-    return step(0, f"ISO ready to send ({size / 1024**2:.0f} MiB)", True)
+    verbose(f"  ISO: {path.name}, {size / C.MIB:.0f} MiB, SHA-256 {sha}")
+    return step(0, f"ISO ready to send ({size / C.MIB:.0f} MiB)", True)
 
 
 def step_confirm_experimental(ctx: StepContext) -> bool:
@@ -99,7 +105,7 @@ def step_prepare_emmc_boot(ctx: StepContext) -> bool:
 def step_detect_stick(ctx: StepContext) -> bool:
     d = ctx.device
     out, err = with_spinner(d.run_script, V.build_stick_probe_script(V.STICK_DEV),
-                            marker="vyos_stick", exec_timeout=20,
+                            marker="vyos_stick", exec_timeout=STICK_PROBE_TIMEOUT,
                             message="Looking for the USB stick in the Mono...")
     if err:
         return step(0, "USB stick detected in the Mono", False, str(err))
@@ -114,25 +120,25 @@ def step_detect_stick(ctx: StepContext) -> bool:
         size = 0
     if size and size < ctx.get("iso_bytes", 0):
         return step(0, "USB stick large enough", False,
-                    f"{size / 1024**3:.1f} GB stick, ISO needs {ctx.get('iso_bytes') / 1024**3:.1f} GB")
+                    f"{size / C.GIB:.1f} GB stick, ISO needs {ctx.get('iso_bytes') / C.GIB:.1f} GB")
     if kv.get("MOUNTED") == "YES":
         return step(0, "USB stick not in use", False, f"{V.STICK_DEV} is mounted in recovery Linux")
     model = kv.get("MODEL", "").strip() or "unknown model"
     print()
-    print(f"  USB stick in the Mono: {V.STICK_DEV}, {size / 1024**3:.1f} GB, {model}")
+    print(f"  USB stick in the Mono: {V.STICK_DEV}, {size / C.GIB:.1f} GB, {model}")
     print("  EVERYTHING on this stick will be ERASED.")
     ok = _ask("  Erase it and write the VyOS ISO? [y/N]: ") == "y"
-    return step(0, f"USB stick {V.STICK_DEV} ({size / 1024**3:.1f} GB) — erase confirmed", ok,
+    return step(0, f"USB stick {V.STICK_DEV} ({size / C.GIB:.1f} GB) — erase confirmed", ok,
                 "declined by user" if not ok else "")
 
 
 def step_http_server(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Start HTTP server"); verbose("=" * C.DIVIDER_WIDTH)
     return _common._step_http_server_start(ctx)
 
 
 def step_reachable(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Verify ISO reachable"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Verify ISO reachable"); verbose("=" * C.DIVIDER_WIDTH)
     return _common._step_firmware_reachable(ctx)
 
 
@@ -149,8 +155,8 @@ def _write(ctx: StepContext, dev: str, *, seek_lba=0, partition_table=b"", expec
         ctx.device.launch_script(script, marker="vyos_write")
     except Exception as e:
         return step(0, f"{label} launched", False, str(e))
-    console_logger.info(f"{label} — sending, writing and reading back ~{size / 1024**2:.0f} MiB...")
-    raw, err = with_spinner(wait_for_report, "vyos_write", timeout=1800.0, message=label)
+    console_logger.info(f"{label} — sending, writing and reading back ~{size / C.MIB:.0f} MiB...")
+    raw, err = with_spinner(wait_for_report, "vyos_write", timeout=ISO_WRITE_TIMEOUT, message=label)
     if err or raw is None:
         return step(0, label, False, str(err) if err else "no report from the device within 30 min")
     verbose(f"  write report:\n{raw.strip()}", "debug")
@@ -184,8 +190,8 @@ def _boot_live(ctx: StepContext, setup_lines, boot_line: str, label: str) -> boo
     for line in setup_lines:
         ok, out = V.uboot_run(con, line)
         if not ok:
-            return step(0, f"U-Boot: {line[:60]}", False, out)
-    con.drain(idle=0.3, max_wait=2.0)
+            return step(0, f"U-Boot: {line[:UBOOT_LINE_PREVIEW]}", False, out)
+    con.drain(idle=V.DRAIN_IDLE, max_wait=V.DRAIN_SHORT_MAX)
     con.write(boot_line + "\r\n")
     console_logger.info("Booting VyOS live — takes a few minutes (the build reboots itself once)...")
     res, err = with_spinner(V.wait_live_login, con, message="Waiting for the VyOS login")
@@ -257,9 +263,9 @@ def step_install_image(ctx: StepContext) -> bool:
     res, err = with_spinner(V.run_install_image, con, ctx.get("vyos_password"),
                             message="Installing VyOS to the eMMC")
     ok, transcript = (False, str(err)) if err else res
-    verbose(f"  install image transcript (tail):\n{transcript[-1500:]}", "debug")
+    verbose(f"  install image transcript (tail):\n{transcript[-TRANSCRIPT_TAIL:]}", "debug")
     return step(0, "VyOS installed to the eMMC (install image)", ok,
-                transcript[-300:] if not ok else "")
+                transcript[-C.LOG_TAIL_LONG:] if not ok else "")
 
 
 def step_check_boot_env(ctx: StepContext) -> bool:

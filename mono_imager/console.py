@@ -17,6 +17,8 @@ import sys
 import logging
 from typing import Optional
 
+from mono_imager import constants as C
+
 logger = logging.getLogger(__name__)
 
 # Sentinel returned by read_line() when the user types the escape word.
@@ -195,17 +197,17 @@ def show_device_stats(identity: dict, self_test: list) -> None:
 
     if identity:
         print()
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         print("  BOARD IDENTITY")
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         for label, value in identity.items():
             print(f"    {label:<22} {value}")
 
     if self_test:
         print()
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         print("  SELF-TEST")
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         failures = 0
         for label, value, passed in self_test:
             detail = f"  {value}" if value else ""

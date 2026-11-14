@@ -4,7 +4,6 @@ mono-imager: Automated firmware flashing for Mono Gateway Routers and Dev Kit
 Supports serial and networked connections with menu-driven TUI.
 
 Author:  H.A. Hermsen
-Version: v1.2.10
 License: GPLv3
 """
 
@@ -21,6 +20,17 @@ from mono_imager.spinner import with_spinner
 from mono_imager import console
 from mono_imager.device_net import RecoveryNetwork
 from mono_imager.uboot_parse import parse_uboot_identity, parse_uboot_self_test
+from mono_imager import constants as C
+
+# --- Tuning (seconds) ---------------------------------------------------------
+SOFT_REBOOT_READ_TIMEOUT = 2         # best-effort `reboot` over serial
+SOFT_REBOOT_SETTLE = 0.5
+CONSOLE_READ_TIMEOUT = 0.1           # raw serial console: short reads keep it responsive
+CONSOLE_DRAIN_SETTLE = 0.2
+CONSOLE_PROMPT_SETTLE = 0.1
+STATS_READ_TIMEOUT = 10
+STATS_CAPTURE_TIMEOUT = 60
+CONSOLE_EXIT_KEY = "\x1d"            # Ctrl+]
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,8 @@ class MenuState(Enum):
     DONE                  = "done"
     CLI_CONSOLE           = "cli_console"
     DEVICE_STATS          = "device_stats"
+    SNAPSHOT              = "snapshot"
+    RESTORE               = "restore"
 
 
 class MonoImager:
@@ -69,7 +81,7 @@ class MonoImager:
         self.transfer_method = None
         self.net_host_ip     = None
         self.net_device_ip   = None
-        self.net_http_port   = 8080
+        self.net_http_port   = C.HTTP_PORT
         self.net_flash_target = None
         self.os_name         = None
         # Device's own recovery-shell network (DHCP or manual). The
@@ -124,7 +136,7 @@ class MonoImager:
         (deliberately, for debugging visibility) and are unaffected.
         """
         print()
-        print("-" * 60)
+        print("-" * C.DIVIDER_WIDTH)
         console.print_status_line(__version__, self.device_net)
 
     # Minimum plausible firmware size. This is a sanity check against
@@ -133,7 +145,7 @@ class MonoImager:
     # never inspects what's inside the file (dumb-pipe by design); this
     # only catches "that can't possibly be a real image" before
     # spending several minutes of a flash attempt on it.
-    MIN_FIRMWARE_SIZE_BYTES = 1 * 1024 * 1024  # 1 MB
+    MIN_FIRMWARE_SIZE_BYTES = 1 * C.MIB
 
     def _validate_firmware_path(self, raw_input: str):
         """
@@ -171,7 +183,7 @@ class MonoImager:
             return None, f"File is empty (0 bytes): {path}"
 
         if size < self.MIN_FIRMWARE_SIZE_BYTES:
-            size_kb = size / 1024
+            size_kb = size / C.KIB
             return None, (
                 f"File is only {size_kb:.0f} KB — too small to be a real "
                 f"firmware image. Check the path is correct."
@@ -215,10 +227,10 @@ class MonoImager:
         from mono_imager.serial_device import SerialDevice
         import time
         try:
-            _d = SerialDevice(port, timeout=2)
-            if _d.connect(115200):
+            _d = SerialDevice(port, timeout=SOFT_REBOOT_READ_TIMEOUT)
+            if _d.connect(C.SERIAL_BAUD):
                 _d.ser.write(b"\r\nreset\r\nreboot\r\n")
-                time.sleep(0.5)
+                time.sleep(SOFT_REBOOT_SETTLE)
                 _d.disconnect()
         except Exception:
             pass
@@ -382,10 +394,12 @@ class MonoImager:
         print("  6) Test LAN connection")
         print("  7) Test USB stick")
         print("  8) Show Device Stats")
-        print("  9) Exit")
+        print("  9) Snapshot eMMC")
+        print("  10) Restore eMMC")
+        print("  11) Exit")
         print()
 
-        choice = input("Select [1-9]: ").strip()
+        choice = input("Select [1-11]: ").strip()
 
         if choice == "1":
             self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
@@ -404,6 +418,10 @@ class MonoImager:
         elif choice == "8":
             self.current_state = MenuState.DEVICE_STATS
         elif choice == "9":
+            self.current_state = MenuState.SNAPSHOT
+        elif choice == "10":
+            self.current_state = MenuState.RESTORE
+        elif choice == "11":
             sys.exit(0)
         else:
             print("  Invalid selection.")
@@ -488,7 +506,7 @@ class MonoImager:
 
         # Flash target is owned by the journeys package.
         from mono_imager.journeys import _FLASH_TARGETS
-        flash_target = _FLASH_TARGETS.get(os_name, "/dev/mmcblk0")
+        flash_target = _FLASH_TARGETS.get(os_name, C.EMMC_DEV)
 
         self.os_name = os_name
 
@@ -592,7 +610,7 @@ class MonoImager:
 
         self.serial_port      = port
         self.net_host_ip      = host_ip
-        self.net_http_port    = 8080
+        self.net_http_port    = C.HTTP_PORT
         self.custom_fw_path   = firmware_path
         self.net_flash_target = flash_target
         self.current_state    = MenuState.NETWORK_FLASHING
@@ -704,9 +722,9 @@ class MonoImager:
         success = rec.print_report()
         if success:
             print()
-            print("=" * 60)
+            print("=" * C.DIVIDER_WIDTH)
             print("  ⚡ FLIP DIP SWITCH TO LEFT (eMMC), THEN POWER-CYCLE ⚡")
-            print("=" * 60)
+            print("=" * C.DIVIDER_WIDTH)
             print()
         self._recovery_finish(success)
 
@@ -777,7 +795,7 @@ class MonoImager:
 
         self.print_screen_divider()
         print("  Test Serial Connection")
-        print("  " + "─" * 56)
+        print("  " + "─" * C.BOX_RULE_WIDTH)
         print()
 
         # Resolve port
@@ -836,6 +854,95 @@ class MonoImager:
 
 
     # ------------------------------------------------------------------ #
+    #  SNAPSHOT / RESTORE eMMC — options 9 and 10 (#29). Menu chrome     #
+    #  only; the journeys live in snapshot_orchestrator.py.              #
+    # ------------------------------------------------------------------ #
+    def _snapshot_common(self, title: str):
+        """Port + transfer (+ host IP and snapshot folder for LAN).
+        -> (port, transfer, host_ip, store) or None (back)."""
+        from mono_imager import flash_orchestrator as core
+        from mono_imager import snapshot as S
+        from mono_imager.config import load_config, save_config
+
+        self.print_screen_divider()
+        print(f"  {title}")
+        print()
+        port = self.serial_port
+        if port:
+            print(f"  Serial port: {port} (chosen at launch)")
+        else:
+            port = self._select_port(auto_select_single=True, allow_back=True, save_on_select=True)
+            if port is None:
+                return None
+        print()
+        print("  1) LAN — snapshots on this PC")
+        print("  2) USB — snapshots on a USB stick in the Mono")
+        print("  3) Back")
+        c = input("Select [1-3]: ").strip()
+        if c not in ("1", "2"):
+            return None
+        transfer = "lan" if c == "1" else "usb"
+        host_ip, store = "", S.default_store()
+        if transfer == "lan":
+            host_ip = core.detect_host_ip()
+            if not host_ip:
+                print("  ❌ Could not auto-detect host IP.")
+                input("  Press Enter to continue...")
+                return None
+            cfg = load_config()
+            store = Path(cfg.get("snapshot_dir") or S.default_store())
+            raw = input(f"  Snapshot folder on this PC [{store}]: ").strip().strip('"')
+            if raw:
+                store = Path(raw).expanduser()
+            cfg["snapshot_dir"] = str(store)
+            save_config(cfg)
+        self.serial_port = port
+        return port, transfer, host_ip, store
+
+    def menu_snapshot(self):
+        from mono_imager import snapshot_orchestrator as so
+        picked = self._snapshot_common("Snapshot eMMC — the whole eMMC, bit for bit")
+        if picked is None:
+            self.current_state = MenuState.MAIN
+            return
+        port, transfer, host_ip, store = picked
+        ok = so.run_snapshot(port=port, transfer=transfer, host_ip=host_ip,
+                             http_port=self.net_http_port,
+                             setup_network=self._setup_recovery_network, store=store,
+                             soft_reboot=self._soft_reboot_if_possible)
+        self._recovery_finish(ok)
+
+    def menu_restore(self):
+        from mono_imager import snapshot as S
+        from mono_imager import snapshot_orchestrator as so
+        picked = self._snapshot_common("Restore eMMC — overwrite the whole eMMC with a snapshot")
+        if picked is None:
+            self.current_state = MenuState.MAIN
+            return
+        port, transfer, host_ip, store = picked
+        folder = manifest = None
+        if transfer == "lan":
+            snaps = S.list_snapshots(store)
+            if not snaps:
+                print(f"  No snapshots in {store}.")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.MAIN
+                return
+            idx = so.pick_snapshot(snaps)
+            if idx is None:
+                self.current_state = MenuState.MAIN
+                return
+            folder, manifest = store / snaps[idx][0], snaps[idx][1]
+        auto = input("  Auto-snapshot the current eMMC first, so this can be undone? [Y/n]: ") \
+            .strip().lower() != "n"
+        ok = so.run_restore(port=port, transfer=transfer, host_ip=host_ip,
+                            http_port=self.net_http_port,
+                            setup_network=self._setup_recovery_network, store=store,
+                            folder=folder, manifest=manifest, auto_snapshot=auto,
+                            soft_reboot=self._soft_reboot_if_possible)
+        self._recovery_finish(ok)
+
+    # ------------------------------------------------------------------ #
     #  TEST USB MOUNT — option 7 from main menu                          #
     # ------------------------------------------------------------------ #
     def menu_test_usb_mount(self):
@@ -872,7 +979,7 @@ class MonoImager:
         # DON'T clear screen — keep all debug output visible
         
         print()
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         if self.flash_success:
             # Journey-specific (#25): OPNsense stays on NOR — telling every
             # OS to flip to eMMC sent OPNsense users into recovery Linux.
@@ -897,7 +1004,7 @@ class MonoImager:
             print("  Check the log output above for details.")
             print("  You can retry from the main menu.")
 
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         print()
         if self.log_file:
             verbose(f"Result: {'OK' if self.flash_success else 'NOK'}")
@@ -932,11 +1039,11 @@ class MonoImager:
             return
 
         self.print_screen_divider()
-        print(f"  Connecting to {port} at 115200 baud...")
+        print(f"  Connecting to {port} at {C.SERIAL_BAUD} baud...")
         print()
 
-        d = SerialDevice(port, timeout=0.1)
-        if not d.connect(115200):
+        d = SerialDevice(port, timeout=CONSOLE_READ_TIMEOUT)
+        if not d.connect(C.SERIAL_BAUD):
             print(f"  ❌ Failed to connect to {port}")
             input("  Press Enter to continue...")
             self.current_state = MenuState.MAIN
@@ -949,9 +1056,9 @@ class MonoImager:
         # Drain any leftover bytes from connect()'s own internal probe,
         # then request a fresh prompt so the screen isn't blank.
         try:
-            time.sleep(0.2)
+            time.sleep(CONSOLE_DRAIN_SETTLE)
             d.safe_read_all()
-            time.sleep(0.1)
+            time.sleep(CONSOLE_PROMPT_SETTLE)
             d.safe_write(b"\r")
         except Exception:
             pass
@@ -981,7 +1088,7 @@ class MonoImager:
             try:
                 while True:
                     ch = sys.stdin.read(1)
-                    if ch == "\x1d":  # Ctrl+]
+                    if ch == CONSOLE_EXIT_KEY:
                         break
                     d.safe_write(ch.encode())
             finally:
@@ -992,7 +1099,7 @@ class MonoImager:
             while True:
                 if msvcrt.kbhit():
                     ch = msvcrt.getwch()
-                    if ord(ch) == 29:  # Ctrl+]
+                    if ch == CONSOLE_EXIT_KEY:
                         break
                     d.safe_write(ch.encode("utf-8", errors="replace"))
 
@@ -1029,21 +1136,21 @@ class MonoImager:
         print()
 
         try:
-            device = SerialDevice(port, timeout=10)
+            device = SerialDevice(port, timeout=STATS_READ_TIMEOUT)
             if not device.connect():
                 print("  ❌ Failed to connect")
                 input("  Press Enter to continue...")
                 self.current_state = MenuState.MAIN
                 return
 
-            print("=" * 60)
+            print("=" * C.DIVIDER_WIDTH)
             print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
-            print("=" * 60)
+            print("=" * C.DIVIDER_WIDTH)
             print()
             print("  Reading boot output (no need to interrupt autoboot)...")
 
             raw_output, _diag_err = with_spinner(
-                device.capture_boot_diagnostics, timeout=60,
+                device.capture_boot_diagnostics, timeout=STATS_CAPTURE_TIMEOUT,
                 message="Reading boot diagnostics..."
             )
             device.disconnect()
@@ -1137,7 +1244,7 @@ class MonoImager:
         # (Fully Auto, tests) use it instead of re-picking (#27).
         self.serial_port = port
 
-        d = core.phase1_bootstrap(port, 115200)
+        d = core.phase1_bootstrap(port, C.SERIAL_BAUD)
         if d is None:
             print()
             print("  Could not reach a recovery shell — network settings will be resolved")
@@ -1180,6 +1287,10 @@ class MonoImager:
                     self.menu_cli_console()
                 elif self.current_state == MenuState.DEVICE_STATS:
                     self.device_stats()
+                elif self.current_state == MenuState.SNAPSHOT:
+                    self.menu_snapshot()
+                elif self.current_state == MenuState.RESTORE:
+                    self.menu_restore()
         except KeyboardInterrupt:
             print("\n\nInterrupted by user")
             sys.exit(0)

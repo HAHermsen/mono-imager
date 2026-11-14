@@ -12,6 +12,7 @@ License: GPLv3
 from mono_imager.step_registry import register_step, StepContext, ALL_OS
 from mono_imager.flash_orchestrator import step, verbose, start_http_server, wait_for_report
 from mono_imager.spinner import with_spinner
+from mono_imager import constants as C
 
 
 def _step_network_ready(ctx: StepContext) -> bool:
@@ -101,6 +102,6 @@ def _step_firmware_reachable(ctx: StepContext) -> bool:
         ctx.device.launch_script(check_script, marker="step06_reachable")
     except Exception as e:
         return step(0, f"Firmware reachable ({url})", False, str(e))
-    check, _rep_err = with_spinner(wait_for_report, "06", timeout=20.0, message="Verifying firmware reachable...")
+    check, _rep_err = with_spinner(wait_for_report, "06", timeout=C.REACHABLE_REPORT_TIMEOUT, message="Verifying firmware reachable...")
     ok = check is not None and "200" in check
     return step(0, f"Firmware reachable ({url})", ok, f"HTTP {check}" if not ok else "")

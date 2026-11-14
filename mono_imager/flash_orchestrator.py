@@ -18,7 +18,6 @@ test_flash_verify.py (5/5 bootstrap, network phase confirmed working
 once device-ip is on the correct subnet).
 
 Author:  H.A. Hermsen
-Version: v1.2.10
 License: GPLv3
 """
 
@@ -30,6 +29,7 @@ import socket
 import threading
 import time
 
+from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -39,6 +39,16 @@ from mono_imager.config import detect_serial_ports
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner
 from mono_imager.step_tracker import StepTracker
+from mono_imager import constants as C
+
+# --- Tuning (seconds unless noted) ----------------------------------------------
+HTTP_COPY_BLOCK = 64 * C.KIB          # firmware file -> socket copy size
+REPORT_POLL_SLEEP = 0.05              # wait_for_report() poll interval
+PRINTENV_TIMEOUT = 10
+SETENV_TIMEOUT = 5
+CONNECT_READ_TIMEOUT = 5              # pyserial timeout for the bootstrap connection
+PROMPT_PROBE_TIMEOUT = 2.0            # "already at the U-Boot prompt?" check
+RECOVERY_LOGIN_TIMEOUT = 60
 
 # Set MONO_DEBUG=1 (or `mono-imager --debug`/`--verbose`) to restore full
 # verbose output to console. debug_enabled() reads MONO_DEBUG live rather
@@ -139,15 +149,15 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             return
 
         if self.firmware_path is None or not self.firmware_path.exists():
-            self.send_error(404)
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
         size = self.firmware_path.stat().st_size
-        self.send_response(200)
+        self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size))
         self.end_headers()
         with open(self.firmware_path, "rb") as f:
-            shutil.copyfileobj(f, self.wfile, length=65536)
+            shutil.copyfileobj(f, self.wfile, length=HTTP_COPY_BLOCK)
 
     def do_HEAD(self):
         """
@@ -168,10 +178,10 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         """
         parsed = urlparse(self.path)
         if self.firmware_path is None or not self.firmware_path.exists():
-            self.send_error(404)
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
         size = self.firmware_path.stat().st_size
-        self.send_response(200)
+        self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size))
         self.end_headers()
@@ -187,7 +197,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         """
         parsed = urlparse(self.path)
         if parsed.path != "/report":
-            self.send_error(404)
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
 
         qs = parse_qs(parsed.query)
@@ -200,11 +210,11 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             with self._reports_lock:
                 self._reports[step_id] = body
             verbose(f"✓ POST /report received: step={step_id} ({len(body)} bytes)", "debug")
-            self.send_response(200)
+            self.send_response(HTTPStatus.OK)
             self.end_headers()
         else:
             verbose(f"POST /report received but missing step param: {parsed.query!r}", "debug")
-            self.send_response(400)
+            self.send_response(HTTPStatus.BAD_REQUEST)
             self.end_headers()
 
     def _handle_report(self, parsed):
@@ -222,15 +232,15 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             with self._reports_lock:
                 self._reports[step_id] = result
             verbose(f"✓ /report received: step={step_id} result={result!r}", "debug")
-            self.send_response(200)
+            self.send_response(HTTPStatus.OK)
             self.end_headers()
         else:
             verbose(f"/report received but missing step/result params: {parsed.query!r}", "debug")
-            self.send_response(400)
+            self.send_response(HTTPStatus.BAD_REQUEST)
             self.end_headers()
 
     @classmethod
-    def wait_for_report(cls, step_id: str, timeout: float = 15.0) -> Optional[str]:
+    def wait_for_report(cls, step_id: str, timeout: float = C.REPORT_TIMEOUT) -> Optional[str]:
         """
         Poll the thread-safe reports store for a result reported by
         the device for the given step_id, blocking up to timeout
@@ -251,7 +261,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             with cls._reports_lock:
                 if step_id in cls._reports:
                     return cls._reports.pop(step_id)
-            time.sleep(0.05)
+            time.sleep(REPORT_POLL_SLEEP)
         return None
 
     @classmethod
@@ -275,7 +285,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         verbose(f"HTTP: {fmt % args}", "debug")
 
 
-def wait_for_report(step_id: str, timeout: float = 15.0) -> Optional[str]:
+def wait_for_report(step_id: str, timeout: float = C.REPORT_TIMEOUT) -> Optional[str]:
     """
     Module-level convenience wrapper around
     _FirmwareHandler.wait_for_report() — see that method's docstring
@@ -320,7 +330,7 @@ def detect_host_ip() -> str:
     proceeding with a guessed IP (which wastes minutes before the real error surfaces)."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
+            s.connect((C.INTERNET_PROBE_IP, C.INTERNET_PROBE_PORT))
             return s.getsockname()[0]
     except Exception:
         return ""
@@ -397,7 +407,7 @@ def capture_uboot_env(d: SerialDevice) -> Optional[dict]:
     backup is a nice-to-have, not a hard prerequisite for flashing.
     """
     try:
-        output = d.send_command("printenv", timeout=10)
+        output = d.send_command("printenv", timeout=PRINTENV_TIMEOUT)
     except Exception as e:
         verbose(f"capture_uboot_env: printenv failed: {e}", "warning")
         return None
@@ -433,7 +443,7 @@ def restore_uboot_env(d: SerialDevice, backup: Optional[dict]) -> int:
     restored = 0
     for key, value in backup.items():
         try:
-            d.send_command(f'setenv {key} "{value}"', timeout=5)
+            d.send_command(f'setenv {key} "{value}"', timeout=SETENV_TIMEOUT)
             restored += 1
         except Exception as e:
             verbose(f"restore_uboot_env: failed to restore {key}: {e}", "warning")
@@ -445,7 +455,8 @@ def restore_uboot_env(d: SerialDevice, backup: Optional[dict]) -> int:
 # Unchanged from the proven test_flash_verify.py run (5/5 bootstrap on
 # real hardware, network phase confirmed once device-ip matches subnet).
 
-def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
+def phase1_uboot(port: str, baud: int = C.SERIAL_BAUD, wait_message: Optional[str] = None,
+                 autoboot_timeout: float = C.AUTOBOOT_TIMEOUT) -> Optional[SerialDevice]:
     """
     Phase 1a: Serial bootstrap up to the U-Boot prompt.
 
@@ -469,12 +480,17 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
     No OS awareness. No eMMC erase. No bootcmd changes.
     Those belong in journey files.
 
+    wait_message / autoboot_timeout: optional, for callers that want the
+    user to reboot the running OS cleanly instead of power-cycling (eMMC
+    snapshot/restore, #29) and so need longer than 60 s for the OS to
+    shut down. Defaults leave every existing caller unchanged.
+
     Returns SerialDevice at U-Boot prompt on success, None on failure.
     """
     reset_results()
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     verbose("Phase 1 — Bootstrap (serial)")
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     console_logger.info("Connecting to device...")
 
     # Step 1: Port present (only checks the OS lists it; Step 2 proves a device answers)
@@ -489,24 +505,24 @@ def phase1_uboot(port: str, baud: int = 115200) -> Optional[SerialDevice]:
         return None
 
     # Step 2: Connect
-    d = SerialDevice(port, timeout=5)
+    d = SerialDevice(port, timeout=CONNECT_READ_TIMEOUT)
     connected = d.connect(baud)
     if not step(2, f"Connect at {baud} baud", connected):
         return None
 
     # Step 3: Interrupt U-Boot — skip the wait if we're already there.
-    already_at_prompt = d.probe_uboot_prompt(timeout=2.0)
+    already_at_prompt = d.probe_uboot_prompt(timeout=PROMPT_PROBE_TIMEOUT)
     if already_at_prompt:
         verbose("✓ Device already at U-Boot prompt — skipping power-cycle wait")
         interrupted = True
     else:
         print()
-        print("=" * 60)
-        print("  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
+        print(wait_message or "  ⚡ POWER CYCLE YOUR DEVICE NOW ⚡")
+        print("=" * C.DIVIDER_WIDTH)
         print()
         interrupted, _autoboot_err = with_spinner(
-            d.wait_for_autoboot, timeout=60,
+            d.wait_for_autoboot, timeout=autoboot_timeout,
             message="Waiting for U-Boot autoboot interrupt..."
         )
         if _autoboot_err:
@@ -567,7 +583,7 @@ def phase1_recovery(d: SerialDevice,
 
     # Step 5: Login
     login_msg = "Logging into recovery shell..." if login_method == "login_recovery" else "Logging into staging shell..."
-    logged_in, _login_err = with_spinner(login_fn, timeout=60, message=login_msg)
+    logged_in, _login_err = with_spinner(login_fn, timeout=RECOVERY_LOGIN_TIMEOUT, message=login_msg)
     if _login_err:
         logged_in = False
     if not step(5, login_label, logged_in):
@@ -577,7 +593,7 @@ def phase1_recovery(d: SerialDevice,
     return d
 
 
-def phase1_bootstrap(port: str, baud: int = 115200,
+def phase1_bootstrap(port: str, baud: int = C.SERIAL_BAUD,
                      boot_medium: Optional[str] = None) -> Optional[SerialDevice]:
     """
     Phase 1: Full bootstrap — U-Boot interrupt + recovery boot + login.
@@ -623,9 +639,9 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     and found inconclusive on a single run), this switches to the
     pattern with a 100% observed pass rate.
     """
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     verbose("Phase 3 — Flash")
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     console_logger.info("Preparing to flash...")
 
     url = f"http://{host_ip}:{port}/firmware.img"
@@ -693,7 +709,7 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
         verbose(f"✗ Step 09: launch_script() RAISED: {e}", "error")
         remote_path = None
 
-    check = wait_for_report("09", timeout=20.0)
+    check = wait_for_report("09", timeout=C.REACHABLE_REPORT_TIMEOUT)
     reachable = check is not None and "200" in check
 
     debug_detail = f"HTTP status: {check}" if not reachable else ""
@@ -766,7 +782,7 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
     # remains a real opportunity for a future, more careful pass —
     # not worth the risk of breaking a working flash step in the
     # meantime.
-    FLASH_SIZE_CAP = int(3.8 * 1024**3 * 0.8)  # ≈3.0GB, 80% of confirmed 3.8GB root cap
+    FLASH_SIZE_CAP = C.RAM_STAGING_CAP  # ≈3.0GB, 80% of confirmed 3.8GB root cap
 
     use_streaming = firmware_size > 0 and firmware_size > FLASH_SIZE_CAP
 
@@ -775,8 +791,8 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
 
     if use_streaming:
         verbose(
-            f"Firmware size ({firmware_size / 1024**3:.2f} GB) exceeds the "
-            f"{FLASH_SIZE_CAP / 1024**3:.2f} GB buffered-flash cap — using "
+            f"Firmware size ({firmware_size / C.GIB:.2f} GB) exceeds the "
+            f"{FLASH_SIZE_CAP / C.GIB:.2f} GB buffered-flash cap — using "
             "streaming mode (curl | dd direct to target).",
             "warning"
         )
@@ -798,7 +814,7 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
         )
     response, flash_error = with_spinner(
         d.run_script, flash_script,
-        marker="step10_flash", exec_timeout=600,
+        marker="step10_flash", exec_timeout=C.FLASH_TIMEOUT,
         message="Flashing — this may take several minutes"
     )
     if flash_error is not None:
@@ -813,9 +829,9 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
 
     step(10, "curl | dd executed on device", True)
     step(11, "dd confirmed records in/out", has_records,
-         f"output: {response[-200:]}" if not has_records else "")
+         f"output: {response[-C.LOG_TAIL:]}" if not has_records else "")
     step(12, "No curl errors", not has_error,
-         f"output: {response[-200:]}" if has_error else "")
+         f"output: {response[-C.LOG_TAIL:]}" if has_error else "")
 
     return has_records and not has_error
 
@@ -827,11 +843,11 @@ def phase4_postflash(d: SerialDevice) -> bool:
     Sends reboot to the device. Journey files handle any post-flash
     steps before calling this (firmware re-image, DIP flip prompts, etc.).
     """
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     verbose("Phase 4 — Post-flash")
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     verbose("Sending reboot command...")
-    d.send_command("reboot", wait_for_prompt=False, timeout=5)
+    d.send_command("reboot", wait_for_prompt=False, timeout=C.REBOOT_CMD_TIMEOUT)
     verbose("Flash complete. Reboot sent.")
     console_logger.info("Rebooting device...")
     return True
@@ -873,14 +889,14 @@ def run_flash_journey(
     journey = None
     try:
         print()
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         print("PHASE 1: Bootstrap (Serial Connection)")
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         print(f"Port: {port}")
         print()
 
         # Step 1: Connect and interrupt U-Boot — no OS awareness
-        d = phase1_uboot(port, 115200)
+        d = phase1_uboot(port, C.SERIAL_BAUD)
         if d is None:
             print("❌ Bootstrap FAILED")
             return None
@@ -934,9 +950,9 @@ def run_flash_journey(
             journey.ctx.device_ip  = device_net["ip"]
 
         print()
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         print("PHASE 2+: Flashing Firmware")
-        print("=" * 60)
+        print("=" * C.DIVIDER_WIDTH)
         fw_display = "auto-detected from USB" if Path(firmware_path) == Path(".") else str(firmware_path)
         print(f"OS:          {os_name}")
         print(f"Firmware:    {fw_display}")
@@ -979,9 +995,9 @@ def run_flash_journey(
 def print_report():
     # Full detail to the file, unchanged — every step, numbered, with
     # technical reasons. This is the troubleshooting record.
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     verbose("Verification Report")
-    verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH)
     passed = sum(1 for _, _, p, _ in results if p)
     total  = len(results)
     for num, desc, p, reason in results:
@@ -990,7 +1006,7 @@ def print_report():
         if reason:
             line += f"\n           {reason}"
         verbose(line)
-    verbose("-" * 60)
+    verbose("-" * C.DIVIDER_WIDTH)
     verdict = "OK" if passed == total else "NOK"
     verbose(f"Result: {verdict} ({passed}/{total} steps passed)")
     verbose(f"📄 Report saved to: {get_log_file()}")

@@ -85,6 +85,19 @@ from mono_imager.flash_orchestrator import (
     step, verbose, console_logger, wait_for_report,
 )
 from mono_imager.journeys import _common  # also provides shared _step_http_server_start / _step_firmware_reachable
+from mono_imager import constants as C
+
+# --- U-Boot recovery repair (NOR) -------------------------------------------------
+FIT_HEADER_PROBE_LEN = "0x100"           # bytes read to identify an image header
+_FIT_SIZE_FIELD_ADDR = "0x82000004"      # UBOOT_LOAD_ADDR + 4: FIT total-size field
+NOR_SCAN_START = 0x400000                # scan NOR for the recovery kernel,
+NOR_SCAN_END   = 0x3C00000               #   1 MiB steps, past the env/DTB area
+NOR_SCAN_STEP  = 0x100000
+FIRMWARE_UPDATE_TIMEOUT = 300
+
+# --- Mono's documented OpenWRT dd passes (whole-disk image, firmware region kept) --
+PT_DD_ARGS   = f"bs={C.SECTOR_BYTES} count={C.EMMC_FW_START // C.SECTOR_BYTES}"    # first 4 KiB: partition table
+BULK_DD_ARGS = f"bs=1M skip={C.EMMC_FW_END_MIB} seek={C.EMMC_FW_END_MIB}"        # 32 MiB onward
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +116,19 @@ _UBOOT_SET_EMMC_CMD = (
     "root=/dev/mmcblk0p2 rootwait\"; run emmc_load && booti ${kernel_addr_r} - ${fdt_addr_r}'"
 )
 _UBOOT_SET_BOOTCMD_CMD = "setenv bootcmd 'run openwrt || run recovery'"
+_UBOOT_BOOTARGS_NOR_CMD = f'setenv bootargs "${{bootargs}} boot_medium={C.BOOT_MEDIUM_NOR}"'
 
+
+
+def _md_be32(md_output: str) -> int:
+    """
+    Big-endian u32 from U-Boot `md.b <addr> 4` output, e.g.
+    "82000004: 00 5a 1c 3e    .Z.>" -> 0x005a1c3e. Raises ValueError /
+    IndexError on unparseable output (callers handle both).
+    """
+    hex_b = md_output.split(":")[-1].strip().split()[:4]
+    return (int(hex_b[0], 16) << 24 | int(hex_b[1], 16) << 16 |
+            int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
 
 
 def _uboot_steps_openwrt_lan(device) -> bool:
@@ -133,7 +158,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     # If 'recovery' uses 'sf read', also validate the kernel size at that
     # offset so we don't keep a leftover pointer to a firmware FIT blob.
     try:
-        out = device.send_command("printenv recovery", timeout=5)
+        out = device.send_command("printenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
         verbose(f"  {out.strip()}")
         if "recovery=" in out:
             recovery_confirmed = False
@@ -143,39 +168,37 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 koffset = parts[1] if len(parts) >= 2 else ""
                 if koffset:
                     try:
-                        device.send_command("sf probe 0", timeout=10)
-                        device.send_command(f"sf read 0x82000000 {koffset} 0x100", timeout=15)
-                        magic_out = device.send_command("md.b 0x82000000 4", timeout=5)
-                        if "d0 0d fe ed" in magic_out:
-                            size_out = device.send_command("md.b 0x82000004 4", timeout=5)
+                        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
+                        device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {koffset} {FIT_HEADER_PROBE_LEN}", timeout=C.UBOOT_WRITE_TIMEOUT)
+                        magic_out = device.send_command(f"md.b {C.UBOOT_LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
+                        if C.FIT_MAGIC_HEX in magic_out:
+                            size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
                             try:
-                                hex_b = size_out.split(":")[-1].strip().split()[:4]
-                                fit_size = (int(hex_b[0], 16) << 24 | int(hex_b[1], 16) << 16 |
-                                            int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
-                                if fit_size < 5 * 1024 * 1024:
+                                fit_size = _md_be32(size_out)
+                                if fit_size < C.MIN_KERNEL_FIT_BYTES:
                                     verbose(f"  ✗ 'recovery' points to a non-kernel FIT "
-                                            f"({fit_size/1024/1024:.1f} MB at {koffset}) — clearing...")
-                                    device.send_command("setenv recovery", timeout=5)
+                                            f"({fit_size / C.MIB:.1f} MB at {koffset}) — clearing...")
+                                    device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
                                     # fall through to NOR scan
                                 else:
                                     verbose(f"  ✓ 'recovery' confirmed — kernel FIT at {koffset} "
-                                            f"({fit_size/1024/1024:.1f} MB)")
+                                            f"({fit_size / C.MIB:.1f} MB)")
                                     recovery_confirmed = True
                             except (ValueError, IndexError):
                                 verbose("  ✓ 'recovery' is defined (validation skipped)")
                                 recovery_confirmed = True
-                        elif "1f 8b" in magic_out:
+                        elif C.GZIP_MAGIC_HEX in magic_out:
                             # Gzip kernel (Image.gz / AArch64 booti path).
                             # Also verify kernel_comp_addr_r is in NOR env —
                             # it gets wiped by 'env default -a' and booti
                             # silently fails without it.
-                            kc = device.send_command("printenv kernel_comp_addr_r", timeout=5)
+                            kc = device.send_command("printenv kernel_comp_addr_r", timeout=C.UBOOT_QUICK_TIMEOUT)
                             if "kernel_comp_addr_r=" in kc:
                                 verbose(f"  ✓ 'recovery' confirmed — gzip kernel at {koffset}")
                                 recovery_confirmed = True
                             else:
                                 verbose("  ✗ kernel_comp_addr_r missing — rebuilding recovery env...")
-                                device.send_command("setenv recovery", timeout=5)
+                                device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
                                 # fall through to NOR scan
                         else:
                             verbose("  ✓ 'recovery' is defined — no changes needed")
@@ -191,14 +214,14 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                 recovery_confirmed = True
 
             if recovery_confirmed:
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
                 # Re-persist decompression vars — something (firmware update?) can wipe them
                 # between runs, causing the next run to fall through to the slow NOR scan.
-                device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
-                device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
-                device.send_command("saveenv", timeout=15)
-                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
+                device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
+                device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
+                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
+                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
                 return step(0, "U-Boot 'recovery' variable confirmed present", True)
     except Exception as e:
         verbose(f"  printenv recovery: {e}", "warning")
@@ -217,20 +240,20 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     for offset, size in CANDIDATES:
         verbose(f"  Trying backup env at NOR offset {offset} (size {size})...")
         try:
-            device.send_command("sf probe 0", timeout=10)
-            device.send_command(f"sf read 0x82000000 {offset} {size}", timeout=15)
+            device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
+            device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {offset} {size}", timeout=C.UBOOT_WRITE_TIMEOUT)
             # -c checks CRC32; fails cleanly if data is not a valid env block
-            device.send_command(f"env import -c 0x82000000 {size}", timeout=10)
-            check = device.send_command("printenv recovery", timeout=5)
+            device.send_command(f"env import -c {C.UBOOT_LOAD_ADDR} {size}", timeout=C.UBOOT_CMD_TIMEOUT)
+            check = device.send_command("printenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
             if "recovery=" in check:
                 verbose(f"  ✓ Restored 'recovery' from NOR backup at {offset}")
                 verbose(f"  {check.strip()}")
                 # Override bootcmd so OpenWRT boots after the flash.
                 # The restored factory bootcmd (e.g. 'run opnsense') won't work.
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
-                device.send_command("saveenv", timeout=15)
-                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
+                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
                 return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
         except Exception as e:
             verbose(f"  Candidate {offset} failed: {e}", "debug")
@@ -247,17 +270,17 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     # Only print lines when something non-trivial is found.
     print("  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
 
-    FIT_MAGIC  = "d0 0d fe ed"
-    UIMG_MAGIC = "27 05 19 56"
-    GZIP_MAGIC = "1f 8b"
-    LOAD_ADDR  = "0x82000000"
-    DTB_ADDR   = "0x90000000"   # separate RAM area for DTB when using booti
-    LOAD_SZ    = "0x2000000"    # 32 MB — comfortably covers any recovery image
+    FIT_MAGIC  = C.FIT_MAGIC_HEX
+    UIMG_MAGIC = C.UIMAGE_MAGIC_HEX
+    GZIP_MAGIC = C.GZIP_MAGIC_HEX
+    LOAD_ADDR  = C.UBOOT_LOAD_ADDR
+    DTB_ADDR   = C.UBOOT_DTB_ADDR    # separate RAM area for DTB when using booti
+    LOAD_SZ    = C.NOR_KERNEL_LEN    # 32 MB — comfortably covers any recovery image
 
-    KERNEL_OFFSETS = [f"0x{off:x}" for off in range(0x400000, 0x3C00000, 0x100000)]
+    KERNEL_OFFSETS = [f"0x{off:x}" for off in range(NOR_SCAN_START, NOR_SCAN_END, NOR_SCAN_STEP)]
 
     try:
-        device.send_command("sf probe 0", timeout=10)
+        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
     except Exception as e:
         verbose(f"  sf probe failed: {e}", "error")
         verbose("  Manual fix: setenv recovery \"<sf load cmd>\" && saveenv", "error")
@@ -268,28 +291,26 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     with Spinner(f"Scanning NOR ({len(KERNEL_OFFSETS)} offsets)..."):
         for koffset in KERNEL_OFFSETS:
             try:
-                device.send_command(f"sf read {LOAD_ADDR} {koffset} 0x100", timeout=15)
-                magic_out = device.send_command(f"md.b {LOAD_ADDR} 4", timeout=5)
+                device.send_command(f"sf read {LOAD_ADDR} {koffset} 0x100", timeout=C.UBOOT_WRITE_TIMEOUT)
+                magic_out = device.send_command(f"md.b {LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
 
                 # ── Large standalone FIT (kernel+initrd inline) ──────────────
                 if FIT_MAGIC in magic_out:
-                    size_out = device.send_command("md.b 0x82000004 4", timeout=5)
+                    size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
                     try:
-                        hex_b = size_out.split(":")[-1].strip().split()[:4]
-                        fit_size = (int(hex_b[0], 16) << 24 | int(hex_b[1], 16) << 16 |
-                                    int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
+                        fit_size = _md_be32(size_out)
                     except (ValueError, IndexError):
                         fit_size = 0
 
-                    if fit_size >= 5 * 1024 * 1024:
-                        verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size/1024/1024:.1f} MB)")
+                    if fit_size >= C.MIN_KERNEL_FIT_BYTES:
+                        verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size / C.MIB:.1f} MB)")
                         if dtb_offset:
                             # FIT has no embedded FDT — pair with the DTB found earlier.
                             # fdt_high prevents U-Boot from relocating the FDT below the kernel.
-                            device.send_command("setenv fdt_high 0xffffffffffffffff", timeout=5)
+                            device.send_command(f"setenv fdt_high {C.UBOOT_FDT_HIGH_NO_RELOC}", timeout=C.UBOOT_QUICK_TIMEOUT)
                             recovery_cmd = (
                                 f"sf probe 0;"
-                                f"sf read {DTB_ADDR} {dtb_offset} 0x20000;"
+                                f"sf read {DTB_ADDR} {dtb_offset} {C.NOR_DTB_LEN};"
                                 f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
                                 f"bootm {LOAD_ADDR} - {DTB_ADDR}"
                             )
@@ -302,7 +323,7 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                     else:
                         # Small FDT: either raw DTB or external-FIT header —
                         # remember it in case we find the kernel (gzip) later.
-                        verbose(f"  DTB/ext-FIT at {koffset} ({fit_size/1024:.1f} KB) — noted")
+                        verbose(f"  DTB/ext-FIT at {koffset} ({fit_size / C.KIB:.1f} KB) — noted")
                         if dtb_offset is None:
                             dtb_offset = koffset
                         continue
@@ -321,28 +342,28 @@ def _uboot_steps_openwrt_lan(device) -> bool:
                     if dtb_offset:
                         recovery_cmd = (
                             f"sf probe 0;"
-                            f"sf read {DTB_ADDR} {dtb_offset} 0x20000;"
+                            f"sf read {DTB_ADDR} {dtb_offset} {C.NOR_DTB_LEN};"
                             f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
                             f"booti {LOAD_ADDR} - {DTB_ADDR}"
                         )
-                        device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
-                        device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
+                        device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
+                        device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
                     else:
                         recovery_cmd = (
                             f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
                             f"booti {LOAD_ADDR}"
                         )
-                        device.send_command("setenv kernel_comp_addr_r 0xa0000000", timeout=5)
-                        device.send_command("setenv kernel_comp_size 0x10000000", timeout=5)
+                        device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
+                        device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
 
                 else:
                     continue  # no interesting magic at this offset
 
-                device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=10)
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=10)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=10)
-                device.send_command("saveenv", timeout=15)
-                device.send_command('setenv bootargs "${bootargs} boot_medium=qspi"', timeout=5)
+                device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
+                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
                 return step(
                     0,
                     f"U-Boot 'recovery' reconstructed — NOR {koffset}",
@@ -371,13 +392,13 @@ register_uboot_steps(OS, TRANSFER, _uboot_steps_openwrt_lan)
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["http_server_up"], label="Start HTTP server")
 def step_http_server_start(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Start HTTP server"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Start HTTP server"); verbose("=" * C.DIVIDER_WIDTH)
     return _common._step_http_server_start(ctx)
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["network_up", "http_server_up"], produces=["firmware_ready"], label="Verify firmware reachable")
 def step_firmware_reachable(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Verify firmware reachable"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Verify firmware reachable"); verbose("=" * C.DIVIDER_WIDTH)
     return _common._step_firmware_reachable(ctx)
 
 
@@ -417,7 +438,7 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     short/partial read could let `count=8` finish with fewer than
     4096 bytes actually written — a truncated, invalid GPT.
     """
-    verbose("=" * 60); verbose("Flash OpenWRT image"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Flash OpenWRT image"); verbose("=" * C.DIVIDER_WIDTH)
     d = ctx.device
     source = ctx.get("firmware_source")
     is_gz = str(ctx.firmware_path).lower().endswith(".gz")
@@ -434,8 +455,8 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
         f"{download_step}"
         f"{decompress_step}"
         f"{{ "
-        f"dd if={_STAGED_IMG} of={ctx.flash_target} bs=512 count=8; "
-        f"dd if={_STAGED_IMG} of={ctx.flash_target} bs=1M skip=32 seek=32; "
+        f"dd if={_STAGED_IMG} of={ctx.flash_target} {PT_DD_ARGS}; "
+        f"dd if={_STAGED_IMG} of={ctx.flash_target} {BULK_DD_ARGS}; "
         f"}} > /tmp/mono_imager_flash.log 2>&1; "
         f"sync; "
         f"rm -f {_STAGED_IMG}; "
@@ -449,10 +470,10 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
         return step(0, "OpenWRT flash launched", False, str(e))
 
     console_logger.info("Flashing OpenWRT — downloading, then writing both dd passes...")
-    raw, err = with_spinner(wait_for_report, "flash", timeout=600.0, message="Flashing OpenWRT")
+    raw, err = with_spinner(wait_for_report, "flash", timeout=C.FLASH_TIMEOUT, message="Flashing OpenWRT")
     if err or raw is None:
         return step(0, "OpenWRT flash (dd)", False,
-                    str(err) if err else "no report-back from device in 600s")
+                    str(err) if err else f"no report-back from device in {C.FLASH_TIMEOUT}s")
 
     # Two dd calls -> two "records out" lines in the combined log.
     matches = re.findall(r"(\d+)\+(\d+)\s+records out", raw)
@@ -461,18 +482,18 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
 
     if len(matches) < 2:
         return step(0, "OpenWRT flash (dd, both passes)", False,
-                    f"expected 2 'records out' lines, got {len(matches)}: {raw[-300:]}")
+                    f"expected 2 'records out' lines, got {len(matches)}: {raw[-C.LOG_TAIL_LONG:]}")
 
     pt_full, pt_partial = int(matches[0][0]), int(matches[0][1])
-    pt_bytes = pt_full * 512 + pt_partial
+    pt_bytes = pt_full * C.SECTOR_BYTES + pt_partial
     bulk_full, bulk_partial = int(matches[1][0]), int(matches[1][1])
-    bulk_bytes = bulk_full * 1024 * 1024 + bulk_partial
+    bulk_bytes = bulk_full * C.MIB + bulk_partial
 
-    step(0, "OpenWRT partition table (dd bs=512 count=8)", pt_bytes > 0,
-         raw[-200:] if pt_bytes == 0 else "")
+    step(0, f"OpenWRT partition table (dd {PT_DD_ARGS})", pt_bytes > 0,
+         raw[-C.LOG_TAIL:] if pt_bytes == 0 else "")
     ok = pt_bytes > 0 and bulk_bytes > 0 and not has_error
-    step(0, f"OpenWRT image (dd bs=1M skip=32 seek=32, {bulk_bytes // 1024 // 1024} MB)",
-         ok, raw[-200:] if not ok else "")
+    step(0, f"OpenWRT image (dd {BULK_DD_ARGS}, {bulk_bytes // C.MIB} MB)",
+         ok, raw[-C.LOG_TAIL:] if not ok else "")
     return ok
 
 
@@ -482,20 +503,20 @@ def step_flash_openwrt(ctx: StepContext) -> bool:
     label="Firmware update (eMMC bootloader)"
 )
 def step_firmware_update(ctx: StepContext) -> bool:
-    verbose("=" * 60); verbose("Firmware update"); verbose("=" * 60)
+    verbose("=" * C.DIVIDER_WIDTH); verbose("Firmware update"); verbose("=" * C.DIVIDER_WIDTH)
     d = ctx.device
     try:
         response, _fw_err = with_spinner(
             d.send_command,
             "printf 'yes\\n' | firmware update 2>&1; echo RC=$?",
-            timeout=300,
+            timeout=FIRMWARE_UPDATE_TIMEOUT,
             message="Updating eMMC bootloader (firmware update)..."
         )
         if _fw_err:
             raise _fw_err
         ok = "RC=0" in response
         return step(0, "Firmware update (eMMC bootloader)", ok,
-                   response[-200:] if not ok else "")
+                   response[-C.LOG_TAIL:] if not ok else "")
     except Exception as e:
         return step(0, "Firmware update", False, str(e))
 

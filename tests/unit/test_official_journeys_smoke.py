@@ -50,12 +50,19 @@ def check(label, condition):
         failed += 1
 
 
+# Two dd passes, as OpenWRT's whole-disk flash reports them (partition
+# table, then everything from 32 MiB); Armbian's single pass matches too.
+_TWO_DD_PASSES = ("8+0 records in\n8+0 records out\n"
+                  "5000+0 records in\n5000+0 records out\n")
+
+
 def _wait_for_report_side_effect(marker, timeout=None):
-    """Serves both the reachability check (marker '06') and the flash
-    step's record-count regex (marker '07') with one mock function."""
+    """Serves the reachability check ('06') and the flash steps' dd
+    record counts ('07' Armbian, 'flash' OpenWRT) with one mock function."""
     return {
         "06": "200",
         "07": "5000+0 records in\n5000+0 records out\n",
+        "flash": _TWO_DD_PASSES,
     }.get(marker, "")
 
 
@@ -72,7 +79,7 @@ def _make_mock_device():
     d = MagicMock()
     d.send_command.side_effect = _send_command_side_effect
     d.launch_script.return_value = None
-    d.run_script.return_value = "5000+0 records in\n5000+0 records out\n"
+    d.run_script.return_value = _TWO_DD_PASSES
     d.wait_for_autoboot.return_value = True
     d.boot_recovery.return_value = True
     d.login_recovery.return_value = True
@@ -102,7 +109,9 @@ def _run_journey(os_name, transfer, **kwargs):
 
 def test_openwrt_lan():
     print("\n--- OpenWRT + lan ---")
-    with patch("mono_imager.journeys.openwrt_lan.start_http_server", return_value=MagicMock()), \
+    # The HTTP-server and reachability steps are the shared ones in _common.py.
+    with patch("mono_imager.journeys._common.start_http_server", return_value=MagicMock()), \
+         patch("mono_imager.journeys._common.wait_for_report", side_effect=_wait_for_report_side_effect), \
          patch("mono_imager.journeys.openwrt_lan.wait_for_report", side_effect=_wait_for_report_side_effect), \
          patch("builtins.input", return_value=""):
         ok, results, n_steps = _run_journey("OpenWRT", "lan")
@@ -113,7 +122,11 @@ def test_openwrt_lan():
 
 def test_openwrt_usb():
     print("\n--- OpenWRT + usb ---")
-    with patch("mono_imager.journeys.openwrt_usb.find_image_on_usb",
+    # Mounting runs a partition-scan script on the device (#26), covered by
+    # test_usb_mount.py / test_usb_partition_scan.py — mocked here.
+    with patch("mono_imager.journeys.openwrt_usb.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
+         patch("mono_imager.journeys.openwrt_usb.check_usb_size", return_value=True), \
+         patch("mono_imager.journeys.openwrt_usb.find_image_on_usb",
                return_value=("/mnt/usb/openwrt.img", "img")), \
          patch("builtins.input", return_value=""):
         ok, results, n_steps = _run_journey(
@@ -126,7 +139,8 @@ def test_openwrt_usb():
 
 def test_armbian_lan():
     print("\n--- Armbian + lan ---")
-    with patch("mono_imager.journeys.armbian_lan.start_http_server", return_value=MagicMock()), \
+    with patch("mono_imager.journeys._common.start_http_server", return_value=MagicMock()), \
+         patch("mono_imager.journeys._common.wait_for_report", side_effect=_wait_for_report_side_effect), \
          patch("mono_imager.journeys.armbian_lan.wait_for_report", side_effect=_wait_for_report_side_effect), \
          patch("mono_imager.recovery_orchestrator.run_firmware_update", return_value=True), \
          patch("mono_imager.device_net.RecoveryNetwork") as MockNet, \
@@ -148,7 +162,11 @@ def test_armbian_lan():
 
 def test_armbian_usb():
     print("\n--- Armbian + usb ---")
-    with patch("mono_imager.journeys.armbian_usb.find_image_on_usb",
+    # Mounting runs a partition-scan script on the device (#26), covered by
+    # test_usb_mount.py / test_usb_partition_scan.py — mocked here.
+    with patch("mono_imager.journeys.armbian_usb.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
+         patch("mono_imager.journeys.armbian_usb.check_usb_size", return_value=True), \
+         patch("mono_imager.journeys.armbian_usb.find_image_on_usb",
                return_value=("/mnt/usb/armbian.img.xz", "img.xz")), \
          patch("mono_imager.recovery_orchestrator.run_firmware_update", return_value=True), \
          patch("mono_imager.device_net.RecoveryNetwork") as MockNet, \
