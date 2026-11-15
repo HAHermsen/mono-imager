@@ -1,13 +1,13 @@
 {
   "mypy": {
-    "arg-type": 21,
-    "assignment": 16,
-    "attr-defined": 55,
+    "arg-type": 16,
+    "assignment": 14,
+    "attr-defined": 4,
     "call-overload": 1,
-    "index": 29,
+    "index": 20,
     "list-item": 1,
     "operator": 3,
-    "union-attr": 20,
+    "union-attr": 12,
     "valid-type": 2,
     "var-annotated": 8
   },
@@ -16,7 +16,7 @@
     "DTZ001": 2,
     "DTZ005": 2,
     "F841": 1,
-    "I001": 38,
+    "I001": 37,
     "ISC004": 12,
     "PLR1711": 1,
     "RET501": 1,

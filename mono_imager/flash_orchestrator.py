@@ -617,35 +617,8 @@ def phase1_bootstrap(port: str, baud: int = C.SERIAL_BAUD,
     return phase1_recovery(d, boot_medium=boot_medium)
 
 
-def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
-                  firmware_size: int = 0) -> bool:
-    """
-    Phase 3: Flash — curl | dd on device, verify dd output.
-
-    Uses run_script() with output redirected to files on-device, then
-    read back via cat/wc — NOT direct stdout capture. This matters:
-    direct-stdout capture (curl's real output landing straight in the
-    exec response, e.g. "curl -s -o /dev/null -w '%{http_code}' <url>"
-    read directly) was found to be FLAKY on real hardware — passing
-    roughly 1 in 3 runs with identical code, identical command, same
-    device. Across many real runs, the file-redirect pattern (write
-    output to a file, then separately cat/wc that file — exactly what
-    a parallel diagnostic script's "Stage 3" does) passed 100% of the
-    time, while the direct-stdout form failed intermittently. Rather
-    than chase the exact cause of that intermittent loss (suspected:
-    curl's stdout buffering mode varies depending on pty/line-
-    discipline state at process start, though this was not confirmed
-    — a competing theory, shell line-editing interference, was tested
-    and found inconclusive on a single run), this switches to the
-    pattern with a 100% observed pass rate.
-    """
-    verbose("=" * C.DIVIDER_WIDTH)
-    verbose("Phase 3 — Flash")
-    verbose("=" * C.DIVIDER_WIDTH)
-    console_logger.info("Preparing to flash...")
-
-    url = f"http://{host_ip}:{port}/firmware.img"
-
+def _step09_source_reachable(d: SerialDevice, host_ip: str, port: int, url: str) -> bool:
+    """Step 9: the device can reach the host's firmware URL (HEAD, reported over TCP/IP)."""
     # Step 9: Firmware source reachable.
     #
     # PROTOTYPE: TCP/IP-based result reporting, replacing serial-echo
@@ -720,9 +693,11 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
             "if this still fails, the issue is likely NOT script complexity."
         )
 
-    if not step(9, f"Firmware source reachable ({url})", reachable, debug_detail):
-        return False
+    return step(9, f"Firmware source reachable ({url})", reachable, debug_detail)
 
+
+def _flash_script(url: str, flash_target: str, firmware_size: int) -> str:
+    """Steps 10-12 script: download-then-dd, or curl | dd when the image is too big for RAM."""
     # Step 10+11+12: download firmware, then dd from local file —
     # UNLESS the image is too large to fit in recovery Linux's root
     # filesystem (confirmed on real hardware to be a 3.8GB tmpfs-
@@ -786,9 +761,6 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
 
     use_streaming = firmware_size > 0 and firmware_size > FLASH_SIZE_CAP
 
-    verbose(f"Flashing {flash_target} — this may take several minutes...")
-    console_logger.info("Flashing firmware — this may take several minutes...")
-
     if use_streaming:
         verbose(
             f"Firmware size ({firmware_size / C.GIB:.2f} GB) exceeds the "
@@ -812,6 +784,44 @@ def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
             f"rm -f {local_fw_path}; "
             f"cat /tmp/mono_imager_step10_flash.log"
         )
+    return flash_script
+
+
+def phase3_flash(d: SerialDevice, host_ip: str, port: int, flash_target: str,
+                  firmware_size: int = 0) -> bool:
+    """
+    Phase 3: Flash — curl | dd on device, verify dd output.
+
+    Uses run_script() with output redirected to files on-device, then
+    read back via cat/wc — NOT direct stdout capture. This matters:
+    direct-stdout capture (curl's real output landing straight in the
+    exec response, e.g. "curl -s -o /dev/null -w '%{http_code}' <url>"
+    read directly) was found to be FLAKY on real hardware — passing
+    roughly 1 in 3 runs with identical code, identical command, same
+    device. Across many real runs, the file-redirect pattern (write
+    output to a file, then separately cat/wc that file — exactly what
+    a parallel diagnostic script's "Stage 3" does) passed 100% of the
+    time, while the direct-stdout form failed intermittently. Rather
+    than chase the exact cause of that intermittent loss (suspected:
+    curl's stdout buffering mode varies depending on pty/line-
+    discipline state at process start, though this was not confirmed
+    — a competing theory, shell line-editing interference, was tested
+    and found inconclusive on a single run), this switches to the
+    pattern with a 100% observed pass rate.
+    """
+    verbose("=" * C.DIVIDER_WIDTH)
+    verbose("Phase 3 — Flash")
+    verbose("=" * C.DIVIDER_WIDTH)
+    console_logger.info("Preparing to flash...")
+
+    url = f"http://{host_ip}:{port}/firmware.img"
+
+    if not _step09_source_reachable(d, host_ip, port, url):
+        return False
+
+    verbose(f"Flashing {flash_target} — this may take several minutes...")
+    console_logger.info("Flashing firmware — this may take several minutes...")
+    flash_script = _flash_script(url, flash_target, firmware_size)
     response, flash_error = with_spinner(
         d.run_script, flash_script,
         marker="step10_flash", exec_timeout=C.FLASH_TIMEOUT,
@@ -871,6 +881,39 @@ def phase4_postflash(d: SerialDevice) -> bool:
 # original menu_network_flashing()'s behavior of leaving flash_success
 # untouched on those early failures. Returns a bool (this module's own
 # print_report() verdict) once the journey actually ran.
+
+def _cleanup_flash_journey(journey, d) -> None:
+    """Stop the journey's HTTP server, delete any extracted rootfs, close serial."""
+    server = None
+    if journey is not None:
+        try:
+            server = journey.ctx.get("http_server")
+        except Exception:
+            pass
+        try:
+            extracted = journey.ctx.get("extracted_rootfs")
+            if extracted:
+                Path(extracted).unlink(missing_ok=True)
+        except Exception:
+            pass
+    if server:
+        server.shutdown()
+        verbose("HTTP server stopped")
+    if d:
+        d.disconnect()
+
+
+def _print_flash_banner(os_name: str, firmware_path, host_ip: str, http_port: int, device_ip) -> None:
+    print("=" * C.DIVIDER_WIDTH)
+    print("PHASE 2+: Flashing Firmware")
+    print("=" * C.DIVIDER_WIDTH)
+    fw_display = "auto-detected from USB" if Path(firmware_path) == Path(".") else str(firmware_path)
+    print(f"OS:          {os_name}")
+    print(f"Firmware:    {fw_display}")
+    print(f"Host IP:     {host_ip}:{http_port}")
+    print(f"Device IP:   {device_ip or '(not needed for this journey)'}")
+    print()
+
 
 def run_flash_journey(
     port: str,
@@ -950,15 +993,7 @@ def run_flash_journey(
             journey.ctx.device_ip  = device_net["ip"]
 
         print()
-        print("=" * C.DIVIDER_WIDTH)
-        print("PHASE 2+: Flashing Firmware")
-        print("=" * C.DIVIDER_WIDTH)
-        fw_display = "auto-detected from USB" if Path(firmware_path) == Path(".") else str(firmware_path)
-        print(f"OS:          {os_name}")
-        print(f"Firmware:    {fw_display}")
-        print(f"Host IP:     {host_ip}:{http_port}")
-        print(f"Device IP:   {journey.ctx.device_ip or '(not needed for this journey)'}")
-        print()
+        _print_flash_banner(os_name, firmware_path, host_ip, http_port, journey.ctx.device_ip)
 
         ok = journey.run()
 
@@ -969,23 +1004,7 @@ def run_flash_journey(
         print()
 
     finally:
-        server = None
-        if journey is not None:
-            try:
-                server = journey.ctx.get("http_server")
-            except Exception:
-                pass
-            try:
-                extracted = journey.ctx.get("extracted_rootfs")
-                if extracted:
-                    Path(extracted).unlink(missing_ok=True)
-            except Exception:
-                pass
-        if server:
-            server.shutdown()
-            verbose("HTTP server stopped")
-        if d:
-            d.disconnect()
+        _cleanup_flash_journey(journey, d)
 
     return print_report()
 

@@ -573,6 +573,51 @@ def _manual_download(d: SerialDevice, target: str) -> bool:
     return ok
 
 
+def _detect_update_target(d: SerialDevice) -> str:
+    """The medium `firmware update` will flash: the one NOT booted (boot_medium= on
+    the kernel cmdline); "emmc" when that cannot be read."""
+    try:
+        boot_output = d.run_script(
+            "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
+            marker="detect_boot_source", exec_timeout=BOOT_SOURCE_TIMEOUT
+        )
+    except RuntimeError as e:
+        logger.warning(f"run_firmware_update: could not detect boot source: {e}")
+        target = "emmc"  # default: assume booted from NOR, so flash eMMC
+    else:
+        if "boot_medium=emmc" in boot_output:
+            target = "qspi"
+        elif "boot_medium=qspi" in boot_output:
+            target = "emmc"
+        else:
+            logger.warning(
+                f"run_firmware_update: boot_medium not found in cmdline "
+                f"(got: {boot_output!r}) — defaulting to emmc target"
+            )
+            target = "emmc"
+    return target
+
+
+def _preserve_env_flags(caps: dict, preserve_env: bool, target: str) -> str:
+    """The --preserve-env flag (with its leading space) when wanted and supported, else "".
+    Tells the user what will happen to the env."""
+    flags = ""
+    if preserve_env:
+        if caps["preserve_env"]:
+            flags = " --preserve-env"
+        else:
+            console_logger.info("  (Older firmware tool: it always preserves the U-Boot env — no flag needed.)")
+    elif not caps["preserve_env"]:
+        console_logger.info(
+            "  ⚠ Older firmware tool: it cannot wipe the U-Boot env — "
+            "the existing env will be kept."
+        )
+    console_logger.info(f"  U-Boot env on {target}: {'preserved' if preserve_env or not caps['preserve_env'] else 'reset to factory defaults'}")
+
+    # Tier 1: the tool's own download.
+    return flags
+
+
 def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], None]] = None,
                          idle_timeout: float = STREAM_IDLE_TIMEOUT, max_total: float = STREAM_MAX_TOTAL,
                          preserve_env: Optional[bool] = None) -> bool:
@@ -614,25 +659,7 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     # Keys off boot_medium= (set by U-Boot's "emmc"/"recovery" boot
     # commands) — the same signal the tool itself uses. The old root=
     # grep made a detection FAILURE indistinguishable from an eMMC boot.
-    try:
-        boot_output = d.run_script(
-            "cat /proc/cmdline | grep -o 'boot_medium=[a-z]*' || echo 'boot_medium=unknown'",
-            marker="detect_boot_source", exec_timeout=BOOT_SOURCE_TIMEOUT
-        )
-    except RuntimeError as e:
-        logger.warning(f"run_firmware_update: could not detect boot source: {e}")
-        target = "emmc"  # default: assume booted from NOR, so flash eMMC
-    else:
-        if "boot_medium=emmc" in boot_output:
-            target = "qspi"
-        elif "boot_medium=qspi" in boot_output:
-            target = "emmc"
-        else:
-            logger.warning(
-                f"run_firmware_update: boot_medium not found in cmdline "
-                f"(got: {boot_output!r}) — defaulting to emmc target"
-            )
-            target = "emmc"
+    target = _detect_update_target(d)
 
     logger.info(f"run_firmware_update: will flash {target} (auto-detected by device)")
 
@@ -644,20 +671,8 @@ def run_firmware_update(d: SerialDevice, on_output: Optional[Callable[[str], Non
     # always preserves the env anyway, so plain `firmware update` gives
     # the "preserve" outcome there and "wipe" is simply unavailable.
     caps = firmware_tool_caps(d)
-    flags = ""
-    if preserve_env:
-        if caps["preserve_env"]:
-            flags = " --preserve-env"
-        else:
-            console_logger.info("  (Older firmware tool: it always preserves the U-Boot env — no flag needed.)")
-    elif not caps["preserve_env"]:
-        console_logger.info(
-            "  ⚠ Older firmware tool: it cannot wipe the U-Boot env — "
-            "the existing env will be kept."
-        )
-    console_logger.info(f"  U-Boot env on {target}: {'preserved' if preserve_env or not caps['preserve_env'] else 'reset to factory defaults'}")
+    flags = _preserve_env_flags(caps, preserve_env, target)
 
-    # Tier 1: the tool's own download.
     ok, output = _run_firmware_cmd(d, f"firmware update{flags}", on_output, idle_timeout, max_total)
     if ok:
         return True

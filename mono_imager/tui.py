@@ -474,33 +474,10 @@ class MonoImager:
         print()
 
         # OS selection — built dynamically from discovered journey files
-        from mono_imager.journeys import discovered_journeys
-
-        journeys = discovered_journeys()  # [(os_name, transfer), ...]
-
-        print("  Select OS and flash method:")
-        from mono_imager.journeys import get_transfer_label
-        for i, (os_name, transfer) in enumerate(journeys, 1):
-            print(f"    {i}) {os_name} via {get_transfer_label(os_name, transfer)}")
-        back_idx = len(journeys) + 1
-        print(f"    {back_idx}) Back")
-        print("  (Type 'exit!' at any prompt to escape to main menu)")
-        print()
-        os_choice = self.safe_input(f"  Select [1-{back_idx}]: ")
-        if os_choice is None:
+        picked = self._auto_pick_journey()
+        if picked is None:
             return
-
-        if os_choice == str(back_idx):
-            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
-            return
-
-        try:
-            os_name, transfer = journeys[int(os_choice) - 1]
-        except (ValueError, IndexError):
-            print("  ❌ Invalid selection.")
-            input("  Press Enter to continue...")
-            self.current_state = MenuState.NETWORK_AUTO_CONFIG
-            return
+        os_name, transfer = picked
 
         self.transfer_method = transfer
 
@@ -518,61 +495,12 @@ class MonoImager:
         # check, so this stays correct as journeys are added/changed.
         from mono_imager.step_registry import list_journey
         if "Device network ready" in list_journey(os_name, transfer):
-            print()
-            print("  +-----------------------------------------------------+")
-            print("  | ETHERNET CABLE REQUIRED                             |")
-            print("  |                                                     |")
-            print("  | The device needs its own network connection -       |")
-            print("  | both for the flash transfer itself, and for any     |")
-            print("  | post-flash 'firmware update' step, which needs      |")
-            print("  | direct internet access.                             |")
-            print("  | Connect an Ethernet cable to a router/switch that   |")
-            print("  | provides DHCP and internet access - the active      |")
-            print("  | port is auto-detected, no specific jack required.   |")
-            print("  | If no DHCP response comes back, you'll be           |")
-            print("  | prompted to enter the network settings manually.    |")
-            print("  +-----------------------------------------------------+")
-            print()
-            input("  Press Enter once the cable is plugged in...")
+            self._print_cable_notice()
 
-        print()
-        if transfer == "usb":
-            print("  Image will be auto-detected from USB stick.")
-            print("  Recommended: 16 GB minimum (holds all three OS images simultaneously).")
-            print()
-            firmware_path     = Path(".")
-            firmware_display  = "auto-detected from USB stick (16 GB min. recommended)"
-        else:
-            from mono_imager.journeys import get_firmware_prompt, get_journey_notice
-            notice = get_journey_notice(os_name, transfer)
-            if notice:
-                print(notice)
-                print()
-            firmware_prompt = get_firmware_prompt(os_name, transfer)
-            firmware_raw = self.safe_input(f"  {firmware_prompt} ")
-            if firmware_raw is None:
-                return
-            firmware_path, error = self._validate_firmware_path(firmware_raw)
-            if error:
-                print(f"  ❌ {error}")
-                input("  Press Enter to continue...")
-                self.current_state = MenuState.NETWORK_AUTO_CONFIG
-                return
-            firmware_display = str(firmware_path)
-
-            # Guard against an image whose real format does not match the
-            # chosen OS journey (e.g. a bzip2 OPNsense image via OpenWRT's
-            # raw dd) - that flashes "OK" but leaves an unbootable device.
-            from mono_imager.journeys import check_image_matches_os
-            _img_ok, _img_why = check_image_matches_os(os_name, firmware_path)
-            if not _img_ok:
-                print()
-                print(f"  ⚠ Image/OS mismatch: {_img_why}")
-                if self.safe_input("  Flash anyway? [y/N]: ") not in ("y", "Y"):
-                    print("  Cancelled.")
-                    input("  Press Enter to continue...")
-                    self.current_state = MenuState.NETWORK_AUTO_CONFIG
-                    return
+        fw = self._auto_firmware(os_name, transfer)
+        if fw is None:
+            return
+        firmware_path, firmware_display = fw
 
         host_ip = core.detect_host_ip()
         if not host_ip:
@@ -623,6 +551,100 @@ class MonoImager:
     #  been removed — they were unreachable and flash_orchestrator.py    #
     #  never used them anyway.)                                         #
     # ------------------------------------------------------------------ #
+    def _auto_pick_journey(self):
+        """Ask which (OS, transfer) journey to run; None when backing out or invalid
+        (the next state is already set)."""
+        from mono_imager.journeys import discovered_journeys
+
+        journeys = discovered_journeys()  # [(os_name, transfer), ...]
+
+        print("  Select OS and flash method:")
+        from mono_imager.journeys import get_transfer_label
+        for i, (os_name, transfer) in enumerate(journeys, 1):
+            print(f"    {i}) {os_name} via {get_transfer_label(os_name, transfer)}")
+        back_idx = len(journeys) + 1
+        print(f"    {back_idx}) Back")
+        print("  (Type 'exit!' at any prompt to escape to main menu)")
+        print()
+        os_choice = self.safe_input(f"  Select [1-{back_idx}]: ")
+        if os_choice is None:
+            return None
+
+        if os_choice == str(back_idx):
+            self.current_state = MenuState.FLASH_AUTO_OR_MANUAL
+            return None
+
+        try:
+            os_name, transfer = journeys[int(os_choice) - 1]
+        except (ValueError, IndexError):
+            print("  ❌ Invalid selection.")
+            input("  Press Enter to continue...")
+            self.current_state = MenuState.NETWORK_AUTO_CONFIG
+            return None
+        return os_name, transfer
+
+    @staticmethod
+    def _print_cable_notice():
+        """The device needs its own Ethernet connection for this journey."""
+        print()
+        print("  +-----------------------------------------------------+")
+        print("  | ETHERNET CABLE REQUIRED                             |")
+        print("  |                                                     |")
+        print("  | The device needs its own network connection -       |")
+        print("  | both for the flash transfer itself, and for any     |")
+        print("  | post-flash 'firmware update' step, which needs      |")
+        print("  | direct internet access.                             |")
+        print("  | Connect an Ethernet cable to a router/switch that   |")
+        print("  | provides DHCP and internet access - the active      |")
+        print("  | port is auto-detected, no specific jack required.   |")
+        print("  | If no DHCP response comes back, you'll be           |")
+        print("  | prompted to enter the network settings manually.    |")
+        print("  +-----------------------------------------------------+")
+        print()
+        input("  Press Enter once the cable is plugged in...")
+
+    def _auto_firmware(self, os_name: str, transfer: str):
+        """(firmware path, display text); None when cancelled or invalid (state set)."""
+        print()
+        if transfer == "usb":
+            print("  Image will be auto-detected from USB stick.")
+            print("  Recommended: 16 GB minimum (holds all three OS images simultaneously).")
+            print()
+            firmware_path     = Path(".")
+            firmware_display  = "auto-detected from USB stick (16 GB min. recommended)"
+        else:
+            from mono_imager.journeys import get_firmware_prompt, get_journey_notice
+            notice = get_journey_notice(os_name, transfer)
+            if notice:
+                print(notice)
+                print()
+            firmware_prompt = get_firmware_prompt(os_name, transfer)
+            firmware_raw = self.safe_input(f"  {firmware_prompt} ")
+            if firmware_raw is None:
+                return None
+            firmware_path, error = self._validate_firmware_path(firmware_raw)
+            if error:
+                print(f"  ❌ {error}")
+                input("  Press Enter to continue...")
+                self.current_state = MenuState.NETWORK_AUTO_CONFIG
+                return None
+            firmware_display = str(firmware_path)
+
+            # Guard against an image whose real format does not match the
+            # chosen OS journey (e.g. a bzip2 OPNsense image via OpenWRT's
+            # raw dd) - that flashes "OK" but leaves an unbootable device.
+            from mono_imager.journeys import check_image_matches_os
+            _img_ok, _img_why = check_image_matches_os(os_name, firmware_path)
+            if not _img_ok:
+                print()
+                print(f"  ⚠ Image/OS mismatch: {_img_why}")
+                if self.safe_input("  Flash anyway? [y/N]: ") not in ("y", "Y"):
+                    print("  Cancelled.")
+                    input("  Press Enter to continue...")
+                    self.current_state = MenuState.NETWORK_AUTO_CONFIG
+                    return None
+        return firmware_path, firmware_display
+
     def menu_network_flashing(self):
         """
         Run the actual flash journey. Bootstrap, U-Boot steps, recovery

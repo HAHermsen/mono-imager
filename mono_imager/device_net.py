@@ -113,12 +113,27 @@ class RecoveryNetwork:
         # Recovery Linux boots all eth ports administratively DOWN, so
         # LOWER_UP is never set until each candidate is brought up first.
         # Combined into a single round trip — each costs real seconds.
+        ifaces = self._live_ports(d, core)
+        if ifaces is None:
+            return False
+
+        if self._reuse_known_config(d, ifaces):
+            return True
+
+        dhcp = self._dhcp_on_ports(d, ifaces, rec)
+        if dhcp is not None:
+            return dhcp
+
+        return self._manual_until_done(d, ifaces)
+
+    def _live_ports(self, d, core) -> list | None:
+        """Bring every Ethernet port up; the ones with a cable (copper first), or None."""
         try:
             bring_up_cmd = "; ".join(f"ip link set eth{n} up 2>/dev/null" for n in range(C.ETH_IFACE_COUNT))
             d.run_script(bring_up_cmd, marker="recovery_eth_up", exec_timeout=ETH_SCRIPT_TIMEOUT)
         except Exception as e:
             print(f"  ❌ Failed to bring up Ethernet ports: {e}")
-            return False
+            return None
 
         try:
             # Poll for LOWER_UP instead of a blind sleep 2: returns as
@@ -142,37 +157,46 @@ class RecoveryNetwork:
                 ifaces = _copper_first(core.parse_active_eth_ifaces(ip_output))
                 if not ifaces:
                     print("  ❌ Still no Ethernet port with a cable detected.")
-                    return False
+                    return None
             print(f"  Port(s) reporting a link: {', '.join(ifaces)}")
         except Exception as e:
             print(f"  ❌ Failed to check Ethernet carrier: {e}")
-            return False
+            return None
 
+        return ifaces
+
+    def _reuse_known_config(self, d, ifaces: list) -> bool:
+        """
+        Cached config: re-apply on whichever candidate still reaches the
+        net (its own port first) - the working port can differ from the
+        previous boot. True when it still works; the cache is dropped if not.
+        """
+        if not self.config:
+            return False
+        net = self.config
+        order = ([net["iface"]] if net.get("iface") in ifaces else []) + \
+                [c for c in ifaces if c != net.get("iface")]
+        for cand in order:
+            print(f"  Re-applying known config on {cand}: {net['ip']}/{net['prefix']} via {net['gateway']}...")
+            if self._apply(d, cand, net) and self._verify(d, net["gateway"]):
+                self.verified = True
+                self.config = {**net, "iface": cand}
+                print(f"  ✓ Internet reachable via {cand} - network is ready.")
+                return True
+        print("  ⚠ Previously-working config no longer reachable - re-resolving...")
+        self.config = None
+        self.verified = False
+        return False
+
+    def _dhcp_on_ports(self, d, ifaces: list, rec) -> bool | None:
+        """DHCP on each port. True when one works, False when the user gives up
+        choosing between several, None when no port got a working lease."""
         # LOWER_UP is unreliable on this board: several internal ports
         # (SerDes/SFP side) report a link with NO external cable, so a
         # LOWER_UP count > 1 does NOT mean multiple cables (#19 false
         # positive). Find the real uplink by which candidate actually
         # obtains a working DHCP lease; only treat it as a genuine
         # multi-uplink (and prompt) if more than one truly reaches the net.
-
-        # Cached config: re-apply on whichever candidate still reaches the
-        # net - the working port can differ from the previous boot.
-        if self.config:
-            net = self.config
-            order = ([net["iface"]] if net.get("iface") in ifaces else []) + \
-                    [c for c in ifaces if c != net.get("iface")]
-            for cand in order:
-                print(f"  Re-applying known config on {cand}: {net['ip']}/{net['prefix']} via {net['gateway']}...")
-                if self._apply(d, cand, net) and self._verify(d, net["gateway"]):
-                    self.verified = True
-                    self.config = {**net, "iface": cand}
-                    print(f"  ✓ Internet reachable via {cand} - network is ready.")
-                    return True
-            print("  ⚠ Previously-working config no longer reachable - re-resolving...")
-            self.config = None
-            self.verified = False
-
-        # First time (or cache invalidated): DHCP-probe each candidate.
         working = []  # [(iface, lease)]
         for cand in ifaces:
             lease, _dhcp_err = with_spinner(
@@ -199,7 +223,10 @@ class RecoveryNetwork:
             self.config = {**lease, "source": "dhcp", "iface": iface}
             self.verified = True
             return True
+        return None
 
+    def _manual_until_done(self, d, ifaces: list) -> bool:
+        """Manual entry with a retry / pick-port / skip / give-up loop."""
         print()
         print("  ❌ No Ethernet port obtained a working DHCP lease.")
         print("  Falling back to manual network entry.")

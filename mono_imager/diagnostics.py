@@ -125,6 +125,53 @@ def test_serial(port: str) -> bool:
     return connected
 
 
+def _check_device_reaches_host(d, results: list, host_ip: str, start_http_server,
+                               wait_for_report) -> bool:
+    """
+    Serve a tiny file on the host and have the device fetch its headers,
+    reporting the HTTP code back over TCP/IP. False only when the host
+    server could not start (the caller stops there); the reachability
+    result itself is recorded in `results`.
+    """
+    http_port = C.LANTEST_HTTP_PORT
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tf:
+        _tf.write(b"LAN_TEST")
+        tmp = pathlib.Path(_tf.name)
+    server = start_http_server(host_ip, http_port, tmp)
+    if not console.check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
+        tmp.unlink(missing_ok=True)
+        return False
+
+    url = f"http://{host_ip}:{http_port}/firmware.img"
+    check_script = (
+        f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
+        f"> /tmp/lantest_code.txt; "
+        f"curl -sk -X POST --data-binary @/tmp/lantest_code.txt "
+        f"\"http://{host_ip}:{http_port}/report?step=lantest\" >/dev/null 2>&1"
+    )
+    try:
+        d.launch_script(check_script, marker="lantest")
+        report, _rep_err = with_spinner(
+            wait_for_report, "lantest", timeout=C.REPORT_TIMEOUT,
+            message="Waiting for device HTTP report..."
+        )
+        device_sees_host = report is not None and "200" in report
+    except Exception:
+        device_sees_host = False
+    finally:
+        server.shutdown()
+        tmp.unlink(missing_ok=True)
+
+    _curl_detail = (
+        "" if device_sees_host else
+        "device's network is up but can't reach the host — either port " f"{C.LANTEST_HTTP_PORT} is "
+        "blocked (allow Python.exe through Windows Defender Firewall) or the cable "
+        "doesn't connect to the SAME router/switch as the host"
+    )
+    console.check(results, "Device can reach host HTTP server", device_sees_host, _curl_detail)
+    return True
+
+
 def test_lan(
     port: str,
     host_ip: Optional[str],
@@ -179,43 +226,9 @@ def test_lan(
         device_net = get_device_net() or {}
         device_ip = device_net.get("ip")
 
-        http_port = C.LANTEST_HTTP_PORT
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tf:
-            _tf.write(b"LAN_TEST")
-            tmp = pathlib.Path(_tf.name)
-        server = start_http_server(host_ip, http_port, tmp)
-        if not console.check(results, f"HTTP server up on {host_ip}:{http_port}", server is not None):
-            tmp.unlink(missing_ok=True)
+        if not _check_device_reaches_host(d, results, host_ip, start_http_server, wait_for_report):
             input("\n  Press Enter to continue...")
             return None
-
-        url = f"http://{host_ip}:{http_port}/firmware.img"
-        check_script = (
-            f"curl -sk -I -o /dev/null -w '%{{http_code}}' {url} "
-            f"> /tmp/lantest_code.txt; "
-            f"curl -sk -X POST --data-binary @/tmp/lantest_code.txt "
-            f"\"http://{host_ip}:{http_port}/report?step=lantest\" >/dev/null 2>&1"
-        )
-        try:
-            d.launch_script(check_script, marker="lantest")
-            report, _rep_err = with_spinner(
-                wait_for_report, "lantest", timeout=C.REPORT_TIMEOUT,
-                message="Waiting for device HTTP report..."
-            )
-            device_sees_host = report is not None and "200" in report
-        except Exception:
-            device_sees_host = False
-        finally:
-            server.shutdown()
-            tmp.unlink(missing_ok=True)
-
-        _curl_detail = (
-            "" if device_sees_host else
-            "device's network is up but can't reach the host — either port " f"{C.LANTEST_HTTP_PORT} is "
-            "blocked (allow Python.exe through Windows Defender Firewall) or the cable "
-            "doesn't connect to the SAME router/switch as the host"
-        )
-        console.check(results, "Device can reach host HTTP server", device_sees_host, _curl_detail)
 
     finally:
         if d:

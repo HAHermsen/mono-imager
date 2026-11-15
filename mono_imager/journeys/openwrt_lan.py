@@ -131,6 +131,228 @@ def _md_be32(md_output: str) -> int:
             int(hex_b[2], 16) << 8  | int(hex_b[3], 16))
 
 
+def _validate_recovery_var(device, out: str) -> bool:
+    """
+    `out` is `printenv recovery` output that defines 'recovery'. True when
+    it can be kept as is. False after clearing it ('setenv recovery') when
+    it points to a non-kernel FIT, or to a gzip kernel without
+    kernel_comp_addr_r — the caller then falls through to the NOR repair.
+    """
+    if "sf read" not in out:
+        verbose("  ✓ 'recovery' is defined — no changes needed")
+        return True
+    # Extract NOR offset (2nd arg of "sf read <ram> <noroff> <size>")
+    parts = out.split("sf read")[-1].strip().split()
+    koffset = parts[1] if len(parts) >= 2 else ""
+    if not koffset:
+        verbose("  ✓ 'recovery' is defined — no changes needed")
+        return True
+    try:
+        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
+        device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {koffset} {FIT_HEADER_PROBE_LEN}", timeout=C.UBOOT_WRITE_TIMEOUT)
+        magic_out = device.send_command(f"md.b {C.UBOOT_LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
+        if C.FIT_MAGIC_HEX in magic_out:
+            return _validate_recovery_fit(device, koffset)
+        if C.GZIP_MAGIC_HEX in magic_out:
+            return _validate_recovery_gzip(device, koffset)
+        verbose("  ✓ 'recovery' is defined — no changes needed")
+        return True
+    except Exception:
+        verbose("  ✓ 'recovery' is defined (validation skipped)")
+        return True
+
+
+def _validate_recovery_fit(device, koffset: str) -> bool:
+    """'recovery' loads a FIT at `koffset`: keep it only if it is kernel-sized."""
+    size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
+    try:
+        fit_size = _md_be32(size_out)
+    except (ValueError, IndexError):
+        verbose("  ✓ 'recovery' is defined (validation skipped)")
+        return True
+    if fit_size < C.MIN_KERNEL_FIT_BYTES:
+        verbose(f"  ✗ 'recovery' points to a non-kernel FIT "
+                f"({fit_size / C.MIB:.1f} MB at {koffset}) — clearing...")
+        device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
+        return False
+    verbose(f"  ✓ 'recovery' confirmed — kernel FIT at {koffset} "
+            f"({fit_size / C.MIB:.1f} MB)")
+    return True
+
+
+def _validate_recovery_gzip(device, koffset: str) -> bool:
+    """
+    Gzip kernel (Image.gz / AArch64 booti path). Also verify
+    kernel_comp_addr_r is in NOR env — it gets wiped by 'env default -a'
+    and booti silently fails without it.
+    """
+    kc = device.send_command("printenv kernel_comp_addr_r", timeout=C.UBOOT_QUICK_TIMEOUT)
+    if "kernel_comp_addr_r=" in kc:
+        verbose(f"  ✓ 'recovery' confirmed — gzip kernel at {koffset}")
+        return True
+    verbose("  ✗ kernel_comp_addr_r missing — rebuilding recovery env...")
+    device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
+    return False
+
+
+def _set_kernel_comp_vars(device) -> None:
+    """booti needs these to decompress Image.gz; 'env default -a' wipes them."""
+    device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
+    device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
+
+
+def _save_openwrt_boot_env(device, keep_comp_vars: bool = False) -> None:
+    """
+    Set the official 'openwrt' command and bootcmd, saveenv, then mark this
+    (recovery) boot as NOR. `keep_comp_vars` re-persists the decompression
+    vars before saveenv — something (firmware update?) can wipe them between
+    runs, causing the next run to fall through to the slow NOR scan.
+    """
+    device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+    device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
+    if keep_comp_vars:
+        _set_kernel_comp_vars(device)
+    device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
+    device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
+
+
+# Primary env is typically at 0x300000; the redundant slot is at primary+size.
+# Both 128KB (0x20000) and 64KB (0x10000) size variants are tried.
+BACKUP_ENV_CANDIDATES = [
+    ("0x320000", "0x20000"),   # primary=0x300000 size=128KB
+    ("0x310000", "0x10000"),   # primary=0x300000 size=64KB
+    ("0x3F0000", "0x10000"),   # alternative near-end-of-flash layout
+    ("0x3E0000", "0x20000"),   # alternative layout
+]
+
+
+def _restore_recovery_from_backup_env(device):
+    """
+    Import U-Boot's redundant env copy from NOR (CRC-checked) and keep it
+    if it defines 'recovery'. Returns the step result, or None when no
+    candidate offset holds a usable env.
+    """
+    print("  'recovery' not found — attempting restore from NOR backup env...")
+    for offset, size in BACKUP_ENV_CANDIDATES:
+        verbose(f"  Trying backup env at NOR offset {offset} (size {size})...")
+        try:
+            device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
+            device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {offset} {size}", timeout=C.UBOOT_WRITE_TIMEOUT)
+            # -c checks CRC32; fails cleanly if data is not a valid env block
+            device.send_command(f"env import -c {C.UBOOT_LOAD_ADDR} {size}", timeout=C.UBOOT_CMD_TIMEOUT)
+            check = device.send_command("printenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
+            if "recovery=" in check:
+                verbose(f"  ✓ Restored 'recovery' from NOR backup at {offset}")
+                verbose(f"  {check.strip()}")
+                # Override bootcmd so OpenWRT boots after the flash.
+                # The restored factory bootcmd (e.g. 'run opnsense') won't work.
+                _save_openwrt_boot_env(device)
+                return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
+        except Exception as e:
+            verbose(f"  Candidate {offset} failed: {e}", "debug")
+            continue
+    return None
+
+
+def _sf_boot_cmd(koffset: str, dtb_offset, boot: str) -> str:
+    """'recovery' value: load the image at `koffset` (and the DTB, if any) and boot it."""
+    load_sz = C.NOR_KERNEL_LEN    # 32 MB — comfortably covers any recovery image
+    if dtb_offset:
+        return (
+            f"sf probe 0;"
+            f"sf read {C.UBOOT_DTB_ADDR} {dtb_offset} {C.NOR_DTB_LEN};"
+            f"sf read {C.UBOOT_LOAD_ADDR} {koffset} {load_sz};"
+            f"{boot} {C.UBOOT_LOAD_ADDR} - {C.UBOOT_DTB_ADDR}"
+        )
+    return (
+        f"sf probe 0;sf read {C.UBOOT_LOAD_ADDR} {koffset} {load_sz};"
+        f"{boot} {C.UBOOT_LOAD_ADDR}"
+    )
+
+
+def _probe_nor_offset(device, koffset: str, dtb_offset):
+    """
+    Identify the image at NOR `koffset`. Returns (recovery_cmd, dtb_offset):
+    recovery_cmd is None when nothing bootable is there; dtb_offset is
+    updated when a small FDT (raw DTB or external-FIT header) is found.
+    """
+    device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {koffset} 0x100", timeout=C.UBOOT_WRITE_TIMEOUT)
+    magic_out = device.send_command(f"md.b {C.UBOOT_LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
+
+    # ── Large standalone FIT (kernel+initrd inline) ──────────────
+    if C.FIT_MAGIC_HEX in magic_out:
+        size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
+        try:
+            fit_size = _md_be32(size_out)
+        except (ValueError, IndexError):
+            fit_size = 0
+        if fit_size < C.MIN_KERNEL_FIT_BYTES:
+            # Small FDT: either raw DTB or external-FIT header —
+            # remember it in case we find the kernel (gzip) later.
+            verbose(f"  DTB/ext-FIT at {koffset} ({fit_size / C.KIB:.1f} KB) — noted")
+            return None, dtb_offset if dtb_offset is not None else koffset
+        verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size / C.MIB:.1f} MB)")
+        if dtb_offset:
+            # FIT has no embedded FDT — pair with the DTB found earlier.
+            # fdt_high prevents U-Boot from relocating the FDT below the kernel.
+            device.send_command(f"setenv fdt_high {C.UBOOT_FDT_HIGH_NO_RELOC}", timeout=C.UBOOT_QUICK_TIMEOUT)
+        return _sf_boot_cmd(koffset, dtb_offset, "bootm"), dtb_offset
+
+    # ── Legacy uImage ─────────────────────────────────────────────
+    if C.UIMAGE_MAGIC_HEX in magic_out:
+        verbose(f"  ✓ uImage at {koffset}")
+        return _sf_boot_cmd(koffset, None, "bootm"), dtb_offset
+
+    # ── Gzip compressed ARM64 Image.gz ───────────────────────────
+    if C.GZIP_MAGIC_HEX in magic_out:
+        verbose(f"  ✓ Gzip kernel at {koffset}")
+        cmd = _sf_boot_cmd(koffset, dtb_offset, "booti")
+        _set_kernel_comp_vars(device)
+        return cmd, dtb_offset
+
+    return None, dtb_offset  # no interesting magic at this offset
+
+
+def _scan_nor_for_recovery(device) -> bool:
+    """
+    Scan 64 MB NOR in 1 MB steps for any bootable image magic.
+    Detection map (confirmed on this Mono Gateway dk / LS1046A):
+      0x500000 = DTB or small FIT header (d0 0d fe ed, ~38 KB) — remember it
+      0xa00000 = gzip compressed ARM64 Image.gz  (1f 8b)       — kernel here
+    When gzip is found, pair with any earlier DTB offset to build a booti
+    command; FIT and uImage boot with bootm. Only lines for non-trivial
+    finds are printed.
+    """
+    print("  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
+    kernel_offsets = [f"0x{off:x}" for off in range(NOR_SCAN_START, NOR_SCAN_END, NOR_SCAN_STEP)]
+
+    try:
+        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
+    except Exception as e:
+        verbose(f"  sf probe failed: {e}", "error")
+        verbose("  Manual fix: setenv recovery \"<sf load cmd>\" && saveenv", "error")
+        return step(0, "U-Boot 'recovery' variable missing — sf probe failed", False)
+
+    dtb_offset = None   # first small FDT found (potential DTB or ext-FIT header)
+    with Spinner(f"Scanning NOR ({len(kernel_offsets)} offsets)..."):
+        for koffset in kernel_offsets:
+            try:
+                recovery_cmd, dtb_offset = _probe_nor_offset(device, koffset, dtb_offset)
+                if recovery_cmd is None:
+                    continue
+                device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=C.UBOOT_CMD_TIMEOUT)
+                _save_openwrt_boot_env(device)
+                return step(0, f"U-Boot 'recovery' reconstructed — NOR {koffset}", True)
+            except Exception as e:
+                verbose(f"  Probe at {koffset} failed: {e}", "debug")
+                continue
+
+    verbose("  ✗ No recovery kernel found anywhere in NOR flash", "error")
+    verbose("  Manual fix: on a working device run 'printenv recovery' then", "error")
+    verbose("  on this device: setenv recovery \"<value>\" && saveenv", "error")
+    return step(0, "U-Boot 'recovery' variable missing — recovery image not found", False)
+
+
 def _uboot_steps_openwrt_lan(device) -> bool:
     """
     Ensure the 'recovery' U-Boot variable is defined so that boot_recovery()
@@ -148,9 +370,9 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     Tries several candidate backup offsets common on NXP LS1046A SPI NOR.
     If any succeeds, the full factory env (including 'recovery') is restored,
     then a correct bootcmd for OpenWRT/extlinux is set, and the result is
-    saved back to NOR.
+    saved back to NOR. Failing that, NOR is scanned for the recovery kernel.
 
-    If all candidates fail, the step fails with instructions for manual repair.
+    If everything fails, the step fails with instructions for manual repair.
     """
     print("  Checking U-Boot 'recovery' variable...")
 
@@ -160,224 +382,16 @@ def _uboot_steps_openwrt_lan(device) -> bool:
     try:
         out = device.send_command("printenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
         verbose(f"  {out.strip()}")
-        if "recovery=" in out:
-            recovery_confirmed = False
-            if "sf read" in out:
-                # Extract NOR offset (2nd arg of "sf read <ram> <noroff> <size>")
-                parts = out.split("sf read")[-1].strip().split()
-                koffset = parts[1] if len(parts) >= 2 else ""
-                if koffset:
-                    try:
-                        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
-                        device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {koffset} {FIT_HEADER_PROBE_LEN}", timeout=C.UBOOT_WRITE_TIMEOUT)
-                        magic_out = device.send_command(f"md.b {C.UBOOT_LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
-                        if C.FIT_MAGIC_HEX in magic_out:
-                            size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
-                            try:
-                                fit_size = _md_be32(size_out)
-                                if fit_size < C.MIN_KERNEL_FIT_BYTES:
-                                    verbose(f"  ✗ 'recovery' points to a non-kernel FIT "
-                                            f"({fit_size / C.MIB:.1f} MB at {koffset}) — clearing...")
-                                    device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
-                                    # fall through to NOR scan
-                                else:
-                                    verbose(f"  ✓ 'recovery' confirmed — kernel FIT at {koffset} "
-                                            f"({fit_size / C.MIB:.1f} MB)")
-                                    recovery_confirmed = True
-                            except (ValueError, IndexError):
-                                verbose("  ✓ 'recovery' is defined (validation skipped)")
-                                recovery_confirmed = True
-                        elif C.GZIP_MAGIC_HEX in magic_out:
-                            # Gzip kernel (Image.gz / AArch64 booti path).
-                            # Also verify kernel_comp_addr_r is in NOR env —
-                            # it gets wiped by 'env default -a' and booti
-                            # silently fails without it.
-                            kc = device.send_command("printenv kernel_comp_addr_r", timeout=C.UBOOT_QUICK_TIMEOUT)
-                            if "kernel_comp_addr_r=" in kc:
-                                verbose(f"  ✓ 'recovery' confirmed — gzip kernel at {koffset}")
-                                recovery_confirmed = True
-                            else:
-                                verbose("  ✗ kernel_comp_addr_r missing — rebuilding recovery env...")
-                                device.send_command("setenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
-                                # fall through to NOR scan
-                        else:
-                            verbose("  ✓ 'recovery' is defined — no changes needed")
-                            recovery_confirmed = True
-                    except Exception:
-                        verbose("  ✓ 'recovery' is defined (validation skipped)")
-                        recovery_confirmed = True
-                else:
-                    verbose("  ✓ 'recovery' is defined — no changes needed")
-                    recovery_confirmed = True
-            else:
-                verbose("  ✓ 'recovery' is defined — no changes needed")
-                recovery_confirmed = True
-
-            if recovery_confirmed:
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                # Re-persist decompression vars — something (firmware update?) can wipe them
-                # between runs, causing the next run to fall through to the slow NOR scan.
-                device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
-                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
-                return step(0, "U-Boot 'recovery' variable confirmed present", True)
+        if "recovery=" in out and _validate_recovery_var(device, out):
+            _save_openwrt_boot_env(device, keep_comp_vars=True)
+            return step(0, "U-Boot 'recovery' variable confirmed present", True)
     except Exception as e:
         verbose(f"  printenv recovery: {e}", "warning")
 
-    # 'recovery' is missing — attempt NOR backup env restoration.
-    # Primary env is typically at 0x300000; redundant slot is at primary+size.
-    # Try both 128KB (0x20000) and 64KB (0x10000) size variants.
-    print("  'recovery' not found — attempting restore from NOR backup env...")
-    CANDIDATES = [
-        ("0x320000", "0x20000"),   # primary=0x300000 size=128KB
-        ("0x310000", "0x10000"),   # primary=0x300000 size=64KB
-        ("0x3F0000", "0x10000"),   # alternative near-end-of-flash layout
-        ("0x3E0000", "0x20000"),   # alternative layout
-    ]
-
-    for offset, size in CANDIDATES:
-        verbose(f"  Trying backup env at NOR offset {offset} (size {size})...")
-        try:
-            device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
-            device.send_command(f"sf read {C.UBOOT_LOAD_ADDR} {offset} {size}", timeout=C.UBOOT_WRITE_TIMEOUT)
-            # -c checks CRC32; fails cleanly if data is not a valid env block
-            device.send_command(f"env import -c {C.UBOOT_LOAD_ADDR} {size}", timeout=C.UBOOT_CMD_TIMEOUT)
-            check = device.send_command("printenv recovery", timeout=C.UBOOT_QUICK_TIMEOUT)
-            if "recovery=" in check:
-                verbose(f"  ✓ Restored 'recovery' from NOR backup at {offset}")
-                verbose(f"  {check.strip()}")
-                # Override bootcmd so OpenWRT boots after the flash.
-                # The restored factory bootcmd (e.g. 'run opnsense') won't work.
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
-                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
-                return step(0, f"U-Boot 'recovery' restored from NOR backup ({offset})", True)
-        except Exception as e:
-            verbose(f"  Candidate {offset} failed: {e}", "debug")
-            continue
-
-    # ── Phase 2: scan NOR for the recovery kernel ───────────────────────
-    # Scan 64 MB NOR in 1 MB steps looking for any bootable image magic.
-    # Detection map (confirmed on this Mono Gateway dk / LS1046A):
-    #   0x500000 = DTB or small FIT header (d0 0d fe ed, ~38 KB) — remember it
-    #   0xa00000 = gzip compressed ARM64 Image.gz  (1f 8b)       — kernel here
-    # When gzip is found, pair with any earlier DTB offset to build a
-    # booti command.  Also try external-FIT (bootm) as fallback in the
-    # same 'recovery' variable so U-Boot tries both automatically.
-    # Only print lines when something non-trivial is found.
-    print("  NOR backup env unavailable — scanning NOR for recovery kernel (~60-90s)...")
-
-    FIT_MAGIC  = C.FIT_MAGIC_HEX
-    UIMG_MAGIC = C.UIMAGE_MAGIC_HEX
-    GZIP_MAGIC = C.GZIP_MAGIC_HEX
-    LOAD_ADDR  = C.UBOOT_LOAD_ADDR
-    DTB_ADDR   = C.UBOOT_DTB_ADDR    # separate RAM area for DTB when using booti
-    LOAD_SZ    = C.NOR_KERNEL_LEN    # 32 MB — comfortably covers any recovery image
-
-    KERNEL_OFFSETS = [f"0x{off:x}" for off in range(NOR_SCAN_START, NOR_SCAN_END, NOR_SCAN_STEP)]
-
-    try:
-        device.send_command("sf probe 0", timeout=C.UBOOT_CMD_TIMEOUT)
-    except Exception as e:
-        verbose(f"  sf probe failed: {e}", "error")
-        verbose("  Manual fix: setenv recovery \"<sf load cmd>\" && saveenv", "error")
-        return step(0, "U-Boot 'recovery' variable missing — sf probe failed", False)
-
-    dtb_offset = None   # first small FDT found (potential DTB or ext-FIT header)
-
-    with Spinner(f"Scanning NOR ({len(KERNEL_OFFSETS)} offsets)..."):
-        for koffset in KERNEL_OFFSETS:
-            try:
-                device.send_command(f"sf read {LOAD_ADDR} {koffset} 0x100", timeout=C.UBOOT_WRITE_TIMEOUT)
-                magic_out = device.send_command(f"md.b {LOAD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
-
-                # ── Large standalone FIT (kernel+initrd inline) ──────────────
-                if FIT_MAGIC in magic_out:
-                    size_out = device.send_command(f"md.b {_FIT_SIZE_FIELD_ADDR} 4", timeout=C.UBOOT_QUICK_TIMEOUT)
-                    try:
-                        fit_size = _md_be32(size_out)
-                    except (ValueError, IndexError):
-                        fit_size = 0
-
-                    if fit_size >= C.MIN_KERNEL_FIT_BYTES:
-                        verbose(f"  ✓ Kernel FIT at {koffset} ({fit_size / C.MIB:.1f} MB)")
-                        if dtb_offset:
-                            # FIT has no embedded FDT — pair with the DTB found earlier.
-                            # fdt_high prevents U-Boot from relocating the FDT below the kernel.
-                            device.send_command(f"setenv fdt_high {C.UBOOT_FDT_HIGH_NO_RELOC}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                            recovery_cmd = (
-                                f"sf probe 0;"
-                                f"sf read {DTB_ADDR} {dtb_offset} {C.NOR_DTB_LEN};"
-                                f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                                f"bootm {LOAD_ADDR} - {DTB_ADDR}"
-                            )
-                        else:
-                            recovery_cmd = (
-                                f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                                f"bootm {LOAD_ADDR}"
-                            )
-                        # fall through to save & return below
-                    else:
-                        # Small FDT: either raw DTB or external-FIT header —
-                        # remember it in case we find the kernel (gzip) later.
-                        verbose(f"  DTB/ext-FIT at {koffset} ({fit_size / C.KIB:.1f} KB) — noted")
-                        if dtb_offset is None:
-                            dtb_offset = koffset
-                        continue
-
-                # ── Legacy uImage ─────────────────────────────────────────────
-                elif UIMG_MAGIC in magic_out:
-                    verbose(f"  ✓ uImage at {koffset}")
-                    recovery_cmd = (
-                        f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                        f"bootm {LOAD_ADDR}"
-                    )
-
-                # ── Gzip compressed ARM64 Image.gz ───────────────────────────
-                elif GZIP_MAGIC in magic_out:
-                    verbose(f"  ✓ Gzip kernel at {koffset}")
-                    if dtb_offset:
-                        recovery_cmd = (
-                            f"sf probe 0;"
-                            f"sf read {DTB_ADDR} {dtb_offset} {C.NOR_DTB_LEN};"
-                            f"sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                            f"booti {LOAD_ADDR} - {DTB_ADDR}"
-                        )
-                        device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                        device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                    else:
-                        recovery_cmd = (
-                            f"sf probe 0;sf read {LOAD_ADDR} {koffset} {LOAD_SZ};"
-                            f"booti {LOAD_ADDR}"
-                        )
-                        device.send_command(f"setenv kernel_comp_addr_r {C.UBOOT_KERNEL_COMP_ADDR}", timeout=C.UBOOT_QUICK_TIMEOUT)
-                        device.send_command(f"setenv kernel_comp_size {C.UBOOT_KERNEL_COMP_SIZE}", timeout=C.UBOOT_QUICK_TIMEOUT)
-
-                else:
-                    continue  # no interesting magic at this offset
-
-                device.send_command(f'setenv recovery "{recovery_cmd}"', timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command(_UBOOT_SET_EMMC_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command(_UBOOT_SET_BOOTCMD_CMD, timeout=C.UBOOT_CMD_TIMEOUT)
-                device.send_command("saveenv", timeout=C.UBOOT_WRITE_TIMEOUT)
-                device.send_command(_UBOOT_BOOTARGS_NOR_CMD, timeout=C.UBOOT_QUICK_TIMEOUT)
-                return step(
-                    0,
-                    f"U-Boot 'recovery' reconstructed — NOR {koffset}",
-                    True
-                )
-
-            except Exception as e:
-                verbose(f"  Probe at {koffset} failed: {e}", "debug")
-                continue
-
-    verbose("  ✗ No recovery kernel found anywhere in NOR flash", "error")
-    verbose("  Manual fix: on a working device run 'printenv recovery' then", "error")
-    verbose("  on this device: setenv recovery \"<value>\" && saveenv", "error")
-    return step(0, "U-Boot 'recovery' variable missing — recovery image not found", False)
+    restored = _restore_recovery_from_backup_env(device)
+    if restored is not None:
+        return restored
+    return _scan_nor_for_recovery(device)
 
 
 register_uboot_steps(OS, TRANSFER, _uboot_steps_openwrt_lan)
