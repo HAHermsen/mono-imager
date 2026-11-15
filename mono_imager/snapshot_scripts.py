@@ -519,7 +519,7 @@ def build_gpt_fix_script(dev: Optional[str] = None) -> str:
 OD_ARGS = "-v -b"
 
 
-def build_dump_script(src: str, skip: int, count: int, bs: int = 512) -> str:  # 512 = S.SECTOR
+def build_dump_script(src: str, skip: int, count: int, bs: int = 512) -> str:  # 512 = SECTOR
     """Octal dump of `count` blocks of `bs` bytes of `src`, starting at block `skip`."""
     return (f"dd if={src} bs={bs} skip={skip} count={count} 2>/dev/null | od {OD_ARGS}; "
             "echo DUMP_DONE=1\n")

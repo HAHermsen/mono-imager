@@ -254,7 +254,7 @@ def _restore_on_device(d, *, info: dict, dip_now: str, transfer: str, host_ip: s
                        auto_snapshot: bool, ask: Callable, servers: list) -> bool:
     """
     Everything that needs recovery Linux. False when it ended early (after the
-    failing SO.step), True when it ran to the end. A started server is put in
+    failing step), True when it ran to the end. A started server is put in
     `servers` so the caller can shut it down.
     """
     from mono_imager.snapshot_server import SnapshotSession, start_snapshot_server

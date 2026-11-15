@@ -471,7 +471,12 @@ def snapshot_has_gpt(folder: Path, manifest: dict) -> bool:
 
 
 # --- Re-exports: the device-script builders and the health check live in their own
-# modules (import this module, not those). Must stay at the bottom: they import
-# the constants above.
-from mono_imager.snapshot_checks import *
-from mono_imager.snapshot_scripts import *
+# modules. Resolved lazily: a star import at the bottom would silently come up empty
+# when one of those modules is imported first (they import this one back).
+def __getattr__(name: str):
+    import importlib
+    for mod in ("mono_imager.snapshot_checks", "mono_imager.snapshot_scripts"):
+        m = importlib.import_module(mod)
+        if name in m.__all__:
+            return getattr(m, name)
+    raise AttributeError(f"module 'mono_imager.snapshot' has no attribute {name!r}")
