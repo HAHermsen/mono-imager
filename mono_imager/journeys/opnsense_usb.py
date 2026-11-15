@@ -17,13 +17,14 @@ License: GPLv3
 """
 
 import logging
-from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
-from mono_imager.spinner import with_spinner, Spinner
-from mono_imager.flash_orchestrator import step, verbose, console_logger
-from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
-from mono_imager.journeys.opnsense_lan import _uboot_steps_opnsense_lan
+
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import console_logger, step
 from mono_imager.journeys import _common  # noqa: F401 — registers "Device network ready" step
+from mono_imager.journeys import _usb_steps as _usb
+from mono_imager.journeys import opnsense_lan as _lan
+from mono_imager.spinner import with_spinner
+from mono_imager.step_registry import StepContext, register_step, register_uboot_steps
 
 logger = logging.getLogger(__name__)
 
@@ -32,51 +33,20 @@ FIRMWARE_PROMPT = "Type the full path (or drag-n-drop) of the OPNsense .img.bz2 
 TRANSFER = "usb"
 
 
-register_uboot_steps(OS, TRANSFER, _uboot_steps_opnsense_lan)
+register_uboot_steps(OS, TRANSFER, _lan._uboot_steps_opnsense_lan)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["dip_confirmed_nor"], label="Confirm DIP switch is RIGHT (NOR)")
-def step_confirm_dip_nor(ctx: StepContext) -> bool:
-    console_logger.info("")
-    console_logger.info("  ┌─────────────────────────────────────────────────┐")
-    console_logger.info("  │  START HERE: DIP switch → RIGHT (NOR)            │")
-    console_logger.info("  │                                                   │")
-    console_logger.info("  │  OPNsense flashes and boots entirely from NOR.   │")
-    console_logger.info("  │  Keep DIP RIGHT throughout — do NOT flip to LEFT. │")
-    console_logger.info("  └─────────────────────────────────────────────────┘")
-    console_logger.info("")
-    try:
-        input("  Confirm DIP is RIGHT and press ENTER to continue... ")
-    except KeyboardInterrupt:
-        return step(0, "DIP confirmed NOR", False, "interrupted")
-    return step(0, "DIP confirmed NOR (RIGHT)", True)
+step_confirm_dip_nor = register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["dip_confirmed_nor"], label="Confirm DIP switch is RIGHT (NOR)")(
+    _lan.step_confirm_dip_nor)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["dip_confirmed_nor"], produces=["usb_mounted"], label="Mount USB stick")
-def step_mount_usb(ctx: StepContext) -> bool:
-    d = ctx.device
-    try:
-        # Mount whichever partition holds the image, not blindly sda1 (#26).
-        with Spinner("Mounting USB stick..."):
-            part, _has_image, detail = mount_usb_stick(d, ctx.usb_device, ctx.usb_mount, [OS])
-        ok = part is not None
-        if ok:
-            check_usb_size(d, ctx.usb_mount)
-        return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
-                    detail[-C.LOG_TAIL_SHORT:] if not ok else "")
-    except Exception as e:
-        return step(0, "USB mount", False, str(e))
+step_mount_usb = register_step(os=[OS], transfer=[TRANSFER], requires=["dip_confirmed_nor"], produces=["usb_mounted"], label="Mount USB stick")(
+    _usb.mount_usb_step(OS))
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["usb_mounted"], produces=["firmware_ready"], label="Detect firmware file on USB")
-def step_firmware_on_usb(ctx: StepContext) -> bool:
-    path, fmt = find_image_on_usb(ctx.device, ctx.usb_mount, OS)
-    if not path:
-        return step(0, "Firmware found on USB", False,
-                    "no OPNsense image found — expected opnsense*.img.bz2 or opnsense*.img")
-    ctx.set("firmware_source", path)
-    ctx.set("firmware_format", fmt)
-    return step(0, f"Firmware found on USB ({path})", True)
+step_firmware_on_usb = register_step(os=[OS], transfer=[TRANSFER], requires=["usb_mounted"], produces=["firmware_ready"], label="Detect firmware file on USB")(
+    _usb.firmware_on_usb_step(
+        OS, "no OPNsense image found — expected opnsense*.img.bz2 or opnsense*.img"))
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash OPNsense image (bzip2 | dd)")
@@ -111,57 +81,17 @@ def step_flash_opnsense(ctx: StepContext) -> bool:
     return has_records and not has_error
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")
-def step_unmount_usb(ctx: StepContext) -> bool:
-    try:
-        with Spinner("Unmounting USB stick..."):
-            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
-        return step(0, f"USB unmounted ({ctx.usb_mount})", True)
-    except Exception as e:
-        verbose(f"⚠ USB unmount warning: {e}", "warning")
-        return step(0, "USB unmount", True)
+step_unmount_usb = register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")(
+    _usb.step_unmount_usb)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["device_mac_known"], label="Detect device MAC address")
-def step_detect_mac(ctx: StepContext) -> bool:
-    d = ctx.device
-    iface = (ctx.device_net or {}).get("iface", C.DEFAULT_ETH_IFACE)
-    try:
-        result = d.run_script(f"cat /sys/class/net/{iface}/address 2>/dev/null || echo unknown", marker="get_mac", exec_timeout=C.SHELL_QUICK_TIMEOUT)
-        mac = result.strip()
-        if mac and mac != "unknown" and ":" in mac:
-            ctx.device_mac = mac
-            ctx.set("device_mac", mac)
-            ctx.set("device_mac_known", mac)
-            verbose(f"✓ MAC: {mac}")
-            return step(0, f"Device MAC detected ({mac})", True)
-    except Exception as e:
-        verbose(f"⚠ MAC detection failed: {e}", "warning")
-    ctx.set("device_mac_known", None)
-    step(0, "Device MAC detection", True, "warning: detection failed — will prompt at re-image step")
-    return True
+step_detect_mac = register_step(os=[OS], transfer=[TRANSFER], requires=["network_up"], produces=["device_mac_known"], label="Detect device MAC address")(
+    _lan.step_detect_mac)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known", "network_up"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")
-def step_reimage_emmc_firmware(ctx: StepContext) -> bool:
-    from mono_imager.recovery_orchestrator import run_firmware_update
-    d = ctx.device
-    try:
-        with Spinner("Re-imaging eMMC firmware (firmware update)..."):
-            ok = run_firmware_update(d)
-        return step(0, "eMMC firmware re-image (firmware update)", ok)
-    except Exception as e:
-        return step(0, "eMMC firmware re-image (firmware update)", False, str(e))
+step_reimage_emmc_firmware = register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed", "device_mac_known", "network_up"], produces=["emmc_firmware_reimaged"], label="Re-image eMMC firmware (firmware update)")(
+    _lan.step_reimage_emmc_firmware)
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_firmware_reimaged"], produces=["rebooted"], label="Reboot into OPNsense")
-def step_reboot(ctx: StepContext) -> bool:
-    console_logger.info("")
-    console_logger.info("✓ Rebooting — U-Boot will boot OPNsense from eMMC automatically.")
-    console_logger.info("  DIP stays RIGHT (NOR). No action needed.")
-    console_logger.info("")
-    try:
-        ctx.device.send_command("reboot", wait_for_prompt=False, timeout=C.REBOOT_CMD_TIMEOUT)
-    except Exception as e:
-        verbose(f"⚠ Reboot warning: {e}", "warning")
-    return step(0, "Reboot sent — OPNsense booting from eMMC", True)
+step_reboot = register_step(os=[OS], transfer=[TRANSFER], requires=["emmc_firmware_reimaged"], produces=["rebooted"], label="Reboot into OPNsense")(
+    _lan.step_reboot)

@@ -4,7 +4,6 @@
     "assignment": 16,
     "attr-defined": 55,
     "call-overload": 1,
-    "import-not-found": 1,
     "index": 29,
     "list-item": 1,
     "operator": 3,
@@ -13,11 +12,11 @@
     "var-annotated": 8
   },
   "ruff": {
-    "BLE001": 102,
+    "BLE001": 95,
     "DTZ001": 2,
     "DTZ005": 2,
     "F841": 1,
-    "I001": 42,
+    "I001": 38,
     "ISC004": 12,
     "PLR1711": 1,
     "RET501": 1,

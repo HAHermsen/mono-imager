@@ -24,13 +24,16 @@ License: GPLv3
 """
 
 import getpass
-import hashlib
 import re
 import struct
 import time
 
-from mono_imager.flash_orchestrator import verbose
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import verbose
+from mono_imager.snapshot import (  # noqa: F401 — shared with snapshot.py; V.sha256_file is public
+    printf_octal,
+    sha256_file,
+)
 
 # --- Constants ----------------------------------------------------------------
 
@@ -140,14 +143,6 @@ SOURCE_NOTICE = (
 
 # --- Host-side helpers (no device involved) ----------------------------------
 
-def sha256_file(path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def ask_vyos_password(read=getpass.getpass, out=print) -> str:
     """
     Ask (twice, hidden) for the password `install image` will set for the
@@ -227,12 +222,6 @@ def stage_partition_table(layout, base_lba: int = STAGE_BASE_LBA) -> bytes:
     p1, p2 = layout["p1"], layout["p2"]
     return (entry(p1, MBR_INACTIVE) + entry(p2, MBR_BOOTABLE)
             + b"\x00" * (MBR_ENTRY_SIZE * (MBR_ENTRIES - 2)) + BOOT_SIGNATURE)
-
-
-def printf_octal(data: bytes) -> str:
-    """`data` as a printf format string of octal escapes (POSIX printf
-    and BusyBox printf both understand \\ooo)."""
-    return "".join(f"\\{b:03o}" for b in data)
 
 
 def read_fat32_file(path, part_offset: int, name: str) -> bytes:

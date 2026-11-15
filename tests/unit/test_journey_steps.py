@@ -53,6 +53,7 @@ from mono_imager.journeys import _common, usb_utils as U
 from mono_imager.journeys import opnsense_lan as OL, opnsense_usb as OU
 from mono_imager.journeys import openwrt_lan as WL, openwrt_usb as WU
 from mono_imager.journeys import armbian_lan as AL, armbian_usb as AU
+from mono_imager.journeys import _usb_steps as US
 
 passed = 0
 failed = 0
@@ -176,20 +177,21 @@ check("launch fails -> False", OL.step_flash_opnsense(c) is False)
 # ============================================================================
 section("USB journeys: mount, image detection, unmount")
 for mod, osn in ((OU, "OPNsense"), (WU, "OpenWRT"), (AU, "Armbian")):
-    with patch.object(mod, "mount_usb_stick", return_value=("/dev/sda2", True, "")), \
-         patch.object(mod, "check_usb_size") as cs:
+    with patch.object(US, "mount_usb_stick", return_value=("/dev/sda2", True, "")) as mu, \
+         patch.object(US, "check_usb_size") as cs:
         check(f"{osn}: mounted -> True, size checked", mod.step_mount_usb(ctx()) is True and cs.called)
-    with patch.object(mod, "mount_usb_stick", return_value=(None, False, "no partitions\n")), \
-         patch.object(mod, "check_usb_size") as cs:
+        check(f"{osn}: mount looks for this OS's image", mu.call_args.args[3] == [osn])
+    with patch.object(US, "mount_usb_stick", return_value=(None, False, "no partitions\n")), \
+         patch.object(US, "check_usb_size") as cs:
         check(f"{osn}: nothing mounted -> False, no size check", mod.step_mount_usb(ctx()) is False
               and not cs.called and "no partitions" in last()[0][3])
-    with patch.object(mod, "mount_usb_stick", side_effect=RuntimeError("serial")):
+    with patch.object(US, "mount_usb_stick", side_effect=RuntimeError("serial")):
         check(f"{osn}: mount raises -> False", mod.step_mount_usb(ctx()) is False)
     c = ctx()
-    with patch.object(mod, "find_image_on_usb", return_value=("/mnt/usb/x.img", "img")):
+    with patch.object(US, "find_image_on_usb", return_value=("/mnt/usb/x.img", "img")):
         check(f"{osn}: image found -> source + format stored", mod.step_firmware_on_usb(c) is True
               and c.get("firmware_source") == "/mnt/usb/x.img" and c.get("firmware_format") == "img")
-    with patch.object(mod, "find_image_on_usb", return_value=(None, None)):
+    with patch.object(US, "find_image_on_usb", return_value=(None, None)):
         check(f"{osn}: no image -> False", mod.step_firmware_on_usb(ctx()) is False)
     c = ctx()
     check(f"{osn}: unmount -> True", mod.step_unmount_usb(c) is True

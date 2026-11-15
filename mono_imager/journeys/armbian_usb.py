@@ -21,12 +21,13 @@ License: GPLv3
 """
 
 import logging
-from mono_imager.step_registry import register_step, StepContext
-from mono_imager.spinner import with_spinner, Spinner
-from mono_imager.flash_orchestrator import step, verbose, console_logger
-from mono_imager.journeys.usb_utils import find_image_on_usb, check_usb_size, mount_usb_stick
-from mono_imager.journeys.armbian_lan import _flip_to_emmc_and_verify, _refresh_firmware_and_finish
+
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import console_logger, step, verbose
+from mono_imager.journeys import _usb_steps as _usb
+from mono_imager.journeys.armbian_lan import _flip_to_emmc_and_verify, _refresh_firmware_and_finish
+from mono_imager.spinner import with_spinner
+from mono_imager.step_registry import StepContext, register_step
 
 logger = logging.getLogger(__name__)
 
@@ -34,31 +35,13 @@ OS       = "Armbian"
 TRANSFER = "usb"
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["usb_mounted"], label="Mount USB stick")
-def step_mount_usb(ctx: StepContext) -> bool:
-    d = ctx.device
-    try:
-        # Mount whichever partition holds the image, not blindly sda1 (#26).
-        with Spinner("Mounting USB stick..."):
-            part, _has_image, detail = mount_usb_stick(d, ctx.usb_device, ctx.usb_mount, [OS])
-        ok = part is not None
-        if ok:
-            check_usb_size(d, ctx.usb_mount)
-        return step(0, f"USB mounted ({part or ctx.usb_device} -> {ctx.usb_mount})", ok,
-                    detail[-C.LOG_TAIL_SHORT:] if not ok else "")
-    except Exception as e:
-        return step(0, "USB mount", False, str(e))
+step_mount_usb = register_step(os=[OS], transfer=[TRANSFER], requires=[], produces=["usb_mounted"], label="Mount USB stick")(
+    _usb.mount_usb_step(OS))
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["usb_mounted"], produces=["firmware_ready"], label="Detect firmware file on USB")
-def step_firmware_on_usb(ctx: StepContext) -> bool:
-    path, fmt = find_image_on_usb(ctx.device, ctx.usb_mount, OS)
-    if not path:
-        return step(0, "Firmware found on USB", False,
-                    "no Armbian image found — expected armbian*.img.xz or armbian*.img")
-    ctx.set("firmware_source", path)
-    ctx.set("firmware_format", fmt)
-    return step(0, f"Firmware found on USB ({path})", True)
+step_firmware_on_usb = register_step(os=[OS], transfer=[TRANSFER], requires=["usb_mounted"], produces=["firmware_ready"], label="Detect firmware file on USB")(
+    _usb.firmware_on_usb_step(
+        OS, "no Armbian image found — expected armbian*.img.xz or armbian*.img"))
 
 
 @register_step(os=[OS], transfer=[TRANSFER], requires=["firmware_ready"], produces=["os_flashed"], label="Flash Armbian image")
@@ -94,15 +77,8 @@ def step_flash_armbian(ctx: StepContext) -> bool:
     return has_records and not has_error
 
 
-@register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")
-def step_unmount_usb(ctx: StepContext) -> bool:
-    try:
-        with Spinner("Unmounting USB stick..."):
-            ctx.device.send_command(f"umount {ctx.usb_mount} 2>&1; sync", timeout=C.UMOUNT_TIMEOUT)
-        return step(0, f"USB unmounted ({ctx.usb_mount})", True)
-    except Exception as e:
-        verbose(f"⚠ USB unmount warning: {e}", "warning")
-        return step(0, "USB unmount", True)
+step_unmount_usb = register_step(os=[OS], transfer=[TRANSFER], requires=["os_flashed"], produces=["usb_unmounted"], label="Unmount USB stick")(
+    _usb.step_unmount_usb)
 
 
 # Official procedure from here on — same as armbian_lan.py, shared via

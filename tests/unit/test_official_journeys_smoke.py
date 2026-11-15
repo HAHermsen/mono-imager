@@ -124,9 +124,9 @@ def test_openwrt_usb():
     print("\n--- OpenWRT + usb ---")
     # Mounting runs a partition-scan script on the device (#26), covered by
     # test_usb_mount.py / test_usb_partition_scan.py — mocked here.
-    with patch("mono_imager.journeys.openwrt_usb.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
-         patch("mono_imager.journeys.openwrt_usb.check_usb_size", return_value=True), \
-         patch("mono_imager.journeys.openwrt_usb.find_image_on_usb",
+    with patch("mono_imager.journeys._usb_steps.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
+         patch("mono_imager.journeys._usb_steps.check_usb_size", return_value=True), \
+         patch("mono_imager.journeys._usb_steps.find_image_on_usb",
                return_value=("/mnt/usb/openwrt.img", "img")), \
          patch("builtins.input", return_value=""):
         ok, results, n_steps = _run_journey(
@@ -164,9 +164,9 @@ def test_armbian_usb():
     print("\n--- Armbian + usb ---")
     # Mounting runs a partition-scan script on the device (#26), covered by
     # test_usb_mount.py / test_usb_partition_scan.py — mocked here.
-    with patch("mono_imager.journeys.armbian_usb.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
-         patch("mono_imager.journeys.armbian_usb.check_usb_size", return_value=True), \
-         patch("mono_imager.journeys.armbian_usb.find_image_on_usb",
+    with patch("mono_imager.journeys._usb_steps.mount_usb_stick", return_value=("/dev/sda1", True, "")), \
+         patch("mono_imager.journeys._usb_steps.check_usb_size", return_value=True), \
+         patch("mono_imager.journeys._usb_steps.find_image_on_usb",
                return_value=("/mnt/usb/armbian.img.xz", "img.xz")), \
          patch("mono_imager.recovery_orchestrator.run_firmware_update", return_value=True), \
          patch("mono_imager.device_net.RecoveryNetwork") as MockNet, \
