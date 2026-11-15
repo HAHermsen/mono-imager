@@ -358,17 +358,39 @@ for name, shell, envv in shells():
 # ----------------------------------------------------------------------------
 # Single-pass LAN snapshot: each chunk read ONCE and hashed on the device while
 # it streams (tee into a FIFO). Edge cases, under every shell.
+# Named limits and sizes for these tests (CLAUDE.md section 2: no magic numbers).
+SP_DISK_BYTES = 40 * S.MIB + 1536     # fake eMMC: two chunks, the last one short (sector-sized tail)
+SP_DISK_CHUNKS = 2                    # chunks in SP_DISK_BYTES at CHUNK size
+SP_NOR_BYTES = 2 * S.MIB              # fake NOR flash for the read-only dump
+SHA256_HEX_LEN = 64                   # hex digits in a SHA-256 digest
+STUB_MODE = 0o755                     # stub tools must be executable
+CUT_AFTER_BYTES = S.MIB               # the fake curl cuts an upload after this many bytes
+CURL_RC_RECV_ERROR = 56               # curl exit code: failure receiving network data
+CUT_SETTLE_TIMEOUT_S = 10             # snapshot_lan's upload-settle wait, shortened for the cut test
+CUT_CHUNK_TIMEOUT_S = 60              # snapshot_lan's per-chunk report wait, shortened for the cut test
+FAIL_FAST_S = 30                      # a cut upload must be refused within this time
+DEVICE_EXIT_TIMEOUT_S = FAIL_FAST_S   # wait for the device script to exit (proves no FIFO hang)
+REASON_PREVIEW_CHARS = 60             # failure reason shown in a check's label
+LOCALHOST = "127.0.0.1"
+EMMC_32GB_BYTES = 31_268_536_320      # a representative 32 GB eMMC
+EMMC_32GB_CHUNKS = 30                 # chunks such an eMMC is split into
+SERIAL_SCRIPT_MAX_BYTES = 4096        # largest safe device script (a 13 KB one broke on hardware)
+SINGLE_PASS_MAX_GROWTH_BYTES = 256    # single pass may add at most this much over the read-back script
+SIZE_TEST_BASE_URL = "http://192.168.168.89:8080"   # realistic URL length for the size check
+TOKEN_HEX_LEN = 32                    # snapshot session token length (hex digits)
+CHUNK_NUMBERS = range(1, SP_DISK_CHUNKS + 1)        # 1-based chunk numbers in progress text
 NORF = work / "sp_nor.bin"
-NORF.write_bytes(os.urandom(2 * S.MIB))
+NORF.write_bytes(os.urandom(SP_NOR_BYTES))
 REAL_CURL = shutil.which("curl")
 SP_ALL = {"sha256sum", "tee", "mkfifo", "openssl"}
 SSL_STUB = {   # fake openssl: real hash, OpenSSL 3 / 1.1 output; or a wrong hash
     "ssl3": '#!/bin/sh\nh=$(sha256sum | cut -d" " -f1)\necho "SHA2-256(stdin)= $h"\n',
     "ssl1": '#!/bin/sh\nh=$(sha256sum | cut -d" " -f1)\necho "(stdin)= $h"\n',
-    "sslbad": '#!/bin/sh\ncat >/dev/null\necho "SHA2-256(stdin)= ' + "0" * 64 + '"\n',
+    "sslbad": '#!/bin/sh\ncat >/dev/null\necho "SHA2-256(stdin)= ' + "0" * SHA256_HEX_LEN + '"\n',
 }
-# fake curl: an upload gets cut after 1 MiB (curl rc 56), everything else is real
-CUT_CURL = ('#!/bin/sh\ncase "$*" in\n  *upload*) head -c 1048576 | ' + REAL_CURL + ' "$@"; exit 56;;\n'
+# fake curl: an upload gets cut after CUT_AFTER_BYTES (curl rc CURL_RC_RECV_ERROR), everything else is real
+CUT_CURL = (f'#!/bin/sh\ncase "$*" in\n  *upload*) head -c {CUT_AFTER_BYTES} | {REAL_CURL} "$@"; '
+            f'exit {CURL_RC_RECV_ERROR};;\n'
             'esac\nexec ' + REAL_CURL + ' "$@"\n')
 
 
@@ -377,7 +399,7 @@ def stub_dir(tag, files):
     d.mkdir(exist_ok=True)
     for n, body in files.items():
         (d / n).write_text(body)
-        (d / n).chmod(0o755)
+        (d / n).chmod(STUB_MODE)
     return d
 
 
@@ -393,14 +415,14 @@ def lan_snapshot(shell, envv, have, label, *, thorough=False, nor_dump=False, **
     """snapshot_lan end to end on a fresh 40 MiB "eMMC". Returns (manifest, disk, store, rec):
     rec = single_pass flags passed to the script builder, spinner texts, steps, _say lines,
     elapsed seconds, and whether the device script exited (no FIFO hang)."""
-    size = 40 * S.MIB + 1536
+    size = SP_DISK_BYTES
     emmc = work / f"emmc_{label}.img"
     disk = make_disk(emmc, size)
     store = work / f"store_{label}"
     store.mkdir()
     port = free_port()
     sess = SnapshotSession()
-    srv = start_snapshot_server("127.0.0.1", port, sess)
+    srv = start_snapshot_server(LOCALHOST, port, sess)
     dev = FakeDev(shell, envv)
     rec = {"single": [], "spin": [], "steps": [], "say": []}
     real_lan, real_spin, real_step = S.build_lan_snapshot_script, SO.with_spinner, SO.step
@@ -426,13 +448,13 @@ def lan_snapshot(shell, envv, have, label, *, thorough=False, nor_dump=False, **
     with contextlib.ExitStack() as es:
         for pt in patches:
             es.enter_context(pt)
-        m = SO.snapshot_lan(dev, sess, f"http://127.0.0.1:{port}", store,
+        m = SO.snapshot_lan(dev, sess, f"http://{LOCALHOST}:{port}", store,
                             cap(label, probe_for(size, have), thorough=thorough, nor_dump=nor_dump))
     rec["elapsed"] = time.time() - t0
     rec["exited"] = True
     for pr in dev.procs:
         try:
-            pr.wait(timeout=30)
+            pr.wait(timeout=DEVICE_EXIT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             rec["exited"] = False
             pr.kill()
@@ -478,10 +500,10 @@ for name, shell, envv in shells():
     check("NOR dump after the single-pass loop: stored, hash recorded",
           m is not None and m["nor_dump"]["sha256"] == hashlib.sha256(NORF.read_bytes()).hexdigest()
           and (store / f"spnor_{name}" / "nor.bin").read_bytes() == NORF.read_bytes())
-    check("spinner says 'hashing'", rec["spin"] == [f"Chunk {i}/2: eMMC -> PC, hashing" for i in (1, 2)])
+    check("spinner says 'hashing'", rec["spin"] == [f"Chunk {i}/{SP_DISK_CHUNKS}: eMMC -> PC, hashing" for i in CHUNK_NUMBERS])
     check("steps say 'captured and verified'",
           [s for s, ok, _ in rec["steps"] if s.startswith("Chunk")] ==
-          [f"Chunk {i}/2 captured and verified" for i in (1, 2)])
+          [f"Chunk {i}/{SP_DISK_CHUNKS} captured and verified" for i in CHUNK_NUMBERS])
     check("no fallback warning", not any("missing on the device" in s for s in rec["say"]))
 
     section(f"[{name}] single pass: wrong device hash is refused")
@@ -496,37 +518,38 @@ for name, shell, envv in shells():
     section(f"[{name}] single pass: upload cut mid-stream (no FIFO hang)")
     e = with_path(envv, stub_dir(f"cut_{name}", {"curl": CUT_CURL}))
     m, disk, store, rec = lan_snapshot(shell, e, SP_ALL, f"cut_{name}",
-                                       UPLOAD_SETTLE_TIMEOUT=10, CHUNK_TIMEOUT=60)
+                                       UPLOAD_SETTLE_TIMEOUT=CUT_SETTLE_TIMEOUT_S, CHUNK_TIMEOUT=CUT_CHUNK_TIMEOUT_S)
     check("snapshot refused", m is None)
-    check(f"reason names the short transfer ({reason(rec)[:60]})",
-          "transfer failed" in reason(rec) and "rc=56" in reason(rec) and f"1048576 of {CHUNK}" in reason(rec))
+    check(f"reason names the short transfer ({reason(rec)[:REASON_PREVIEW_CHARS]})",
+          "transfer failed" in reason(rec) and f"rc={CURL_RC_RECV_ERROR}" in reason(rec)
+          and f"{CUT_AFTER_BYTES} of {CHUNK}" in reason(rec))
     check("device script exited (tee/fsha/curl did not deadlock)", rec["exited"])
-    check(f"failed fast ({rec['elapsed']:.1f}s < 30s)", rec["elapsed"] < 30)
+    check(f"failed fast ({rec['elapsed']:.1f}s < {FAIL_FAST_S}s)", rec["elapsed"] < FAIL_FAST_S)
     check("nothing published, no .partial", nothing_published(store, f"cut_{name}"))
 
-    section(f"[{name}] single pass: stale /tmp/mi_f and /tmp/mi_v from a crashed run")
+    section(f"[{name}] single pass: stale {S.HASH_FIFO} and {S.HASH_OUT} from a crashed run")
     for kind in ("file", "fifo"):
-        for f in (Path("/tmp/mi_f"), Path("/tmp/mi_v")):
+        for f in (Path(S.HASH_FIFO), Path(S.HASH_OUT)):
             f.unlink(missing_ok=True)
         if kind == "file":
-            Path("/tmp/mi_f").write_text("junk\n")
+            Path(S.HASH_FIFO).write_text("junk\n")
         else:
-            os.mkfifo("/tmp/mi_f")
-        Path("/tmp/mi_v").write_text("f" * 64 + "\n")
+            os.mkfifo(S.HASH_FIFO)
+        Path(S.HASH_OUT).write_text("f" * SHA256_HEX_LEN + "\n")
         m, disk, store, rec = lan_snapshot(shell, envv, SP_ALL, f"stale_{kind}_{name}")
-        check(f"stale /tmp/mi_f ({kind}) + stale /tmp/mi_v: snapshot OK, hashes = the disk",
+        check(f"stale {S.HASH_FIFO} ({kind}) + stale {S.HASH_OUT}: snapshot OK, hashes = the disk",
               m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
-    for f in (Path("/tmp/mi_f"), Path("/tmp/mi_v")):
+    for f in (Path(S.HASH_FIFO), Path(S.HASH_OUT)):
         f.unlink(missing_ok=True)
 
     section(f"[{name}] mode selection: thorough + fallbacks to read-back")
     m, disk, store, rec = lan_snapshot(shell, envv, SP_ALL, f"thor_{name}", thorough=True)
     check("thorough: read-back used although single pass is possible", rec["single"] == [False])
     check("thorough: snapshot OK, hashes = the disk", m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
-    check("thorough: spinner says 'read back'", rec["spin"] == [f"Chunk {i}/2: eMMC -> PC, read back" for i in (1, 2)])
+    check("thorough: spinner says 'read back'", rec["spin"] == [f"Chunk {i}/{SP_DISK_CHUNKS}: eMMC -> PC, read back" for i in CHUNK_NUMBERS])
     check("thorough: steps say 'captured and read-back verified'",
           [s for s, ok, _ in rec["steps"] if s.startswith("Chunk")] ==
-          [f"Chunk {i}/2 captured and read-back verified" for i in (1, 2)])
+          [f"Chunk {i}/{SP_DISK_CHUNKS} captured and read-back verified" for i in CHUNK_NUMBERS])
     check("thorough: no fallback warning (it was asked for)", not any("missing on the device" in s for s in rec["say"]))
     for miss, have in (("tee", SP_ALL - {"tee"}), ("mkfifo", SP_ALL - {"mkfifo"}),
                        ("openssl + sha256sum", {"tee", "mkfifo"})):
@@ -540,25 +563,27 @@ for name, shell, envv in shells():
 
 
 # ----------------------------------------------------------------------------
-section("single pass: device script stays serial-safe (30 chunks, 32 GB eMMC)")
-ch = S.plan_chunks(31_268_536_320)
-check(f"32 GB eMMC = {len(ch)} chunks", len(ch) == 30)
+section(f"single pass: device script stays serial-safe ({EMMC_32GB_CHUNKS} chunks, 32 GB eMMC)")
+ch = S.plan_chunks(EMMC_32GB_BYTES)
+check(f"32 GB eMMC = {len(ch)} chunks", len(ch) == EMMC_32GB_CHUNKS)
 built = {}
 for sp in (False, True):
     for hs in (True, False):
         for nor in (False, True):
             built[(sp, hs, nor)] = S.build_lan_snapshot_script(
-                base_url="http://192.168.168.89:8080", token="0" * 32, chunks=ch,
+                base_url=SIZE_TEST_BASE_URL, token="0" * TOKEN_HEX_LEN, chunks=ch,
                 have_sha=hs, nor=nor, single_pass=sp)
 big = max(len(b.encode()) for b in built.values())
-check(f"every variant <= 4 KB (largest {big} B; a 13 KB script broke on hardware)", big <= 4096)
+check(f"every variant <= {SERIAL_SCRIPT_MAX_BYTES} B (largest {big} B; a 13 KB script broke on hardware)",
+      big <= SERIAL_SCRIPT_MAX_BYTES)
 grow = len(built[(True, True, True)].encode()) - len(built[(False, True, True)].encode())
-check(f"single pass adds < 256 B over read-back ({grow} B)", grow < 256)
+check(f"single pass adds < {SINGLE_PASS_MAX_GROWTH_BYTES} B over read-back ({grow} B)",
+      grow < SINGLE_PASS_MAX_GROWTH_BYTES)
 longest = {k: max(len(x) for x in b.splitlines()) for k, b in built.items()}
 check(f"single pass: longest line not longer than read-back's ({longest[(True, True, True)]} chars)",
       longest[(True, True, True)] <= longest[(False, True, True)])
 check("single pass script = one loop over the plan file, not unrolled per chunk",
-      built[(True, True, False)].count("fsha < /tmp/mi_f") == 1)
+      built[(True, True, False)].count(f"fsha < {S.HASH_FIFO}") == 1)
 
 
 # ----------------------------------------------------------------------------

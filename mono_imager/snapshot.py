@@ -612,6 +612,18 @@ def _report(url: str, body: str) -> str:
 
 PLAN = "/tmp/mono_imager_plan.txt"   # one line per chunk / range, read by a shell loop
 
+# Single-pass snapshot: each chunk is tee'd into HASH_FIFO while it uploads;
+# fsha reads the FIFO and writes the chunk's SHA-256 to HASH_OUT. The paths are
+# short on purpose: every device-script line must stay short (see below).
+HASH_FIFO = "/tmp/mi_f"
+HASH_OUT = "/tmp/mi_v"
+
+# Short names ON PURPOSE (deliberate exception to CLAUDE.md section 2,
+# "Self-Documenting Naming"): device-script variables ($i, $off, $n, $urc,
+# $vs, ...) and helpers (rd, wr, put, rep, fsha, dropc) are kept short so
+# every line stays short on the serial console. Long lines wrap there and
+# the wrapped echo garbles (see SerialDevice.run_script()).
+
 # The scripts below are LOOPS over a short plan file, never one block per
 # chunk: CONFIRMED ON HARDWARE, a 13 KB script (30 chunks unrolled) did not
 # survive the serial heredoc write (run_script/launch_script's byte check
@@ -665,10 +677,10 @@ def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
           f'rd 0 {FW_START} | put "verify?$T&tag=boot"',
           "while read -r i off n; do"]
     if single_pass:
-        s += ["  dropc; rm -f /tmp/mi_f /tmp/mi_v; mkfifo /tmp/mi_f",
-              "  fsha < /tmp/mi_f > /tmp/mi_v &",
-              '  rd $off $n | tee /tmp/mi_f | put "upload?$T&chunk=$i"; urc=$?',
-              "  wait; vs=$(cat /tmp/mi_v)"]
+        s += [f"  dropc; rm -f {HASH_FIFO} {HASH_OUT}; mkfifo {HASH_FIFO}",
+              f"  fsha < {HASH_FIFO} > {HASH_OUT} &",
+              f'  rd $off $n | tee {HASH_FIFO} | put "upload?$T&chunk=$i"; urc=$?',
+              f"  wait; vs=$(cat {HASH_OUT})"]
     else:
         s += ['  rd $off $n | put "upload?$T&chunk=$i"; urc=$?',
               "  dropc"]
