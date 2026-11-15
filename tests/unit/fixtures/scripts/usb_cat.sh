@@ -1,0 +1,1 @@
+if [ -f '/mnt/usb/mono-snapshots/armbian-20261114-2010/manifest.json' ]; then n=0; while IFS= read -r line || [ -n "$line" ]; do echo "L$n=$line"; n=$((n + 1)); done < '/mnt/usb/mono-snapshots/armbian-20261114-2010/manifest.json'; fi; echo CAT_DONE=1

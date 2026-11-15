@@ -13,8 +13,7 @@
 - **Strict Ban on Magic Numbers & Strings:** Every literal number (other than `0`, `1`, `-1` in standard loop/index contexts) and repeated string must be extracted into a named constant, enum, or configuration file.
 - **Centralized Configuration:** Environment variables, thresholds, timeouts, and business rules belong in dedicated config/constants modules—never hardcoded inside business logic. Shared constants live in `mono_imager/constants.py` (imported as `C`); module-only constants sit at the top of the module that owns them (e.g. `snapshot.py`).
 - **Self-Documenting Naming:** Use explicit, unambiguous names for variables, functions, and classes. Avoid single-letter variables or cryptic abbreviations.
-- **Known gaps:** `/tmp/mi_f` and `/tmp/mi_v` in `snapshot.py`, and the test limits 4096 B, 256 B and 30 s, are still literals. Fix the litterals in a way so that clean code and zero magic numberes is adhered too.
-- **Open decision:** device shell scripts use short names (`$i`, `$off`, `$n`) on purpose, to keep lines short on the serial console (section 6). Exception to Self-Documenting Naming, yes, but add comment in code on purpose
+- **Exception (decided):** device shell scripts use short names (`$i`, `$off`, `$n`, `rd`, `put`, `rep`, `fsha`) on purpose, to keep lines short on the serial console (section 6). Allowed, with a comment in the code saying so
 
 ## 3. Modularity & Extensibility (SOLID)
 - **Single Responsibility Principle:** Each file, class, and function must do one thing well. Keep files small and focused (see File & Function Size).
@@ -44,7 +43,6 @@ When given a feature or module specification, follow this exact sequence:
 - **Version Control:** No branches: commit on `main`. The user commits with their own git identity; Claude prepares the change and checks it with `git diff` / `git show --stat`.
 - **Line Endings:** Files are CRLF in the working tree (git stores LF). Keep CRLF, and never leave a lone CR: git then treats the file as binary (happened to `serial_device.py`, fixed in `5f5c014`).
 - **Versioning:** `__version__` in `mono_imager/__init__.py` is the single source; `pyproject.toml` is the only build file. Do not bump the version unless asked.
-- **Known gaps (baseline 2026-11-15):** ruff 355 findings (199 auto-fixable); mypy 157 errors in 15 files.
 
 ## 5. Error Handling & Testing
 - **logging** logs shall be mandatory in the defacto standard available and will be done in files with size of 1 MByte: a log is split into a series of 1 MB files, never one growing file. **Known gap:** today `logging_setup.py` writes one file per run to `logs/`, with no 1 MB split.
@@ -54,6 +52,8 @@ When given a feature or module specification, follow this exact sequence:
 - **Shell-Script Tests:** Generated device scripts are run for real under `/bin/sh` and BusyBox `ash` (when installed). On Windows they need `sh` from Git for Windows; without it those parts skip with a message.
 
 ## 6. Project-Specific Context
+- **Done (2026-11-15):** the single-pass literals are named: `HASH_FIFO` / `HASH_OUT` in `snapshot.py`, and the test limits in a named block in `test_snapshot_scripts.py`. Literals elsewhere in the code are handled in refactor phase 4.
+- **Known gaps (baseline 2026-11-15):** ruff 355 findings (199 auto-fixable); mypy 157 errors in 15 files.
 - **Folder Structure:** Folder /logs contains logging
 - **Language / Runtime:** Python >= 3.10 (`pyproject.toml`). The user runs 3.14 on Windows; Claude tests on Linux with 3.13.
 - **Framework:** none. CLI/TUI on `pyserial` (optional `zstandard` below Python 3.14).
