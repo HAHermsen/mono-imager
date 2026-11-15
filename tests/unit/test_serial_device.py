@@ -114,6 +114,9 @@ import shutil as _sh_which
 SH = "/bin/sh" if Path("/bin/sh").exists() else _sh_which.which("sh")
 import contextlib
 import mono_imager.serial_device as SDM
+import mono_imager.serial_timing as STM    # tuned timings: patched here, read by every serial module
+import mono_imager.serial_scripts as SSM
+import mono_imager.serial_boot as SBM
 from mono_imager import constants as C
 from mono_imager.serial_device import SerialProxy
 
@@ -209,8 +212,9 @@ def fast():
     said.clear()
     with contextlib.ExitStack() as es:
         for k, v in FAST.items():
-            es.enter_context(patch.object(SDM, k, v))
-        es.enter_context(patch.object(SDM, "verbose", lambda m, *a, **k: said.append(str(m))))
+            es.enter_context(patch.object(STM, k, v))
+        for mod in (SDM, SSM, SBM):
+            es.enter_context(patch.object(mod, "verbose", lambda m, *a, **k: said.append(str(m))))
         es.enter_context(patch.object(SDM.logger, "warning", lambda m, *a, **k: said.append(str(m))))
         es.enter_context(patch.object(SDM.logger, "error", lambda m, *a, **k: said.append(str(m))))
         yield
@@ -607,7 +611,7 @@ with fast():
     f = FakeSerial(responder=lambda f, b: f.feed(b"\r\n=> "))
     d = attach(f)
     check("interrupt_autoboot: keys sent, prompt -> True",
-          d.interrupt_autoboot() is True and f.written == [b" "] * SDM.INTERRUPT_KEY_COUNT)
+          d.interrupt_autoboot() is True and f.written == [b" "] * STM.INTERRUPT_KEY_COUNT)
     d = attach(FakeSerial())
     check("interrupt_autoboot: no prompt -> False", d.interrupt_autoboot() is False)
 
