@@ -553,7 +553,10 @@ empty.write_bytes(b"")
 check("empty input", v("  ")[1] == "No path entered.")
 check("not found", "File not found" in v(str(tmpd / "nope.img"))[1])
 check("a folder", "folder, not a file" in v(str(tmpd))[1])
-check("not a regular file (/dev/null)", "Not a regular file" in v("/dev/null")[1])
+if os.name == "nt":
+    print("  SKIP: not a regular file (/dev/null does not exist on Windows)")
+else:
+    check("not a regular file (/dev/null)", "Not a regular file" in v("/dev/null")[1])
 check("0 bytes", "File is empty" in v(str(empty))[1])
 check("too small (2 KB)", "only 2 KB" in v(str(small))[1])
 p, err = v(f'  "{RAW}"  ')
@@ -629,7 +632,8 @@ r, t, a = drive(lambda: app._recovery_finish(True), [""])
 check("_recovery_finish: result kept, waits for Enter, back to MAIN",
       app.flash_success is True and app.current_state == MenuState.MAIN and a)
 fake_tm = _types.SimpleNamespace(TCIFLUSH=0, tcflush=MagicMock())
-with patch.dict(sys.modules, {"termios": fake_tm}):
+# msvcrt=None makes "import msvcrt" raise ImportError, so the termios path runs on Windows too
+with patch.dict(sys.modules, {"termios": fake_tm, "msvcrt": None}):
     drive(lambda: app._recovery_finish(False), [""])
 check("_recovery_finish: stdin flushed via termios (stray Enter can't skip the report)", fake_tm.tcflush.called)
 fake_ms = _types.SimpleNamespace(kbhit=MagicMock(side_effect=[True, True, False]), getch=MagicMock())

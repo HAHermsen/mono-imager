@@ -1,0 +1,45 @@
+{
+  "mypy": {
+    "arg-type": 21,
+    "assignment": 16,
+    "attr-defined": 55,
+    "call-overload": 1,
+    "import-not-found": 1,
+    "index": 29,
+    "list-item": 1,
+    "operator": 3,
+    "union-attr": 20,
+    "valid-type": 2,
+    "var-annotated": 8
+  },
+  "ruff": {
+    "BLE001": 102,
+    "DTZ001": 2,
+    "DTZ005": 2,
+    "F841": 1,
+    "I001": 42,
+    "ISC004": 12,
+    "PLR1711": 1,
+    "RET501": 1,
+    "RUF007": 1,
+    "RUF010": 3,
+    "RUF012": 4,
+    "RUF013": 7,
+    "RUF022": 1,
+    "RUF059": 1,
+    "S110": 10,
+    "SIM102": 2,
+    "SIM103": 1,
+    "SIM114": 1,
+    "SIM115": 1,
+    "TRY401": 1,
+    "UP006": 1,
+    "UP024": 1,
+    "UP035": 7,
+    "UP045": 142
+  },
+  "versions": {
+    "mypy": "2.3.1",
+    "ruff": "0.16.9"
+  }
+}

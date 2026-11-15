@@ -30,10 +30,16 @@ mono-imager = "mono_imager.cli:main"
 zstd = ["zstandard>=0.22; python_version < '3.14'"]
 dev = [
     "pytest>=7",
-    "ruff",
-    "mypy",
+    # pinned: tests/unit/test_lint_baseline.py compares counts measured with these versions
+    "ruff==0.16.9",
+    "mypy==2.3.1",
+    "types-pyserial",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.mypy]
+# the Python the app runs on (3.14): the lint baseline is measured for it
+python_version = "3.14"

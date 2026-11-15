@@ -267,14 +267,20 @@ check("_iter_body: chunked with extension + trailer",
 section("od dump parsing, U-Boot env blobs")
 import struct, zlib, subprocess
 raw = os.urandom(1000) + b"\0" * 40
-od = subprocess.run(["od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
-check("parse_od round trip (GNU od -v -b)", S.parse_od(od) == raw)
-bb = subprocess.run(["busybox", "od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
-check("parse_od round trip (BusyBox od -v -b)", S.parse_od(bb) == raw)
+if shutil.which("od"):
+    od = subprocess.run(["od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
+    check("parse_od round trip (GNU od -v -b)", S.parse_od(od) == raw)
+else:
+    print("  SKIP: parse_od round trip (GNU od -v -b): no od found (add Git for Windows usr\\bin to PATH or run on Linux/macOS)")
+if shutil.which("busybox"):
+    bb = subprocess.run(["busybox", "od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
+    check("parse_od round trip (BusyBox od -v -b)", S.parse_od(bb) == raw)
+else:
+    print("  SKIP: parse_od round trip (BusyBox od -v -b): no busybox found")
 check("parse_od: gap -> None", S.parse_od("0000000 001 002\n0000020 003\n") is None)
 check("no od -A/-t in device scripts (BusyBox lacks them)",
       not any(x in src for x in ("od -A", "od -t", "-tx1")
-              for src in [Path(S.__file__).read_text()]))
+              for src in [Path(S.__file__).read_text(encoding="utf-8")]))
 
 
 def env_blob(vars_, redundant=False, size=S.NOR_ENV_SIZE, bad=False):

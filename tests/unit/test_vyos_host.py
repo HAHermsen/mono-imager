@@ -103,7 +103,7 @@ except ValueError:
     check("not-a-FAT32 offset raises", True)
 
 text = V.parse_uboot_script(scr)
-check("script text = the build's boot.cmd", text.strip() == (FIX / "vyos_boot.cmd").read_text().strip())
+check("script text = the build's boot.cmd", text.strip() == (FIX / "vyos_boot.cmd").read_text(encoding="utf-8").strip())
 try:
     V.parse_uboot_script(b"\x00" * 100)
     check("non-mkimage data raises", False)
