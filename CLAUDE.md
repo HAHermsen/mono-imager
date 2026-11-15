@@ -20,7 +20,7 @@
 - **Dependency Injection:** High-level modules must not depend on low-level modules directly. Pass dependencies (services, repositories, configs) via constructors or function parameters so components can be swapped or mocked easily. As practised here: functions take the device, session and `ask` callables as parameters, which the tests replace.
 - **Interface-Driven Design:** Define types, interfaces, and data contracts *before* writing implementation logic.
 - **Strict Layer Separation:** Keep core domain/business logic completely decoupled from UI, database, network, and third-party API code. Current layers: device shell scripts are built by pure functions (no I/O) in `snapshot.py`; orchestration in `*_orchestrator.py`; serial I/O in `serial_device.py`; UI in `tui.py`.
-- **Known gaps (2026-11-15):** 13,543 lines in 34 files. Over 1,000 lines: `serial_device.py` 1471, `snapshot_orchestrator.py` 1386, `tui.py` 1311, `recovery_orchestrator.py` 1301, `snapshot.py` 1239, `flash_orchestrator.py` 1027. 12 functions exceed 100 lines; 20 functions are duplicated across modules. A phased refactor is planned and waits for approval.
+- **Known gaps (2026-11-15, after refactor phases 1–4):** 14,399 lines in 53 files. No file over 1,000 lines (largest `snapshot_orchestrator.py` 829); no function over 100 lines; duplicated functions were consolidated in phase 1. Still open: magic-number naming, and the lint baseline (ruff 152 findings, mypy 79).
 - **File & Function Size:** soft targets, hard ceilings (decided 2026-11-15):
   - **Files:** target 200–400 lines; above 400 needs a stated reason; 1,000 lines is the hard ceiling.
   - **Functions:** target 50 lines or fewer; 100 lines is the hard ceiling.
@@ -53,7 +53,7 @@ When given a feature or module specification, follow this exact sequence:
 
 ## 6. Project-Specific Context
 - **Done (2026-11-15):** the single-pass literals are named: `HASH_FIFO` / `HASH_OUT` in `snapshot.py`, and the test limits in a named block in `test_snapshot_scripts.py`. Literals elsewhere in the code are handled in refactor phase 4.
-- **Known gaps (baseline 2026-11-15):** ruff 355 findings (199 auto-fixable); mypy 157 errors in 15 files.
+- **Known gaps (baseline locked 2026-11-15, after phase 4):** ruff 152 findings (was 355); mypy 79 errors (was 157). Locked by `tests/unit/test_lint_baseline.py`; counts may only go down.
 - **Folder Structure:** Folder /logs contains logging
 - **Language / Runtime:** Python >= 3.10 (`pyproject.toml`). The user runs 3.14 on Windows; Claude tests on Linux with 3.13.
 - **Framework:** none. CLI/TUI on `pyserial` (optional `zstandard` below Python 3.14).
