@@ -302,9 +302,13 @@ the same building blocks: `phase1_uboot()`, `SerialDevice.boot_recovery()`
 / `run_script()` / `launch_script()`, the `/report` channel,
 `RecoveryNetwork` and `run_firmware_update()` (clone mode only).
 
-Reaching recovery: NOR recovery Linux is loaded into RAM from whichever
-U-Boot is running (`sf read` DTB @ 0x500000 + gzip kernel @ 0xa00000,
-`booti`, `boot_medium=qspi`, no `saveenv`). U-Boot can swallow the first
+Reaching recovery (`_boot_recovery_in_ram()`), from whichever U-Boot is
+running, nothing saved: 1) this U-Boot's own `run recovery` (eMMC
+recovery with the DIP LEFT, `boot_medium=emmc` — has Ethernet); 2) NOR's
+env imported into RAM (`sf read` + `env import -c`) + NOR's `run
+recovery` (`boot_medium=qspi`; on hardware: boots, but no Ethernet from
+an eMMC U-Boot); 3) DTB + kernel at the documented NOR offsets (0x500000
+was empty on real hardware). U-Boot can swallow the first
 character right after the autoboot interrupt, so every command goes
 through `_uboot_cmd()` (empty line to re-sync, one retry). The DIP switch
 is only asked for when that still fails.

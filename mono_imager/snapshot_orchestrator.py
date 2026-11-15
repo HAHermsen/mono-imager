@@ -7,9 +7,10 @@ mono-imager: eMMC snapshot / restore journeys (#29).
 
 Reaching recovery (shared): the user reboots the running OS cleanly and
 mono-imager catches U-Boot on serial (eMMC or NOR U-Boot, whichever the
-DIP switch selects). From that U-Boot, NOR recovery Linux is loaded into
-RAM with `sf read` + `booti` — nothing is saved to any env, NOR is never
-written. Recovery Linux then runs entirely from RAM, so the eMMC can be
+DIP switch selects). From that U-Boot, recovery Linux is started in RAM —
+see _boot_recovery_in_ram(): this U-Boot's own recovery first (has
+Ethernet), then NOR's own env imported + `run recovery`, then fixed NOR
+offsets. Nothing is saved to any env. Recovery Linux then runs entirely from RAM, so the eMMC can be
 overwritten while it runs, and boot_medium=qspi tells the `firmware`
 tool it is NOR recovery (clone mode's `firmware update` then provisions
 the eMMC). Only when that is impossible (U-Boot not caught: blank eMMC,
@@ -141,31 +142,81 @@ def _uboot_cmd(d, cmd: str, timeout: float) -> str:
     return out
 
 
-def _chainload_nor_recovery(d) -> bool:
-    """Load NOR recovery Linux into RAM from the current U-Boot (no saveenv)."""
+def _import_nor_env(d) -> bool:
+    """
+    Load NOR's own U-Boot env into THIS U-Boot's RAM env (`sf read` +
+    `env import -c`, CRC-checked, never saved). Afterwards `run recovery`
+    does exactly what the NOR U-Boot would: boot NOR recovery Linux.
+    No addresses guessed — NOR's own `recovery` command knows them.
+    """
+    for size in S.NOR_ENV_SIZES:
+        _uboot_cmd(d, f"sf read {S.RAM_KERNEL} {S.NOR_ENV_OFF} {size}", C.UBOOT_WRITE_TIMEOUT)
+        out = _uboot_cmd(d, f"env import -c {S.RAM_KERNEL} {size}", C.UBOOT_CMD_TIMEOUT)
+        if "error" in out.lower() or "bad crc" in out.lower():
+            continue
+        rec = _uboot_cmd(d, "printenv recovery", C.UBOOT_QUICK_TIMEOUT)
+        if "recovery=" in rec:
+            verbose(f"  NOR env imported ({size} bytes): {rec.strip()[:C.LOG_TAIL]}")
+            return True
+    verbose("  NOR env could not be imported (no valid env at the expected offset)", "warning")
+    return False
+
+
+def _load_nor_recovery_fixed(d) -> bool:
+    """Second try: DTB + gzip kernel at the documented NOR offsets (magic-checked)."""
     probe, read_dtb, read_kernel, *set_env = S.nor_chainload_commands()
+    _uboot_cmd(d, read_dtb, C.UBOOT_WRITE_TIMEOUT)
+    if C.FIT_MAGIC_HEX not in _uboot_cmd(d, f"md.b {S.RAM_DTB} 4", C.UBOOT_QUICK_TIMEOUT):
+        verbose(f"  no device tree at NOR {S.NOR_DTB_OFF}", "warning")
+        return False
+    _uboot_cmd(d, read_kernel, SF_READ_KERNEL_TIMEOUT)
+    if C.GZIP_MAGIC_HEX not in _uboot_cmd(d, f"md.b {S.RAM_KERNEL} 2", C.UBOOT_QUICK_TIMEOUT):
+        verbose(f"  no gzip kernel at NOR {S.NOR_KERNEL_OFF}", "warning")
+        return False
+    for c in set_env:
+        _uboot_cmd(d, c, C.UBOOT_QUICK_TIMEOUT)
+    return True
+
+
+def _boot(d, medium: str, message: str) -> bool:
+    booted, err = with_spinner(d.boot_recovery, boot_medium=medium, message=message)
+    return bool(booted) and not err
+
+
+def _boot_recovery_in_ram(d) -> Optional[str]:
+    """
+    Start recovery Linux (it runs from RAM) from whatever U-Boot is at the
+    prompt, without touching the DIP switch. Returns the boot medium of
+    the recovery that runs (BOOT_MEDIUM_NOR / BOOT_MEDIUM_EMMC) or None.
+
+      1. this U-Boot's own `run recovery` — the recovery mono-imager already
+         boots at launch, with working Ethernet. With the DIP LEFT that is
+         eMMC recovery: fine for snapshots and same-board restores.
+      2. NOR's env imported into RAM + NOR's own `run recovery`. CONFIRMED ON
+         HARDWARE: it boots, but from an eMMC U-Boot that kernel came up
+         with NO Ethernet ports — so it is only a fallback (USB snapshots).
+      3. DTB + kernel at the documented NOR offsets (0x500000 was empty on
+         real hardware; magic-checked, so harmless to try).
+    Clone mode needs NOR recovery with network: it asks for the DIP switch.
+    """
     try:
-        d.send_command("", timeout=C.UBOOT_QUICK_TIMEOUT)      # prime the prompt
-        out = _uboot_cmd(d, probe, C.UBOOT_CMD_TIMEOUT)
+        d.send_command("", timeout=C.UBOOT_QUICK_TIMEOUT)      # re-sync the prompt
+    except Exception:
+        pass
+    if _boot(d, C.BOOT_MEDIUM_EMMC, "Booting recovery Linux into RAM..."):
+        return C.BOOT_MEDIUM_EMMC
+    try:
+        d.send_command("", timeout=C.UBOOT_QUICK_TIMEOUT)
+        out = _uboot_cmd(d, "sf probe 0", C.UBOOT_CMD_TIMEOUT)
         if "SF:" not in out or "Unknown command" in out:
             verbose(f"  sf probe not usable here: {out.strip()[:C.LOG_TAIL]!r}", "warning")
-            return False
-        _uboot_cmd(d, read_dtb, C.UBOOT_WRITE_TIMEOUT)
-        if C.FIT_MAGIC_HEX not in _uboot_cmd(d, f"md.b {S.RAM_DTB} 4", C.UBOOT_QUICK_TIMEOUT):
-            verbose(f"  no device tree at NOR {S.NOR_DTB_OFF}", "warning")
-            return False
-        _uboot_cmd(d, read_kernel, SF_READ_KERNEL_TIMEOUT)
-        if C.GZIP_MAGIC_HEX not in _uboot_cmd(d, f"md.b {S.RAM_KERNEL} 2", C.UBOOT_QUICK_TIMEOUT):
-            verbose(f"  no gzip kernel at NOR {S.NOR_KERNEL_OFF}", "warning")
-            return False
-        for c in set_env:
-            _uboot_cmd(d, c, C.UBOOT_QUICK_TIMEOUT)
+            return None
+        if _import_nor_env(d) or _load_nor_recovery_fixed(d):
+            if _boot(d, C.BOOT_MEDIUM_NOR, "Booting NOR recovery Linux into RAM..."):
+                return C.BOOT_MEDIUM_NOR
     except Exception as e:
-        verbose(f"  chainload preparation failed: {e}", "warning")
-        return False
-    booted, err = with_spinner(d.boot_recovery, boot_medium=C.BOOT_MEDIUM_NOR,
-                               message="Booting NOR recovery Linux into RAM...")
-    return bool(booted) and not err
+        verbose(f"  NOR recovery preparation failed: {e}", "warning")
+    return None
 
 
 def _capture_env(d) -> dict:
@@ -203,9 +254,13 @@ def reach_recovery(port: str, dip_now: str, soft_reboot: Optional[Callable] = No
             return None, info
     info["env"] = _capture_env(d)
 
-    ok = _chainload_nor_recovery(d)
-    if not ok and not info["flipped"] and dip_now == DIP_EMMC:
-        _banner("  This U-Boot cannot load NOR recovery (no `sf`?).",
+    # On a NOR U-Boot (DIP RIGHT) its own `run recovery` IS NOR recovery.
+    if info["uboot_dip"] == DIP_NOR:
+        medium = C.BOOT_MEDIUM_NOR if _boot(d, C.BOOT_MEDIUM_NOR, "Booting recovery Linux...") else None
+    else:
+        medium = _boot_recovery_in_ram(d)
+    if medium is None and not info["flipped"] and dip_now == DIP_EMMC:
+        _banner("  Recovery Linux could not be started from this U-Boot.",
                 f"  ⚡ FLIP THE DIP SWITCH TO {DIP_TEXT[DIP_NOR]}, THEN POWER-CYCLE ⚡")
         ask("  Press Enter once you've done that... ")
         info["flipped"], info["uboot_dip"] = True, DIP_NOR
@@ -214,13 +269,11 @@ def reach_recovery(port: str, dip_now: str, soft_reboot: Optional[Callable] = No
         if d is None:
             return None, info
         info["env"] = _capture_env(d)
-        ok = _chainload_nor_recovery(d)
-    if not ok and info["uboot_dip"] == DIP_NOR:
-        # NOR U-Boot's own recovery command as the last resort.
-        ok, err = with_spinner(d.boot_recovery, boot_medium=C.BOOT_MEDIUM_NOR,
-                               message="Booting recovery Linux...")
-        ok = bool(ok) and not err
-    if not step(0, "NOR recovery Linux running from RAM", ok):
+        medium = C.BOOT_MEDIUM_NOR if _boot(d, C.BOOT_MEDIUM_NOR, "Booting recovery Linux...") else None
+    info["recovery_medium"] = medium
+    ok = medium is not None
+    where = "NOR" if medium == C.BOOT_MEDIUM_NOR else "eMMC"
+    if not step(0, f"Recovery Linux running from RAM ({where} recovery)", ok):
         d.disconnect()
         return None, info
     logged, err = with_spinner(d.login_recovery, timeout=LOGIN_TIMEOUT, message="Logging into recovery shell...")
@@ -290,6 +343,7 @@ class Capture:
     inventory: Optional[dict] = None  # platform inventory (inventory.py)
     emmc_env: Optional[bytes] = None  # raw eMMC U-Boot env region (info; it is in the image)
     auto: bool = False                # taken automatically before a restore
+    thorough: bool = False            # LAN: re-read every chunk from the eMMC (2nd media read, ~2x slower)
 
 
 def _text_files(cap: Capture) -> dict:
@@ -335,6 +389,12 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional
     sess.begin_snapshot(partial)
     chunks = S.plan_chunks(probe["emmc_bytes"])
     have_sha = "sha256sum" in probe["have"]
+    single = not cap.thorough and {"tee", "mkfifo"} <= probe["have"] \
+        and bool({"openssl", "sha256sum"} & probe["have"])
+    if not cap.thorough and not single:
+        _say("  ⚠ tee/mkfifo/openssl/sha256sum missing on the device — using the slower read-back verify.")
+    spin = "eMMC -> PC, hashing" if single else "eMMC -> PC, read back"
+    done = "captured and verified" if single else "captured and read-back verified"
 
     def fail(what, why):
         _stop_device_job(d)
@@ -343,7 +403,7 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional
         return None
 
     script = S.build_lan_snapshot_script(base_url=base_url, token=sess.token, chunks=chunks,
-                                         have_sha=have_sha, nor=nor)
+                                         have_sha=have_sha, nor=nor, single_pass=single)
     try:
         d.launch_script(script, marker="snap_lan")
     except Exception as e:
@@ -358,7 +418,7 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional
     out = []
     for i, off, n in chunks:
         raw, err = with_spinner(wait_for_report, f"snap_{i}", timeout=CHUNK_TIMEOUT,
-                                message=f"Chunk {i + 1}/{len(chunks)}: eMMC -> PC, read back")
+                                message=f"Chunk {i + 1}/{len(chunks)}: {spin}")
         kv = S.parse_kv(raw or "")
         up = sess.wait("uploads", i, UPLOAD_SETTLE_TIMEOUT)
         if err or raw is None:
@@ -372,10 +432,10 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional
         else:
             vsha = kv.get("VSHA")
         if vsha != up["sha256"]:
-            return fail(f"Chunk {i}", "read-back hash does not match what landed on the PC")
+            return fail(f"Chunk {i}", "device hash does not match what landed on the PC")
         out.append({"index": i, "offset": off, "bytes": n, "sha256": up["sha256"],
                     "file": up["file"], "compression": up["compression"]})
-        step(0, f"Chunk {i + 1}/{len(chunks)} captured and read-back verified", True)
+        step(0, f"Chunk {i + 1}/{len(chunks)} {done}", True)
 
     nor_rec = None
     if nor:
@@ -796,9 +856,12 @@ def clone_warning(manifest: dict, snap_macs: set, here_macs: set) -> list:
 # --- Boot from either DIP position (opt-in) ---------------------------------------------------
 
 def _upload(d, blob: bytes, dst: str) -> bool:
+    """Send a small blob over serial in pieces; True when the device's copy hashes right."""
+    out = ""
     try:
-        out = d.run_script(S.build_upload_blob_script(blob, dst), marker="snap_upload",
-                           write_timeout=UPLOAD_WRITE_TIMEOUT, exec_timeout=UPLOAD_WRITE_TIMEOUT)
+        for n, script in enumerate(S.build_upload_blob_scripts(blob, dst)):
+            out = d.run_script(script, marker=f"snap_upload{n}",
+                               write_timeout=UPLOAD_WRITE_TIMEOUT, exec_timeout=UPLOAD_WRITE_TIMEOUT)
     except Exception as e:
         verbose(f"  upload: {e}", "warning")
         return False
@@ -874,6 +937,7 @@ def health_check(d, probe: dict) -> dict:
 
     if "od" not in probe["have"]:
         health["notes"].append("od missing on the device — GPT not checked")
+        worst("warn")          # unchecked is never "ok"
     else:
         try:
             head = S.parse_od(d.run_script(S.build_dump_script(S.EMMC_DEV, 0, S.GPT_STD_SECTORS),
@@ -891,6 +955,7 @@ def health_check(d, probe: dict) -> dict:
             worst(gpt["status"])
         else:
             health["notes"].append("GPT area could not be read over serial — not checked")
+            worst("warn")          # unchecked is never "ok"
     try:
         kv = S.parse_kv(d.run_script(S.build_fs_check_script(), marker="snap_fsck",
                                      exec_timeout=FSCHECK_TIMEOUT))
@@ -899,6 +964,7 @@ def health_check(d, probe: dict) -> dict:
         verbose(f"  filesystem check: {e}", "warning")
     if kv.get("FSCHECK") != "done":
         health["notes"].append("filesystem check did not finish — not checked")
+        worst("warn")          # unchecked is never "ok"
     for n, r in S.parse_fs_check(kv).items():
         health["filesystems"][str(n)] = r
         worst(r["level"])
@@ -1005,9 +1071,12 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
         nor = False
         if probe["nor_present"]:
             nor = ask("  Also keep a read-only NOR dump for forensics (never restored)? [y/N]: ").lower() == "y"
+        thorough = False
+        if transfer == "lan":
+            thorough = ask("  Thorough verify: re-read every chunk from the eMMC (~2x slower)? [y/N]: ").lower() == "y"
         cap = Capture(label=label, probe=probe, identity=identity, env=env, os_label=os_label,
                       boot_dip=dip_now, nor_dump=nor, nor_env=nor_env, health=health,
-                      inventory=inventory, emmc_env=emmc_env)
+                      inventory=inventory, emmc_env=emmc_env, thorough=thorough)
 
         if transfer == "usb":
             m = snapshot_usb(d, cap)
@@ -1140,8 +1209,9 @@ def run_restore(*, port: str, transfer: str, host_ip: str, http_port: int,
             if ask("  Clone onto this board? [y/N]: ").lower() != "y":
                 return step(0, "Snapshot belongs to this board", False, "clone mode declined") or print_report()
             if probe["boot_medium"] != C.BOOT_MEDIUM_NOR:
-                step(0, "Running NOR recovery (needed for firmware update)", False,
-                     f"boot_medium={probe['boot_medium'] or '?'}")
+                step(0, "Running NOR recovery (needed for clone mode's firmware update)", False,
+                     f"this is {probe['boot_medium'] or '?'} recovery — set the DIP switch to "
+                     f"{DIP_TEXT[DIP_NOR]}, power-cycle and run the restore again")
                 return print_report()
         if not firmware_gate(target_inv, manifest.get("inventory"), clone=clone, ask=ask):
             return step(0, "Restore", False, "stopped to update the firmware first") or print_report()

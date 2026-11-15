@@ -74,6 +74,8 @@ NOR_KERNEL_OFF = C.NOR_KERNEL_OFFSET
 NOR_KERNEL_LEN = C.NOR_KERNEL_LEN
 RAM_KERNEL     = C.UBOOT_LOAD_ADDR
 RAM_DTB        = C.UBOOT_DTB_ADDR
+NOR_ENV_OFF    = hex(C.NOR_ENV_OFFSET)              # NOR U-Boot env (docs: 3 MiB)
+NOR_ENV_SIZES  = (hex(C.UBOOT_ENV_SIZE), "0x10000", "0x20000")   # tried in order, CRC-checked
 
 COMPRESSIONS = ("zst", "gz", "raw")
 
@@ -496,7 +498,9 @@ _RD_FN = r"""rd() {
   if [ $((_s % _m)) -eq 0 ] && [ "$_n" -ge "$_m" ]; then
     _q=$((_n / _m)); _r=$((_n % _m))
     dd if="$DEV" bs=$_m skip=$((_s / _m)) count=$_q 2>/dev/null
-    if [ "$_r" -gt 0 ]; then dd if="$DEV" bs=512 skip=$(((_s + _q * _m) / 512)) count=$((_r / 512)) 2>/dev/null; fi
+    if [ "$_r" -gt 0 ]; then
+      dd if="$DEV" bs=512 skip=$(((_s + _q * _m) / 512)) count=$((_r / 512)) 2>/dev/null
+    fi
   else
     dd if="$DEV" bs=512 skip=$((_s / 512)) count=$((_n / 512)) 2>/dev/null
   fi
@@ -504,6 +508,12 @@ _RD_FN = r"""rd() {
 }
 dropc() { sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null; return 0; }
 sha() { sha256sum | cut -d' ' -f1; }
+# fast SHA-256: openssl uses the CPU's SHA instructions (~10x sha256sum, LS1046A)
+fsha() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 | cut -d= -f2 | tr -d ' '
+  else sha256sum | cut -d' ' -f1; fi
+}
 """
 
 
@@ -513,7 +523,8 @@ def build_probe_script(dev: Optional[str] = None, usb_dev: Optional[str] = None)
     usb_dev = usb_dev or USB_DEV
     b = dev.split("/")[-1]
     tools = ["sha256sum", "zstd", "gzip", "curl", "sgdisk", "head", "tail",
-             "mount", "df", "flashcp", "base64", "od", "e2fsck", "fsck.vfat", "dosfsck"]
+             "mount", "df", "flashcp", "base64", "od", "e2fsck", "fsck.vfat", "dosfsck",
+             "openssl", "tee", "mkfifo"]
     s = [
         f'if [ -b {dev} ]; then echo "EMMC_BYTES=$(( $(cat /sys/block/{b}/size) * 512 ))"; '
         'else echo "EMMC_BYTES=0"; fi',
@@ -599,42 +610,77 @@ def _report(url: str, body: str) -> str:
 
 # -- LAN ------------------------------------------------------------------------------
 
+PLAN = "/tmp/mono_imager_plan.txt"   # one line per chunk / range, read by a shell loop
+
+# The scripts below are LOOPS over a short plan file, never one block per
+# chunk: CONFIRMED ON HARDWARE, a 13 KB script (30 chunks unrolled) did not
+# survive the serial heredoc write (run_script/launch_script's byte check
+# failed). Plan + loop keeps every script around 2 KB, whatever the eMMC size.
+
+
+def _plan(rows: list) -> list:
+    """Lines writing `rows` (lists of fields) to PLAN with a quoted heredoc."""
+    body = "\n".join(" ".join(str(x) for x in r) for r in rows)
+    return [f"cat > {PLAN} <<'MI_PLAN_EOF'", body, "MI_PLAN_EOF"]
+
+
+# wr START: dd parameters (bs, seek) for a write starting at START (aligned 1 MiB or 512 B)
+_WR_FN = r"""wr() {
+  if [ $(($1 % 1048576)) -eq 0 ]; then echo "bs=1048576 seek=$(($1 / 1048576))"
+  else echo "bs=512 seek=$(($1 / 512))"; fi
+}
+"""
+
+# LAN helpers — short lines: long lines wrap on the serial console and the
+# wrapped echo garbles (see SerialDevice.run_script()).
+#   put PATH       stdin -> PC (PUT $U/PATH)        rep STEP K=V...  report to the PC
+_NET_FN = f"""put() {{ curl -s -S -H 'Expect:' -T - "$U/$1" -o /dev/null 2>>{LOG}; }}
+rep() {{
+  _st=$1; shift
+  printf '%s\\n' "$@" | curl -s -H 'Expect:' -X POST --data-binary @- \\
+    "$U/report?step=$_st" >/dev/null 2>&1
+}}
+"""
+
+
 def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
-                              have_sha: bool, nor: bool, dev: Optional[str] = None) -> str:
+                              have_sha: bool, nor: bool, dev: Optional[str] = None,
+                              single_pass: bool = False) -> str:
     """
     Stream every chunk RAW to the PC (the PC compresses + hashes), then
     re-read it from the eMMC with the page cache dropped (a real media
     read) and hash it: on the device when it has sha256sum, otherwise
     by streaming it to the PC's hash-only endpoint. Optional read-only
     NOR dump at the end. One report per chunk (step=snap_<i>).
+
+    single_pass: read each chunk once and hash it on the device while it
+    streams (tee into a FIFO) instead of a second media read. Proves the
+    PC got exactly what was read; ~2x faster. Needs tee, mkfifo and
+    openssl or sha256sum on the device (the caller checks).
     """
     dev = dev or EMMC_DEV
-    t = f"token={token}"
-    s = [f"DEV={dev}", _RD_FN]
-    s.append(f"rd {FW_START} {FW_END - FW_START} | curl -s -H 'Expect:' -T - "
-             f"{_q(base_url + '/verify?' + t + '&tag=fw')} -o /dev/null")
-    s.append(f"rd 0 {FW_START} | curl -s -H 'Expect:' -T - "
-             f"{_q(base_url + '/verify?' + t + '&tag=boot')} -o /dev/null")
-    for i, off, n in chunks:
-        up = base_url + f"/upload?{t}&chunk={i}"
-        s += [
-            f"rd {off} {n} | curl -s -S -H 'Expect:' -T - {_q(up)} -o /dev/null 2>>{LOG}",
-            "urc=$?",
-            "dropc",
-        ]
+    s = [f"DEV={dev}", f"U={_q(base_url)}", f"T={_q('token=' + token)}", _RD_FN, _NET_FN]
+    s += _plan([[i, off, n] for i, off, n in chunks])
+    s += [f'rd {FW_START} {FW_END - FW_START} | put "verify?$T&tag=fw"',
+          f'rd 0 {FW_START} | put "verify?$T&tag=boot"',
+          "while read -r i off n; do"]
+    if single_pass:
+        s += ["  dropc; rm -f /tmp/mi_f /tmp/mi_v; mkfifo /tmp/mi_f",
+              "  fsha < /tmp/mi_f > /tmp/mi_v &",
+              '  rd $off $n | tee /tmp/mi_f | put "upload?$T&chunk=$i"; urc=$?',
+              "  wait; vs=$(cat /tmp/mi_v)"]
+    else:
+        s += ['  rd $off $n | put "upload?$T&chunk=$i"; urc=$?',
+              "  dropc"]
         if have_sha:
-            s.append(f'vs=$(rd {off} {n} | sha)')
+            s.append("  vs=$(rd $off $n | sha)")
         else:
-            s.append(f"rd {off} {n} | curl -s -H 'Expect:' -T - "
-                     f"{_q(base_url + '/verify?' + t + '&tag=c' + str(i))} -o /dev/null; vs=host")
-        s.append(_report(base_url + f"/report?step=snap_{i}",
-                         f'"CHUNK={i}" "UP_RC=$urc" "VSHA=$vs"'))
+            s.append('  rd $off $n | put "verify?$T&tag=c$i"; vs=host')
+    s += ['  rep snap_$i "CHUNK=$i" "UP_RC=$urc" "VSHA=$vs"',
+          f"done < {PLAN}"]
     if nor:
-        s += [
-            f"cat {NOR_DEV} | curl -s -H 'Expect:' -T - {_q(base_url + '/nor?' + t)} -o /dev/null",
-            "nrc=$?",
-            _report(base_url + "/report?step=snap_nor", '"NOR_RC=$nrc"'),
-        ]
+        s += [f'cat {NOR_DEV} | put "nor?$T"; nrc=$?',
+              'rep snap_nor "NOR_RC=$nrc"']
     return "\n".join(s) + "\n"
 
 
@@ -660,28 +706,22 @@ def build_lan_restore_script(*, base_url: str, token: str, ranges: list,
     One report per range (step=rst_<k>).
     """
     dev = dev or EMMC_DEV
-    t = f"token={token}"
-    s = [f"DEV={dev}", _RD_FN]
-    for k, r in enumerate(ranges):
-        url = base_url + f"/image?{t}&k={k}&chunk={r['chunk']}&off={r['off']}&len={r['len']}"
-        if r["abs"] % MIB == 0:
-            bs, seek = MIB, r["abs"] // MIB
-        else:
-            bs, seek = SECTOR, r["abs"] // SECTOR
-        s += [
-            f"{{ curl -s -S {_q(url)} 2>>{LOG}; echo $? > /tmp/mi_crc; }} | "
-            f"dd of=\"$DEV\" bs={bs} seek={seek} conv=notrunc 2>>{LOG}",
-            "drc=$?; crc=$(cat /tmp/mi_crc)",
-            "dropc",
-        ]
-        if have_sha:
-            s.append(f"vs=$(rd {r['abs']} {r['len']} | sha)")
-        else:
-            s.append(f"rd {r['abs']} {r['len']} | curl -s -H 'Expect:' -T - "
-                     f"{_q(base_url + '/verify?' + t + '&tag=r' + str(k))} -o /dev/null; vs=host")
-        s.append(_report(base_url + f"/report?step=rst_{k}",
-                         f'"RANGE={k}" "CURL_RC=$crc" "DD_RC=$drc" "VSHA=$vs"'))
-        s.append('[ "$crc" = 0 ] && [ "$drc" = 0 ] || exit 1')
+    s = [f"DEV={dev}", f"U={_q(base_url)}", f"T={_q('token=' + token)}",
+         _RD_FN, _WR_FN, _NET_FN]
+    s += _plan([[k, r["chunk"], r["off"], r["len"], r["abs"]] for k, r in enumerate(ranges)])
+    s += ["while read -r k c o n a; do",
+          '  q="image?$T&k=$k&chunk=$c&off=$o&len=$n"',
+          f'  {{ curl -s -S "$U/$q" 2>>{LOG}; echo $? > /tmp/mi_crc; }} |',
+          f'    dd of="$DEV" $(wr $a) conv=notrunc 2>>{LOG}',
+          "  drc=$?; crc=$(cat /tmp/mi_crc)",
+          "  dropc"]
+    if have_sha:
+        s.append("  vs=$(rd $a $n | sha)")
+    else:
+        s.append('  rd $a $n | put "verify?$T&tag=r$k"; vs=host')
+    s += ['  rep rst_$k "RANGE=$k" "CURL_RC=$crc" "DD_RC=$drc" "VSHA=$vs"',
+          '  [ "$crc" = 0 ] && [ "$drc" = 0 ] || exit 1',
+          f"done < {PLAN}"]
     return "\n".join(s) + "\n"
 
 
@@ -771,22 +811,21 @@ def build_usb_snapshot_script(*, label: str, chunks: list, compression: str,
     mount = mount or USB_MOUNT
     d = f"{mount}/{USB_ROOT}/{label}.partial"
     comp, dec = _comp_cmd(compression, have), _decomp_cmd(compression)
+    pre = _plan([[i, off, n, chunk_file(i, compression)] for i, off, n in chunks])
     b = [f"DEV={dev}", _RD_FN, f"D={_q(d)}", 'rm -rf "$D"; mkdir -p "$D" || exit 1',
          f'echo "FW_SHA=$(rd {FW_START} {FW_END - FW_START} | sha)" >> {LOG}',
-         f'echo "BOOT_SHA=$(rd 0 {FW_START} | sha)" >> {LOG}']
-    for i, off, n in chunks:
-        f = '"$D"/' + chunk_file(i, compression)
-        b += [
-            f"rd {off} {n} | {comp} > {f}; c=$?",
-            "dropc",
-            f"h1=$({dec} < {f} | sha); h2=$(rd {off} {n} | sha)",
-            f'echo "C_{i}=$c $h1 $h2" >> {LOG}',
-            f'[ "$c" = 0 ] && [ "$h1" = "$h2" ] || {{ echo "FAILED={i}" >> {LOG}; exit 1; }}',
-        ]
+         f'echo "BOOT_SHA=$(rd 0 {FW_START} | sha)" >> {LOG}',
+         "while read -r i off n f; do",
+         f'  rd $off $n | {comp} > "$D/$f"; c=$?',
+         "  dropc",
+         f'  h1=$({dec} < "$D/$f" | sha); h2=$(rd $off $n | sha)',
+         f'  echo "C_$i=$c $h1 $h2" >> {LOG}',
+         f'  [ "$c" = 0 ] && [ "$h1" = "$h2" ] || {{ echo "FAILED=$i" >> {LOG}; exit 1; }}',
+         f"done < {PLAN}"]
     if nor:
         b += [f'cat {NOR_DEV} > "$D"/nor.bin; echo "NOR=$? $(sha < "$D"/nor.bin)" >> {LOG}']
     b.append('sync')
-    return _bg(b, "SNAP_DONE")
+    return "\n".join(pre) + "\n" + _bg(b, "SNAP_DONE")
 
 
 def build_usb_finalize_script(*, label: str, manifest_text: str, text_files: dict,
@@ -863,30 +902,30 @@ def build_usb_restore_script(*, label: str, manifest: dict, ranges: list,
     mount = mount or USB_MOUNT
     d = f"{mount}/{USB_ROOT}/{label}"
     by_index = {c["index"]: c for c in manifest["chunks"]}
-    b = [f"DEV={dev}", _RD_FN, f"cd {_q(d)} || {{ echo 'SUMS=missing' >> {LOG}; exit 1; }}",
-         f"if sha256sum -c SHA256SUMS >/dev/null 2>&1; then echo SUMS=ok >> {LOG}; "
-         f"else echo SUMS=bad >> {LOG}; exit 1; fi"]
+    rows = []
     for k, r in enumerate(ranges):
         c = by_index[r["chunk"]]
-        dec = _decomp_cmd(c["compression"]) + " < " + c["file"]
-        cut = ""
-        if r["off"] or r["len"] != c["bytes"]:
-            cut = f" | tail -c +{r['off'] + 1} | head -c {r['len']}"
-        if r["abs"] % MIB == 0:
-            bs, seek = MIB, r["abs"] // MIB
-        else:
-            bs, seek = SECTOR, r["abs"] // SECTOR
-        b += [f"{dec}{cut} | dd of=\"$DEV\" bs={bs} seek={seek} conv=notrunc 2>/dev/null; drc=$?",
-              "dropc"]
-        if cut:
-            b.append(f"want=$({dec}{cut} | sha)")
-        else:
-            b.append(f"want={c['sha256']}")
-        b += [f"got=$(rd {r['abs']} {r['len']} | sha)",
-              f'echo "R_{k}=$drc $want $got" >> {LOG}',
-              f'[ "$drc" = 0 ] && [ "$want" = "$got" ] || {{ echo "FAILED={k}" >> {LOG}; exit 1; }}']
-    b.append("sync")
-    return _bg(b, "RESTORE_DONE")
+        full = r["off"] == 0 and r["len"] == c["bytes"]
+        rows.append([k, c["file"], c["compression"], r["off"], r["len"], r["abs"],
+                     c["sha256"] if full else "-"])
+    pre = _plan(rows)
+    b = [f"DEV={dev}", _RD_FN, _WR_FN,
+         'dec() { case $1 in zst) zstd -q -d -c;; gz) gzip -d -c;; *) cat;; esac; }',
+         f"cd {_q(d)} || {{ echo 'SUMS=missing' >> {LOG}; exit 1; }}",
+         f"if sha256sum -c SHA256SUMS >/dev/null 2>&1; then echo SUMS=ok >> {LOG}; "
+         f"else echo SUMS=bad >> {LOG}; exit 1; fi",
+         "src() { if [ \"$w\" = - ]; then dec $z < \"$f\" | tail -c +$((o + 1)) | head -c $n; "
+         "else dec $z < \"$f\"; fi; }",
+         "while read -r k f z o n a w; do",
+         '  src | dd of="$DEV" $(wr $a) conv=notrunc 2>/dev/null; drc=$?',
+         "  dropc",
+         '  if [ "$w" = - ]; then want=$(src | sha); else want=$w; fi',
+         "  got=$(rd $a $n | sha)",
+         f'  echo "R_$k=$drc $want $got" >> {LOG}',
+         f'  [ "$drc" = 0 ] && [ "$want" = "$got" ] || {{ echo "FAILED=$k" >> {LOG}; exit 1; }}',
+         f"done < {PLAN}",
+         "sync"]
+    return "\n".join(pre) + "\n" + _bg(b, "RESTORE_DONE")
 
 
 def build_log_script() -> str:
@@ -918,23 +957,28 @@ def build_gpt_fix_script(dev: Optional[str] = None) -> str:
 
 
 # --- Reading raw bytes over serial (od) ----------------------------------------------
-# Small regions (GPT, NOR env) are read as `od -Ax -tx1 -v` text: works in
-# BusyBox, needs no network, and every line starts with its own offset, so
-# run_script()'s duplicate-line filter can never merge two lines.
+# Small regions (GPT, NOR env) are read as `od -v -b` text: octal offset +
+# octal bytes. CONFIRMED ON HARDWARE: recovery Linux's BusyBox od has no -A
+# / -t ("od: invalid option -- 'A'"); -b and -v are the classic options every
+# od has. Every line starts with its own offset, so run_script()'s
+# duplicate-line filter can never merge two lines.
+
+OD_ARGS = "-v -b"
+
 
 def build_dump_script(src: str, skip: int, count: int, bs: int = SECTOR) -> str:
-    """Hex dump of `count` blocks of `bs` bytes of `src`, starting at block `skip`."""
-    return (f"dd if={src} bs={bs} skip={skip} count={count} 2>/dev/null | od -Ax -tx1 -v; "
+    """Octal dump of `count` blocks of `bs` bytes of `src`, starting at block `skip`."""
+    return (f"dd if={src} bs={bs} skip={skip} count={count} 2>/dev/null | od {OD_ARGS}; "
             "echo DUMP_DONE=1\n")
 
 
 def parse_od(text: str) -> Optional[bytes]:
-    """Bytes from `od -Ax -tx1 -v` output, or None if it is not contiguous."""
+    """Bytes from `od -v -b` output (octal), or None if it is not contiguous."""
     rows = {}
     for line in (text or "").splitlines():
-        m = re.match(r"^([0-9a-f]{6,})((?: [0-9a-f]{2})+)\s*$", line.strip())
+        m = re.match(r"^([0-7]{7,})((?: [0-7]{3})+)\s*$", line.strip())
         if m:
-            rows[int(m.group(1), 16)] = bytes(int(b, 16) for b in m.group(2).split())
+            rows[int(m.group(1), 8)] = bytes(int(b, 8) for b in m.group(2).split())
     out, pos = bytearray(), 0
     for off in sorted(rows):
         if off != pos:
@@ -955,7 +999,7 @@ def build_nor_env_dump_script() -> str:
         f'  e="{MTD_DEV_DIR}/$(basename "$s")"; break',
         "done",
         'echo "NOR_ENV_DEV=$e"',
-        f'[ -n "$e" ] && dd if="$e" bs={NOR_ENV_SIZE} count=1 2>/dev/null | od -Ax -tx1 -v',
+        f'[ -n "$e" ] && dd if="$e" bs={NOR_ENV_SIZE} count=1 2>/dev/null | od {OD_ARGS}',
         "echo DUMP_DONE=1",
     ]) + "\n"
 
@@ -971,13 +1015,24 @@ def build_emmc_env_dump_script(dev: Optional[str] = None) -> str:
     return build_dump_script(dev or EMMC_DEV, EMMC_ENV_SECTOR, EMMC_ENV_SECTORS)
 
 
-def build_upload_blob_script(data: bytes, dst: str) -> str:
-    """Recreate `data` as file `dst` on the device over serial (printf, octal escapes)."""
-    s = [f": > {dst}"]
-    for i in range(0, len(data), PRINTF_CHUNK):
-        s.append(f"printf '{printf_octal(data[i:i + PRINTF_CHUNK])}' >> {dst}")
-    s.append(f'echo "UPLOAD_SHA=$(sha256sum < {dst} | cut -d" " -f1)"')
-    return "\n".join(s) + "\n"
+UPLOAD_PIECE = 512                   # bytes of a blob per serial script (~2 KB of text)
+
+
+def build_upload_blob_scripts(data: bytes, dst: str) -> list:
+    """
+    Scripts that recreate `data` as file `dst` on the device over serial
+    (printf, octal escapes), each small enough for one serial heredoc.
+    The last one prints UPLOAD_SHA=<sha256 of dst>.
+    """
+    scripts = []
+    for start in range(0, len(data), UPLOAD_PIECE):
+        piece = data[start:start + UPLOAD_PIECE]
+        s = [f": > {dst}"] if start == 0 else []
+        for i in range(0, len(piece), PRINTF_CHUNK):
+            s.append(f"printf '{printf_octal(piece[i:i + PRINTF_CHUNK])}' >> {dst}")
+        scripts.append("\n".join(s) + "\n")
+    scripts.append(f'echo "UPLOAD_SHA=$(sha256sum < {dst} | cut -d" " -f1)"\n')
+    return scripts
 
 
 def build_emmc_env_write_script(src: str, want_sha: str, dev: Optional[str] = None) -> str:
@@ -1129,8 +1184,8 @@ def build_fs_check_script(dev: Optional[str] = None, partitions: str = "/proc/pa
     return "\n".join([
         f'for p in $(grep -o "{b}p[0-9][0-9]*$" {partitions}); do',
         f'  n=${{p##*p}}; d={dev_dir}/$p; t=other',
-        f'  m=$(dd if=$d bs=1 skip={EXT_MAGIC_OFFSET} count=2 2>/dev/null | od -An -tx1 | tr -d " \\n")',
-        f'  [ "$m" = "{EXT_MAGIC.hex()}" ] && t=ext',
+        f'  set -- $(dd if=$d bs=1 skip={EXT_MAGIC_OFFSET} count=2 2>/dev/null | od -b | head -n 1)',
+        f'  [ "$2 $3" = "{" ".join(f"{b:03o}" for b in EXT_MAGIC)}" ] && t=ext',
         f'  for o in {" ".join(str(o) for o in FAT_LABEL_OFFSETS)}; do',
         '    [ "$(dd if=$d bs=1 skip=$o count=3 2>/dev/null)" = "FAT" ] && t=vfat',
         '  done',

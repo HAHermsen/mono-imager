@@ -37,6 +37,8 @@ LINE_IDLE_MAX_WAIT = 5.0
 LINE_IDLE_SHORT_WAIT = 2.0
 POLL_SLEEP = 0.02                  # short poll interval, not a settling sleep
 SCRIPT_WRITE_TIMEOUT = 10.0        # run_script()/launch_script() heredoc write
+ECHO_BYTES_PER_S = 500             # worst-case console echo rate of a heredoc (wraps + redraws):
+                                   # the post-write idle wait grows with the script size
 AUTOBOOT_DEFAULT_TIMEOUT = 30
 INTERRUPT_PROMPT_TIMEOUT = 5.0     # after the interrupt key, wait for "=>"
 INTERRUPT_KEY_COUNT = 5            # interrupt_autoboot(): keypresses sent
@@ -544,7 +546,11 @@ class SerialDevice:
         # genuinely still rendering output after the prompt-match fired.
         # Same idle-wait applied here as before the exec step, for the
         # same reason: don't assume "prompt seen" means "device settled."
-        self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
+        # A long heredoc keeps echoing after the prompt pattern first shows
+        # (confirmed on hardware with a 13 KB script): big scripts get
+        # proportionally longer to go quiet. Small scripts: unchanged.
+        self._wait_for_line_idle(settle_time=LINE_SETTLE,
+                                 max_wait=max(LINE_IDLE_MAX_WAIT, len(write_cmd) / ECHO_BYTES_PER_S))
 
         # Verify the file landed with the expected byte count before
         # trusting it enough to execute. expected_size = body + newline
@@ -719,7 +725,11 @@ class SerialDevice:
                 break
         verbose(f"<< [launch_script:write raw] {len(write_response)} bytes: {write_response[:C.LOG_TAIL_LONG]!r}", "debug")
 
-        self._wait_for_line_idle(settle_time=LINE_SETTLE, max_wait=LINE_IDLE_MAX_WAIT)
+        # A long heredoc keeps echoing after the prompt pattern first shows
+        # (confirmed on hardware with a 13 KB script): big scripts get
+        # proportionally longer to go quiet. Small scripts: unchanged.
+        self._wait_for_line_idle(settle_time=LINE_SETTLE,
+                                 max_wait=max(LINE_IDLE_MAX_WAIT, len(write_cmd) / ECHO_BYTES_PER_S))
 
         # Same byte-count verification as run_script() — still refuse
         # to launch an unverified/corrupted script, even though we

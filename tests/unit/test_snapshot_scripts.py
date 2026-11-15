@@ -19,6 +19,11 @@ What this tests:
   - USB restore: identical target, firmware region skip, a corrupted file
     on the stick stops the restore BEFORE anything is written
   - every generated script parses (sh -n), incl. the probe
+  - single-pass LAN snapshot (hash while streaming, tee + FIFO): fsha with
+    OpenSSL 3 / 1.1 output and without openssl; a wrong device hash and an
+    upload cut mid-stream are refused without hanging; stale /tmp files;
+    NOR dump; progress text; fallbacks to read-back; "Thorough verify"
+    asked for LAN only; auto-snapshot before a restore; serial-safe size
 
 Skipped (not failed) on hosts without /bin/sh or curl.
 
@@ -35,6 +40,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
+import contextlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,7 +82,7 @@ if not Path("/bin/sh").exists() or not shutil.which("curl"):
 BUSYBOX = shutil.which("busybox")
 APPLETS = ["sh", "dd", "od", "strings", "date", "uname", "cut", "tr", "rm", "sync", "sleep", "cat", "grep", "printf", "basename",
            "dirname", "mkdir", "mv", "ls", "sort", "touch", "head", "tail", "gzip", "sha256sum",
-           "df", "mount", "umount", "wc", "echo", "test", "["]
+           "df", "mount", "umount", "wc", "echo", "test", "[", "tee", "mkfifo"]
 work = Path(tempfile.mkdtemp(prefix="mi_snap_sh_"))
 CHUNK = 32 * S.MIB   # small chunks so a 40 MiB "eMMC" has two
 
@@ -181,6 +188,9 @@ for name, shell, envv in shells():
         "probe": S.build_probe_script(),
         "lan snapshot": S.build_lan_snapshot_script(base_url="http://h:1", token="t",
                                                     chunks=[(0, 0, CHUNK)], have_sha=False, nor=True),
+        "lan snapshot (single pass)": S.build_lan_snapshot_script(base_url="http://h:1", token="t",
+                                                    chunks=[(0, 0, CHUNK)], have_sha=True, nor=True,
+                                                    single_pass=True),
         "lan restore": S.build_lan_restore_script(base_url="http://h:1", token="t",
                                                   ranges=[{"chunk": 0, "off": 0, "len": 4096, "abs": 0}],
                                                   have_sha=True),
@@ -200,26 +210,32 @@ for name, shell, envv in shells():
     check("probe runs to the end", S.parse_probe(out)["ok"])
 
     # ------------------------------------------------------------------------
-    for have_sha in (True, False):
-        section(f"[{name}] LAN snapshot + restore (device sha256sum: {have_sha})")
-        emmc = work / f"emmc_{name}_{have_sha}.img"
+    for have_sha, extra in ((True, ()), (False, ()), (True, ("tee", "mkfifo")),
+                            (True, ("tee", "mkfifo", "openssl"))):
+        single = bool(extra)
+        section(f"[{name}] LAN snapshot + restore (device sha256sum: {have_sha}, single pass: {extra})")
+        tag = f"{have_sha}_{'_'.join(extra) or 'two'}"
+        emmc = work / f"emmc_{name}_{tag}.img"
         size = 40 * S.MIB + 1536
         disk = make_disk(emmc, size)
-        store = work / f"store_{name}_{have_sha}"
+        store = work / f"store_{name}_{tag}"
         store.mkdir()
         port = free_port()
         sess = SnapshotSession()
         srv = start_snapshot_server("127.0.0.1", port, sess)
         base = f"http://127.0.0.1:{port}"
         dev = FakeDev(shell, envv)
-        have = {"sha256sum"} if have_sha else set()
+        have = ({"sha256sum"} if have_sha else set()) | set(extra)
         with patch.object(S, "CHUNK_BYTES", CHUNK), patch.object(S, "EMMC_DEV", str(emmc)), \
              patch("builtins.print"):
             real_lan = S.build_lan_snapshot_script
             with patch.object(S, "build_lan_snapshot_script",
-                              lambda **kw: real_lan(**dict(kw, dev=str(emmc)))):
+                              lambda **kw: (seen.append(kw.get("single_pass")),
+                                            real_lan(**dict(kw, dev=str(emmc))))[1]):
+                seen = []
                 m = SO.snapshot_lan(dev, sess, base, store, cap("snap1", probe_for(size, have)))
         dev.wait()
+        check(f"single pass used: {single}", seen == [single])
         check("snapshot published with a manifest", m is not None and (store / "snap1" / "manifest.json").is_file())
         ok, why, mm = S.verify_store_snapshot(store / "snap1")
         check("published snapshot verifies (SHA256SUMS)", ok)
@@ -231,7 +247,7 @@ for name, shell, envv in shells():
         check("no .partial left behind", not (store / "snap1.partial").exists())
 
         # restore to a bigger, different target
-        tgt = work / f"tgt_{name}_{have_sha}.img"
+        tgt = work / f"tgt_{name}_{tag}.img"
         tgt.write_bytes(b"\xAA" * (size + 8 * S.MIB))
         real_rst = S.build_lan_restore_script
         for skip_fw in (False, True):
@@ -340,6 +356,212 @@ for name, shell, envv in shells():
 
 
 # ----------------------------------------------------------------------------
+# Single-pass LAN snapshot: each chunk read ONCE and hashed on the device while
+# it streams (tee into a FIFO). Edge cases, under every shell.
+NORF = work / "sp_nor.bin"
+NORF.write_bytes(os.urandom(2 * S.MIB))
+REAL_CURL = shutil.which("curl")
+SP_ALL = {"sha256sum", "tee", "mkfifo", "openssl"}
+SSL_STUB = {   # fake openssl: real hash, OpenSSL 3 / 1.1 output; or a wrong hash
+    "ssl3": '#!/bin/sh\nh=$(sha256sum | cut -d" " -f1)\necho "SHA2-256(stdin)= $h"\n',
+    "ssl1": '#!/bin/sh\nh=$(sha256sum | cut -d" " -f1)\necho "(stdin)= $h"\n',
+    "sslbad": '#!/bin/sh\ncat >/dev/null\necho "SHA2-256(stdin)= ' + "0" * 64 + '"\n',
+}
+# fake curl: an upload gets cut after 1 MiB (curl rc 56), everything else is real
+CUT_CURL = ('#!/bin/sh\ncase "$*" in\n  *upload*) head -c 1048576 | ' + REAL_CURL + ' "$@"; exit 56;;\n'
+            'esac\nexec ' + REAL_CURL + ' "$@"\n')
+
+
+def stub_dir(tag, files):
+    d = work / f"stub_{tag}"
+    d.mkdir(exist_ok=True)
+    for n, body in files.items():
+        (d / n).write_text(body)
+        (d / n).chmod(0o755)
+    return d
+
+
+def with_path(envv, d):
+    return dict(envv, PATH=f"{d}:{envv['PATH']}")
+
+
+def chunk_hashes(disk):
+    return [hashlib.sha256(disk[:CHUNK]).hexdigest(), hashlib.sha256(disk[CHUNK:]).hexdigest()]
+
+
+def lan_snapshot(shell, envv, have, label, *, thorough=False, nor_dump=False, **so_patches):
+    """snapshot_lan end to end on a fresh 40 MiB "eMMC". Returns (manifest, disk, store, rec):
+    rec = single_pass flags passed to the script builder, spinner texts, steps, _say lines,
+    elapsed seconds, and whether the device script exited (no FIFO hang)."""
+    size = 40 * S.MIB + 1536
+    emmc = work / f"emmc_{label}.img"
+    disk = make_disk(emmc, size)
+    store = work / f"store_{label}"
+    store.mkdir()
+    port = free_port()
+    sess = SnapshotSession()
+    srv = start_snapshot_server("127.0.0.1", port, sess)
+    dev = FakeDev(shell, envv)
+    rec = {"single": [], "spin": [], "steps": [], "say": []}
+    real_lan, real_spin, real_step = S.build_lan_snapshot_script, SO.with_spinner, SO.step
+
+    def lan(**kw):
+        rec["single"].append(kw.get("single_pass"))
+        return real_lan(**dict(kw, dev=str(emmc)))
+
+    def spin(fn, *a, message="", **kw):
+        rec["spin"].append(message)
+        return real_spin(fn, *a, message=message, **kw)
+
+    def stp(n, text, ok, reason=""):
+        rec["steps"].append((text, ok, reason))
+        return real_step(n, text, ok, reason)
+
+    patches = [patch.object(S, "CHUNK_BYTES", CHUNK), patch.object(S, "EMMC_DEV", str(emmc)),
+               patch.object(S, "NOR_DEV", str(NORF)), patch.object(S, "build_lan_snapshot_script", lan),
+               patch.object(SO, "with_spinner", spin), patch.object(SO, "step", stp),
+               patch.object(SO, "_say", lambda m="": rec["say"].append(m)), patch("builtins.print")]
+    patches += [patch.object(SO, k, v) for k, v in so_patches.items()]
+    t0 = time.time()
+    with contextlib.ExitStack() as es:
+        for pt in patches:
+            es.enter_context(pt)
+        m = SO.snapshot_lan(dev, sess, f"http://127.0.0.1:{port}", store,
+                            cap(label, probe_for(size, have), thorough=thorough, nor_dump=nor_dump))
+    rec["elapsed"] = time.time() - t0
+    rec["exited"] = True
+    for pr in dev.procs:
+        try:
+            pr.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            rec["exited"] = False
+            pr.kill()
+    srv.shutdown()
+    return m, disk, store, rec
+
+
+def nothing_published(store, label):
+    return not (store / label).exists() and not (store / f"{label}.partial").exists()
+
+
+def reason(rec):
+    return " | ".join(r for _, ok, r in rec["steps"] if not ok)
+
+
+for name, shell, envv in shells():
+    section(f"[{name}] single pass: fsha (OpenSSL 3 / 1.1 output, no openssl)")
+    want = hashlib.sha256(b"abc").hexdigest()
+    variants = [("OpenSSL 3 output", with_path(envv, stub_dir("ssl3", {"openssl": SSL_STUB["ssl3"]}))),
+                ("OpenSSL 1.1 output", with_path(envv, stub_dir("ssl1", {"openssl": SSL_STUB["ssl1"]})))]
+    if name == "sh":
+        if shutil.which("openssl"):
+            variants.append(("real openssl", envv))
+        nossl = work / "nossl_bin"
+        if not nossl.exists():
+            nossl.mkdir()
+            for tool in ("sha256sum", "cut", "tr"):
+                (nossl / tool).symlink_to(shutil.which(tool))
+        variants.append(("no openssl -> sha256sum", dict(envv, PATH=str(nossl))))
+    else:
+        variants.append(("no openssl -> sha256sum", envv))   # BusyBox PATH has no openssl
+    for what, e in variants:
+        r = subprocess.run(shell + ["-c", S._RD_FN + "printf abc | fsha\n"], env=e,
+                           capture_output=True, text=True)
+        check(f"fsha, {what}: bare hex digest", r.stdout.strip() == want)
+
+    section(f"[{name}] single pass: normal run with NOR dump, progress text")
+    m, disk, store, rec = lan_snapshot(shell, envv, SP_ALL, f"spnor_{name}", nor_dump=True)
+    check("single pass used", rec["single"] == [True])
+    check("snapshot published, hashes = the disk", m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
+    ok, _, _ = S.verify_store_snapshot(store / f"spnor_{name}")
+    check("published snapshot verifies (SHA256SUMS)", ok)
+    check("NOR dump after the single-pass loop: stored, hash recorded",
+          m is not None and m["nor_dump"]["sha256"] == hashlib.sha256(NORF.read_bytes()).hexdigest()
+          and (store / f"spnor_{name}" / "nor.bin").read_bytes() == NORF.read_bytes())
+    check("spinner says 'hashing'", rec["spin"] == [f"Chunk {i}/2: eMMC -> PC, hashing" for i in (1, 2)])
+    check("steps say 'captured and verified'",
+          [s for s, ok, _ in rec["steps"] if s.startswith("Chunk")] ==
+          [f"Chunk {i}/2 captured and verified" for i in (1, 2)])
+    check("no fallback warning", not any("missing on the device" in s for s in rec["say"]))
+
+    section(f"[{name}] single pass: wrong device hash is refused")
+    e = with_path(envv, stub_dir("sslbad", {"openssl": SSL_STUB["sslbad"]}))
+    m, disk, store, rec = lan_snapshot(shell, e, SP_ALL, f"bad_{name}")
+    check("single pass used", rec["single"] == [True])
+    check("snapshot refused", m is None)
+    check("reason: device hash does not match", "device hash does not match" in reason(rec))
+    check("nothing published, no .partial", nothing_published(store, f"bad_{name}"))
+    check("device script exited", rec["exited"])
+
+    section(f"[{name}] single pass: upload cut mid-stream (no FIFO hang)")
+    e = with_path(envv, stub_dir(f"cut_{name}", {"curl": CUT_CURL}))
+    m, disk, store, rec = lan_snapshot(shell, e, SP_ALL, f"cut_{name}",
+                                       UPLOAD_SETTLE_TIMEOUT=10, CHUNK_TIMEOUT=60)
+    check("snapshot refused", m is None)
+    check(f"reason names the short transfer ({reason(rec)[:60]})",
+          "transfer failed" in reason(rec) and "rc=56" in reason(rec) and f"1048576 of {CHUNK}" in reason(rec))
+    check("device script exited (tee/fsha/curl did not deadlock)", rec["exited"])
+    check(f"failed fast ({rec['elapsed']:.1f}s < 30s)", rec["elapsed"] < 30)
+    check("nothing published, no .partial", nothing_published(store, f"cut_{name}"))
+
+    section(f"[{name}] single pass: stale /tmp/mi_f and /tmp/mi_v from a crashed run")
+    for kind in ("file", "fifo"):
+        for f in (Path("/tmp/mi_f"), Path("/tmp/mi_v")):
+            f.unlink(missing_ok=True)
+        if kind == "file":
+            Path("/tmp/mi_f").write_text("junk\n")
+        else:
+            os.mkfifo("/tmp/mi_f")
+        Path("/tmp/mi_v").write_text("f" * 64 + "\n")
+        m, disk, store, rec = lan_snapshot(shell, envv, SP_ALL, f"stale_{kind}_{name}")
+        check(f"stale /tmp/mi_f ({kind}) + stale /tmp/mi_v: snapshot OK, hashes = the disk",
+              m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
+    for f in (Path("/tmp/mi_f"), Path("/tmp/mi_v")):
+        f.unlink(missing_ok=True)
+
+    section(f"[{name}] mode selection: thorough + fallbacks to read-back")
+    m, disk, store, rec = lan_snapshot(shell, envv, SP_ALL, f"thor_{name}", thorough=True)
+    check("thorough: read-back used although single pass is possible", rec["single"] == [False])
+    check("thorough: snapshot OK, hashes = the disk", m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
+    check("thorough: spinner says 'read back'", rec["spin"] == [f"Chunk {i}/2: eMMC -> PC, read back" for i in (1, 2)])
+    check("thorough: steps say 'captured and read-back verified'",
+          [s for s, ok, _ in rec["steps"] if s.startswith("Chunk")] ==
+          [f"Chunk {i}/2 captured and read-back verified" for i in (1, 2)])
+    check("thorough: no fallback warning (it was asked for)", not any("missing on the device" in s for s in rec["say"]))
+    for miss, have in (("tee", SP_ALL - {"tee"}), ("mkfifo", SP_ALL - {"mkfifo"}),
+                       ("openssl + sha256sum", {"tee", "mkfifo"})):
+        m, disk, store, rec = lan_snapshot(shell, envv, have, f"no_{miss.split()[0]}_{name}")
+        check(f"no {miss}: falls back to read-back, with a warning",
+              rec["single"] == [False] and any("missing on the device" in s for s in rec["say"]))
+        check(f"no {miss}: snapshot still OK", m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
+    m, disk, store, rec = lan_snapshot(shell, envv, {"sha256sum", "tee", "mkfifo"}, f"noossl_{name}")
+    check("tee + mkfifo + sha256sum only (no openssl): single pass still used",
+          rec["single"] == [True] and m is not None and [c["sha256"] for c in m["chunks"]] == chunk_hashes(disk))
+
+
+# ----------------------------------------------------------------------------
+section("single pass: device script stays serial-safe (30 chunks, 32 GB eMMC)")
+ch = S.plan_chunks(31_268_536_320)
+check(f"32 GB eMMC = {len(ch)} chunks", len(ch) == 30)
+built = {}
+for sp in (False, True):
+    for hs in (True, False):
+        for nor in (False, True):
+            built[(sp, hs, nor)] = S.build_lan_snapshot_script(
+                base_url="http://192.168.168.89:8080", token="0" * 32, chunks=ch,
+                have_sha=hs, nor=nor, single_pass=sp)
+big = max(len(b.encode()) for b in built.values())
+check(f"every variant <= 4 KB (largest {big} B; a 13 KB script broke on hardware)", big <= 4096)
+grow = len(built[(True, True, True)].encode()) - len(built[(False, True, True)].encode())
+check(f"single pass adds < 256 B over read-back ({grow} B)", grow < 256)
+longest = {k: max(len(x) for x in b.splitlines()) for k, b in built.items()}
+check(f"single pass: longest line not longer than read-back's ({longest[(True, True, True)]} chars)",
+      longest[(True, True, True)] <= longest[(False, True, True)])
+check("single pass script = one loop over the plan file, not unrolled per chunk",
+      built[(True, True, False)].count("fsha < /tmp/mi_f") == 1)
+
+
+# ----------------------------------------------------------------------------
 section("[sh] read-only filesystem check (real e2fsck when installed)")
 if shutil.which("mkfs.ext4") and shutil.which("e2fsck"):
     fsd = work / "fsdev"
@@ -416,20 +638,28 @@ ENV_B = env_blob({"bootcmd": "run opnsense || run recovery", "ethaddr": "e8:f6:d
 nor_env_dev.write_bytes(ENV_A)
 
 
+asked = []   # prompts of the last journey (run_journey clears it)
+
+
 def answers(*a):
     it = iter(a)
-    return lambda prompt: next(it)
+
+    def ask(prompt):
+        asked.append(prompt)
+        return next(it)
+    return ask
 
 
 real_inv_script = I.build_inventory_script
 
 
-def run_journey(fn, emmc, probe_mac, inputs, **kw):
+def run_journey(fn, emmc, probe_mac, inputs, have_extra=(), **kw):
+    asked.clear()
     dev = FakeDev(shell, envv)
     net = work / f"net_{probe_mac.replace(':', '')}" / "eth0"
     net.mkdir(parents=True, exist_ok=True)
     (net / "address").write_text(probe_mac + "\n")
-    pr = probe_for(size, {"sha256sum", "head", "tail", "gzip", "gzip1", "od", "flashcp"})
+    pr = probe_for(size, {"sha256sum", "head", "tail", "gzip", "gzip1", "od", "flashcp"} | set(have_extra))
     pr["mac"] = probe_mac
     port = free_port()
     with patch.object(S, "CHUNK_BYTES", CHUNK), patch.object(S, "EMMC_DEV", str(emmc)), \
@@ -451,8 +681,9 @@ emmc = work / "j_emmc.img"
 disk = make_disk(emmc, size)
 store = work / "j_store"
 ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df",
-                    ["1", "prod", ], transfer="lan", store=store)
+                    ["1", "prod", ""], transfer="lan", store=store)
 check("run_snapshot (LAN) succeeds", ok and (store / "prod" / "manifest.json").is_file())
+check("LAN snapshot asks 'Thorough verify'", any("Thorough verify" in q for q in asked))
 mprod = json.loads((store / "prod" / "manifest.json").read_text())
 check("manifest records DIP and OS", mprod["boot_dip"] == "EMMC" and mprod["os_label"] == "openwrt")
 check("NOR U-Boot env saved with the snapshot (raw + readable)",
@@ -565,7 +796,7 @@ ENV_NOR = env_blob({"bootcmd": "run opnsense || run recovery", "recovery": "NOR-
                     "ethaddr": "e8:f6:d7:00:17:df", "kernel_addr_r": "0x82000000"})
 dual = bytearray(disk); dual[C.UBOOT_ENV_EMMC_OFFSET:C.UBOOT_ENV_EMMC_OFFSET + len(ENV_EMMC)] = ENV_EMMC
 emmc.write_bytes(bytes(dual)); nor_env_dev.write_bytes(ENV_NOR)
-ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", "dual"], transfer="lan", store=store)
+ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", "dual", ""], transfer="lan", store=store)
 mdual = json.loads((store / "dual" / "manifest.json").read_text())
 check("snapshot keeps both env sets + inventory.txt",
       ok and (store / "dual" / "emmc_env.txt").is_file() and (store / "dual" / "inventory.txt").is_file()
@@ -590,6 +821,7 @@ with patch.object(S, "USB_MOUNT", str(stick)), patch.object(SO, "usb_mount", lam
     ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["2", "usbprod", ""],
                         transfer="usb", store=store)
     check("run_snapshot (USB) succeeds", ok and (stick / S.USB_ROOT / "usbprod" / "SHA256SUMS").is_file())
+    check("USB snapshot does not ask 'Thorough verify' (LAN only)", not any("Thorough" in q for q in asked))
     check("USB: NOR env saved on the stick and in SHA256SUMS",
           (stick / S.USB_ROOT / "usbprod" / "nor_env.bin").read_bytes() == nor_env_dev.read_bytes()
           and subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=stick / S.USB_ROOT / "usbprod",
@@ -601,6 +833,44 @@ with patch.object(S, "USB_MOUNT", str(stick)), patch.object(SO, "usb_mount", lam
     check("run_restore (USB) succeeds", ok and emmc.read_bytes() == disk)
     check("USB auto-snapshot kept on the stick",
           any(p.name.startswith("auto-") for p in (stick / S.USB_ROOT).iterdir()))
+
+
+# ----------------------------------------------------------------------------
+section("[sh] journeys: 'Thorough verify' answer, auto-snapshot uses single pass")
+seen = []
+real_lan_j = S.build_lan_snapshot_script
+
+
+def rec_lan(**kw):
+    seen.append(kw.get("single_pass"))
+    return real_lan_j(**kw)
+
+
+nor_env_dev.write_bytes(ENV_A)
+emmc.write_bytes(disk)
+for ans, single in (("", True), ("y", False), ("Y", False)):
+    seen.clear()
+    lab = f"j_sp_{'thorough' if ans else 'fast'}_{len(S.list_snapshots(store))}"
+    with patch.object(S, "build_lan_snapshot_script", rec_lan):
+        ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", lab, ans], transfer="lan",
+                            store=store, have_extra=("tee", "mkfifo", "openssl"))
+    ok_v, _, mj = S.verify_store_snapshot(store / lab)
+    check(f"answer {ans!r}: single pass {single}, snapshot OK and verified",
+          ok and seen == [single] and ok_v and [c["sha256"] for c in mj["chunks"]] == chunk_hashes(disk))
+
+emmc.write_bytes(bytes(other))
+seen.clear()
+with patch.object(S, "build_lan_snapshot_script", rec_lan):
+    ok, _ = run_journey(SO.run_restore, emmc, "e8:f6:d7:00:17:df", ["1", "yes"], transfer="lan",
+                        store=store, folder=store / "prod", manifest=mprod, auto_snapshot=True,
+                        have_extra=("tee", "mkfifo", "openssl"))
+check("restore with auto-snapshot succeeds, eMMC = 'prod'", ok and emmc.read_bytes() == disk)
+check("auto-snapshot used single pass", seen == [True])
+check("auto-snapshot did not ask 'Thorough verify'", not any("Thorough" in q for q in asked))
+autos = sorted(n for n, m in S.list_snapshots(store) if m.get("auto"))
+ok_a, _, ma = S.verify_store_snapshot(store / autos[-1])
+check("that auto-snapshot holds the replaced eMMC, verified",
+      ok_a and [c["sha256"] for c in ma["chunks"]] == chunk_hashes(bytes(other)))
 
 shutil.rmtree(work, ignore_errors=True)
 print()

@@ -267,9 +267,14 @@ check("_iter_body: chunked with extension + trailer",
 section("od dump parsing, U-Boot env blobs")
 import struct, zlib, subprocess
 raw = os.urandom(1000) + b"\0" * 40
-od = subprocess.run(["od", "-Ax", "-tx1", "-v"], input=raw, capture_output=True).stdout.decode()
-check("parse_od round trip", S.parse_od(od) == raw)
-check("parse_od: gap -> None", S.parse_od("000000 01 02\n000010 03\n") is None)
+od = subprocess.run(["od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
+check("parse_od round trip (GNU od -v -b)", S.parse_od(od) == raw)
+bb = subprocess.run(["busybox", "od", "-v", "-b"], input=raw, capture_output=True).stdout.decode()
+check("parse_od round trip (BusyBox od -v -b)", S.parse_od(bb) == raw)
+check("parse_od: gap -> None", S.parse_od("0000000 001 002\n0000020 003\n") is None)
+check("no od -A/-t in device scripts (BusyBox lacks them)",
+      not any(x in src for x in ("od -A", "od -t", "-tx1")
+              for src in [Path(S.__file__).read_text()]))
 
 
 def env_blob(vars_, redundant=False, size=S.NOR_ENV_SIZE, bad=False):
@@ -415,13 +420,16 @@ check("silent when NOR bootcmd already matches", SO.nor_env_advice(mm, env, env,
 check("silent for eMMC-booting OSes", SO.nor_env_advice({"boot_dip": "EMMC"}, env, {}, True) == [])
 
 # ----------------------------------------------------------------------------
-section("reach_recovery: NOR chainload + DIP fallback")
+section("reach_recovery: recovery into RAM without the DIP switch")
 
 
-def fake_uboot(sf_ok=True, eat_first=0):
+def fake_uboot(sf_ok=True, eat_first=0, nor_env=True, fixed=True, boot_ok=True):
+    """U-Boot at the prompt. nor_env: NOR holds a valid env (env import works).
+    fixed: DTB/kernel at the documented NOR offsets (on real firmware 1.7.5's
+    test board 0x500000 was EMPTY). boot_ok: `run recovery` reaches Linux."""
     d = MagicMock()
     d.captured_uboot_env = {"bootcmd": "run openwrt || run recovery", "ver": "U-Boot 2025.04"}
-    state = {"eat": eat_first}
+    state = {"eat": eat_first, "imported": False}
 
     def send(cmd, timeout=None, **kw):
         if cmd and state["eat"]:
@@ -429,28 +437,66 @@ def fake_uboot(sf_ok=True, eat_first=0):
             state["eat"] -= 1
             return f"Unknown command '{cmd[1:].split()[0]}' - try 'help'"
         if cmd == "sf probe 0":
-            return "SF: Detected mt25qu512a with page size 256 Bytes" if sf_ok else "Unknown command 'sf'"
+            return "SF: Detected mt25qu512abb with page size 256 Bytes" if sf_ok else "Unknown command 'sf'"
+        if cmd.startswith("env import -c"):
+            if nor_env and cmd.endswith(S.NOR_ENV_SIZES[0]):
+                state["imported"] = True
+                return ""
+            return "## Error: bad CRC, import failed"
+        if cmd == "printenv recovery":
+            return "recovery=sf probe 0; sf read ...; bootm" if state["imported"] else "recovery=run emmc_recovery"
         if cmd.startswith(f"md.b {S.RAM_DTB}"):
-            return "90000000: d0 0d fe ed"
+            return "90000000: d0 0d fe ed" if fixed else "90000000: 00 00 00 00"
         if cmd.startswith(f"md.b {S.RAM_KERNEL}"):
             return "82000000: 1f 8b"
         return ""
     d.send_command.side_effect = send
-    d.boot_recovery.return_value = True
+    d.boot_recovery.return_value = boot_ok
     d.login_recovery.return_value = True
     return d
 
 
-d1 = fake_uboot()
-with patch.object(SO, "phase1_uboot", return_value=d1), patch("builtins.print"):
-    dev, info = SO.reach_recovery("COM1", SO.DIP_EMMC, ask=lambda p: "")
-sent_cmds = [c.args[0] for c in d1.send_command.call_args_list]
-check("chainload: sf read DTB + kernel from NOR", any("sf read 0x90000000 0x500000" in c for c in sent_cmds)
-      and any("sf read 0x82000000 0xa00000" in c for c in sent_cmds))
-check("chainload: never saveenv", not any("saveenv" in c for c in sent_cmds))
-check("chainload: booted with boot_medium=qspi",
-      d1.boot_recovery.call_args.kwargs.get("boot_medium") == "qspi")
-check("no DIP flip needed", dev is d1 and info["flipped"] is False)
+def run(*devs, dip=SO.DIP_EMMC):
+    asks = []
+    with patch.object(SO, "phase1_uboot", side_effect=list(devs)), patch("builtins.print"):
+        dev, info = SO.reach_recovery("COM1", dip, ask=lambda p: asks.append(p) or "")
+    return dev, info, asks
+
+
+d0 = fake_uboot()
+dev, info, asks = run(d0)
+cmds = [c.args[0] for c in d0.send_command.call_args_list]
+check("first: this U-Boot's own recovery (the one with working Ethernet), no NOR commands",
+      dev is d0 and info["recovery_medium"] == "emmc" and not asks
+      and not any(c.startswith("sf ") or c.startswith("env import") for c in cmds))
+check("never saveenv", not any("saveenv" in c for c in cmds))
+
+
+def fails_first(d):
+    d.boot_recovery.side_effect = [False, True]
+    return d
+
+
+d1 = fails_first(fake_uboot())
+dev, info, asks = run(d1)
+cmds = [c.args[0] for c in d1.send_command.call_args_list]
+check("own recovery fails -> NOR env imported from NOR's env offset (CRC-checked)",
+      any(c.startswith(f"sf read {S.RAM_KERNEL} {S.NOR_ENV_OFF}") for c in cmds)
+      and any(c.startswith("env import -c") for c in cmds))
+check("then NOR's own `run recovery`, boot_medium=qspi, no address guessing",
+      d1.boot_recovery.call_args.kwargs.get("boot_medium") == "qspi"
+      and not any("0x500000" in c for c in cmds) and info["recovery_medium"] == "qspi" and not asks)
+
+d_fixed = fails_first(fake_uboot(nor_env=False, fixed=True))
+dev, info, asks = run(d_fixed)
+check("no NOR env but documented offsets valid -> NOR recovery", info["recovery_medium"] == "qspi" and not asks)
+
+d_none = fake_uboot(nor_env=False, fixed=False)
+d_none.boot_recovery.side_effect = [False]
+d_nor = fake_uboot()
+dev, info, asks = run(d_none, d_nor)
+check("nothing boots (own recovery fails, no NOR env, 0x500000 empty) -> only then the DIP question",
+      len(asks) == 1 and dev is d_nor and info["uboot_dip"] == SO.DIP_NOR)
 
 d_eat = fake_uboot(eat_first=1)
 d_eat.captured_uboot_env = None
@@ -460,19 +506,20 @@ with patch.object(SO, "phase1_uboot", return_value=d_eat), \
 check("first character swallowed by U-Boot -> re-synced and retried, no DIP flip",
       dev is d_eat and info["flipped"] is False and d_eat.boot_recovery.called)
 check("empty env capture -> captured again on a fresh prompt", info["env"] == {"bootcmd": "run openwrt"})
-sent_cmds = [c.args[0] for c in d_eat.send_command.call_args_list]
-check("prompt primed with an empty line before sf probe", sent_cmds[0] == "" or "" in sent_cmds[:2])
+cmds = [c.args[0] for c in d_eat.send_command.call_args_list]
+check("prompt primed with an empty line before sf probe", cmds[0] == "" or "" in cmds[:2])
 
-d_no_sf, d_nor = fake_uboot(sf_ok=False), fake_uboot()
-asks = []
-with patch.object(SO, "phase1_uboot", side_effect=[d_no_sf, d_nor]), patch("builtins.print"):
-    dev, info = SO.reach_recovery("COM1", SO.DIP_EMMC, ask=lambda p: asks.append(p) or "")
-check("no sf on eMMC U-Boot -> user asked to flip DIP to NOR", len(asks) == 1 and info["flipped"])
-check("then booted NOR recovery", dev is d_nor and info["uboot_dip"] == SO.DIP_NOR)
+d_dead, d_nor = fake_uboot(sf_ok=False, boot_ok=False), fake_uboot()
+dev, info, asks = run(d_dead, d_nor)
+check("no sf and own recovery fails -> DIP question",
+      len(asks) == 1 and info["flipped"] and dev is d_nor and info["uboot_dip"] == SO.DIP_NOR)
 
-with patch.object(SO, "phase1_uboot", side_effect=[None, fake_uboot()]), patch("builtins.print"):
-    dev, info = SO.reach_recovery("COM1", SO.DIP_EMMC, ask=lambda p: "")
+dev, info, asks = run(None, fake_uboot())
 check("U-Boot not caught (blank eMMC / bootdelay=0) -> DIP fallback", dev is not None and info["flipped"])
+
+dev, info, asks = run(fake_uboot(), dip=SO.DIP_NOR)
+check("DIP already RIGHT -> NOR U-Boot's own recovery, no import needed",
+      info["recovery_medium"] == "qspi" and not asks)
 
 shutil.rmtree(work, ignore_errors=True)
 print()
