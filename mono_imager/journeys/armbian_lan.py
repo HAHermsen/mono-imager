@@ -34,15 +34,18 @@ License: GPLv3
 
 import logging
 import sys
-import time
 import threading
-from mono_imager.step_registry import register_step, StepContext
-from mono_imager.spinner import with_spinner
-from mono_imager.flash_orchestrator import step, verbose, console_logger, wait_for_report
+import time
+
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import console_logger, step, verbose, wait_for_report
+from mono_imager.spinner import with_spinner
+from mono_imager.step_registry import StepContext, register_step
 
 RELAY_POLL_SLEEP = 0.05     # live serial relay while waiting for the user
-from mono_imager.journeys import _common  # also provides shared _step_http_server_start / _step_firmware_reachable
+from mono_imager.journeys import (
+    _common,  # also provides shared _step_http_server_start / _step_firmware_reachable
+)
 
 logger = logging.getLogger(__name__)
 

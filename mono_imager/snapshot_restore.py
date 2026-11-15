@@ -13,7 +13,6 @@ License: GPLv3
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
 
 from mono_imager import snapshot_orchestrator as SO
 
@@ -31,7 +30,7 @@ def _ask_label(os_label: str, ask: Callable, existing) -> str:
             return v
 
 
-def pick_snapshot(snaps: list, ask: Callable = SO._ask) -> Optional[int]:
+def pick_snapshot(snaps: list, ask: Callable = SO._ask) -> int | None:
     """snaps: [(label, manifest or None)] -> index or None."""
     if not snaps:
         return None
@@ -341,9 +340,9 @@ def _restore_on_device(d, *, info: dict, dip_now: str, transfer: str, host_ip: s
 
 
 def run_restore(*, port: str, transfer: str, host_ip: str, http_port: int,
-                setup_network: Callable, store: Path, folder: Optional[Path] = None,
-                manifest: Optional[dict] = None, auto_snapshot: bool = True,
-                soft_reboot: Optional[Callable] = None, ask: Callable = SO._ask) -> bool:
+                setup_network: Callable, store: Path, folder: Path | None = None,
+                manifest: dict | None = None, auto_snapshot: bool = True,
+                soft_reboot: Callable | None = None, ask: Callable = SO._ask) -> bool:
     """
     Restore journey. For LAN the snapshot is picked (folder/manifest) by the
     caller and checked against SHA256SUMS here before anything else; for USB
@@ -396,7 +395,7 @@ def _fix_backup_gpt(d):
         SO.step(0, "Backup GPT moved to the end of the larger eMMC (sgdisk -e)", g == "0", g)
 
 
-def _snapshot_nor_env_vars(d, transfer, folder, label, manifest) -> Optional[dict]:
+def _snapshot_nor_env_vars(d, transfer, folder, label, manifest) -> dict | None:
     """Variables of the NOR env saved with a snapshot (PC file or stick)."""
     rec = manifest.get("nor_env") or {}
     if not rec.get("file"):

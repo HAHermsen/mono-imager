@@ -79,13 +79,18 @@ License: GPLv3
 import logging
 import re
 
-from mono_imager.step_registry import register_step, register_uboot_steps, StepContext
-from mono_imager.spinner import with_spinner, Spinner
-from mono_imager.flash_orchestrator import (
-    step, verbose, console_logger, wait_for_report,
-)
-from mono_imager.journeys import _common  # also provides shared _step_http_server_start / _step_firmware_reachable
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import (
+    console_logger,
+    step,
+    verbose,
+    wait_for_report,
+)
+from mono_imager.journeys import (
+    _common,  # also provides shared _step_http_server_start / _step_firmware_reachable
+)
+from mono_imager.spinner import Spinner, with_spinner
+from mono_imager.step_registry import StepContext, register_step, register_uboot_steps
 
 # --- U-Boot recovery repair (NOR) -------------------------------------------------
 FIT_HEADER_PROBE_LEN = "0x100"           # bytes read to identify an image header

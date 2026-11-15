@@ -16,8 +16,8 @@ cannot cache all images simultaneously.
 
 import re
 
-from mono_imager.flash_orchestrator import verbose
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import verbose
 
 # --- Tuning (seconds) ---------------------------------------------------------
 MOUNT_SCRIPT_TIMEOUT = 60            # mounts every partition in turn

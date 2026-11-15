@@ -25,16 +25,16 @@ __author__  = "H.A. Hermsen"
 
 import logging
 import socket  # noqa: F401  (patched by tests; used as F.socket)
-
+from collections.abc import Callable
 from http.server import HTTPServer  # noqa: F401  (patched by tests; used as F.HTTPServer)
 from pathlib import Path
-from typing import Optional, Callable
 
+from mono_imager.logging_setup import debug_enabled as _debug_enabled  # noqa: F401  (tests read fo._debug_enabled)
+from mono_imager import constants as C
 from mono_imager.config import detect_serial_ports  # noqa: F401  (used as F.detect_serial_ports)
 from mono_imager.serial_device import SerialDevice
 from mono_imager.spinner import with_spinner  # noqa: F401  (used as F.with_spinner)
 from mono_imager.step_tracker import StepTracker
-from mono_imager import constants as C
 
 # --- Tuning (seconds unless noted) ----------------------------------------------
 HTTP_COPY_BLOCK = 64 * C.KIB          # firmware file -> socket copy size
@@ -56,7 +56,7 @@ RECOVERY_LOGIN_TIMEOUT = 60
 # basicConfig — doing so at import time caused mutual destruction when tui.py
 # also called it, silently dropping handlers depending on import order.
 
-from mono_imager.logging_setup import get_log_file, make_verbose, debug_enabled as _debug_enabled  # noqa: F401
+from mono_imager.logging_setup import get_log_file, make_verbose
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,7 @@ def parse_uboot_env(printenv_output: str) -> dict:
     return env
 
 
-def capture_uboot_env(d: SerialDevice) -> Optional[dict]:
+def capture_uboot_env(d: SerialDevice) -> dict | None:
     """
     Snapshot the device's current U-Boot environment via `printenv`.
     Returns None on failure (no response, or nothing parseable) —
@@ -156,7 +156,7 @@ def capture_uboot_env(d: SerialDevice) -> Optional[dict]:
     return env
 
 
-def restore_uboot_env(d: SerialDevice, backup: Optional[dict]) -> int:
+def restore_uboot_env(d: SerialDevice, backup: dict | None) -> int:
     """
     Re-apply a previously captured U-Boot environment snapshot (see
     capture_uboot_env()) — used after a whole-disk flash to eMMC that
@@ -252,9 +252,9 @@ def run_flash_journey(
     host_ip: str,
     http_port: int,
     firmware_path,
-    get_device_net: Callable[[], Optional[dict]],
+    get_device_net: Callable[[], dict | None],
     setup_network: Callable[[SerialDevice], bool],
-) -> Optional[bool]:
+) -> bool | None:
     from mono_imager.journeys import get_journey
     from mono_imager.step_registry import get_staging_boot_methods, list_journey
 

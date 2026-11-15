@@ -8,7 +8,7 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from mono_imager import tui as T
 
@@ -17,7 +17,7 @@ class TuiMenusMixin:
     """TUI menus: main menu, flash, network and update screens, serial and LAN tests."""
 
     if TYPE_CHECKING:  # attributes this mixin reads from MonoImager / sibling mixins
-        serial_port: Optional[str]
+        serial_port: str | None
         def safe_input(self, prompt: str) -> str | None: ...
         def _validate_firmware_path(self, *args: Any, **kwargs: Any) -> Any: ...
         _net: Any

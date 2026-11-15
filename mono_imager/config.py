@@ -11,7 +11,6 @@ __author__ = "H.A. Hermsen"
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ def save_last_port(port: str):
     save_config(config)
 
 
-def get_last_port() -> Optional[str]:
+def get_last_port() -> str | None:
     """Get last used serial port, or None"""
     return load_config().get("last_port")
 

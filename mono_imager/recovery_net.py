@@ -13,12 +13,11 @@ License: GPLv3
 import re
 import time
 from collections.abc import Callable
-from typing import Optional
 
 from mono_imager import recovery_orchestrator as R
 
 
-def detect_modern_firmware_tool(d: R.SerialDevice) -> Optional[bool]:
+def detect_modern_firmware_tool(d: R.SerialDevice) -> bool | None:
     """
     Live-detect whether the device's CURRENT recovery Linux has the
     modern `firmware` command AND the kernel cmdline contains
@@ -69,7 +68,7 @@ def detect_modern_firmware_tool(d: R.SerialDevice) -> Optional[bool]:
     return True
 
 
-def get_device_mac(d: R.SerialDevice, interface: str = R.C.DEFAULT_ETH_IFACE) -> Optional[str]:
+def get_device_mac(d: R.SerialDevice, interface: str = R.C.DEFAULT_ETH_IFACE) -> str | None:
     """
     Get the device's real MAC address from `ip a`, parsed — never
     assumed or asked of the user (avoids transcription errors). Tries
@@ -88,7 +87,7 @@ def get_device_mac(d: R.SerialDevice, interface: str = R.C.DEFAULT_ETH_IFACE) ->
     return None
 
 
-def check_internet_reachable(d: R.SerialDevice, gateway: Optional[str] = None,
+def check_internet_reachable(d: R.SerialDevice, gateway: str | None = None,
                               host: str = "firmware.mono.si",
                               ping_ip: str = R.C.INTERNET_PROBE_IP, timeout: int = R.INTERNET_CHECK_TIMEOUT) -> bool:
     """
@@ -151,7 +150,7 @@ def check_internet_reachable(d: R.SerialDevice, gateway: Optional[str] = None,
     return True
 
 
-def try_dhcp(d: R.SerialDevice, iface: str = R.C.DEFAULT_ETH_IFACE, timeout: int = R.DHCP_TIMEOUT) -> Optional[dict]:
+def try_dhcp(d: R.SerialDevice, iface: str = R.C.DEFAULT_ETH_IFACE, timeout: int = R.DHCP_TIMEOUT) -> dict | None:
     """
     Bring up `iface` and request a lease via udhcpc, then read back
     whatever the lease actually produced (IP/prefix, default gateway,
@@ -210,8 +209,8 @@ def try_dhcp(d: R.SerialDevice, iface: str = R.C.DEFAULT_ETH_IFACE, timeout: int
 
 def _stream_command(d: R.SerialDevice, command: str, idle_timeout: float = R.STREAM_IDLE_TIMEOUT,
                      max_total: float = R.STREAM_MAX_TOTAL, auto_confirm_response: str = None,
-                     on_output: Optional[Callable[[str], None]] = None,
-                     done_markers: Optional[list] = None) -> str:
+                     on_output: Callable[[str], None] | None = None,
+                     done_markers: list | None = None) -> str:
     """
     Send a command and stream its raw output live from the serial
     port, rather than buffering it via run_script() (which blocks

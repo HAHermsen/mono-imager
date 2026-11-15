@@ -13,12 +13,12 @@ License: GPLv3
 
 from pathlib import Path
 
-from mono_imager.flash_orchestrator import step, verbose, console_logger, wait_for_report
+from mono_imager import constants as C
+from mono_imager.flash_orchestrator import console_logger, step, verbose, wait_for_report
+from mono_imager.journeys import _common
+from mono_imager.journeys import _vyos as V
 from mono_imager.spinner import with_spinner
 from mono_imager.step_registry import StepContext
-from mono_imager.journeys import _vyos as V
-from mono_imager.journeys import _common
-from mono_imager import constants as C
 
 STICK_PROBE_TIMEOUT = 20
 ISO_WRITE_TIMEOUT = 1800.0           # send + write + read back the ISO

@@ -11,7 +11,6 @@ License: GPLv3
 
 
 from collections.abc import Callable
-from typing import Optional
 
 from mono_imager import recovery_orchestrator as R
 
@@ -187,9 +186,9 @@ def _preserve_env_flags(caps: dict, preserve_env: bool, target: str) -> str:
     return flags
 
 
-def run_firmware_update(d: R.SerialDevice, on_output: Optional[Callable[[str], None]] = None,
+def run_firmware_update(d: R.SerialDevice, on_output: Callable[[str], None] | None = None,
                          idle_timeout: float = R.STREAM_IDLE_TIMEOUT, max_total: float = R.STREAM_MAX_TOTAL,
-                         preserve_env: Optional[bool] = None) -> bool:
+                         preserve_env: bool | None = None) -> bool:
     """
     Flash the OTHER medium than the one booted (the tool auto-detects
     boot_medium= and never overwrites what you're running from) via the

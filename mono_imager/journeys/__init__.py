@@ -133,7 +133,7 @@ def discovered_journeys() -> list[tuple[str, str]]:
     the registry — used by the TUI to build its OS/transfer menus
     dynamically rather than from a hardcoded list.
     """
-    from mono_imager.step_registry import _registry, ALL_OS, ALL_TRANSFER
+    from mono_imager.step_registry import ALL_OS, ALL_TRANSFER, _registry
 
     seen = set()
     for descriptor in _registry:

@@ -22,7 +22,6 @@ License: GPLv3
 
 import datetime as _dt
 import re
-from typing import Optional
 
 from mono_imager import constants as C
 from mono_imager.uboot_parse import parse_uboot_identity, parse_uboot_self_test
@@ -42,7 +41,7 @@ _MONTHS = {m: i for i, m in enumerate(
     ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 
 
-def build_inventory_script(*, dev: Optional[str] = None, emmc_sysfs: Optional[str] = None,
+def build_inventory_script(*, dev: str | None = None, emmc_sysfs: str | None = None,
                            net_sysfs: str = "/sys/class/net", proc_mtd: str = "/proc/mtd",
                            mtd_dev_dir: str = "/dev") -> str:
     """Read-only facts about the board as KEY=VALUE lines (keys are unique)."""
@@ -79,8 +78,8 @@ def build_inventory_script(*, dev: Optional[str] = None, emmc_sysfs: Optional[st
     return "\n".join(s) + "\n"
 
 
-def parse_inventory(kv: dict, *, ntp_synced: bool, boot_output: Optional[str] = None,
-                    probe: Optional[dict] = None) -> dict:
+def parse_inventory(kv: dict, *, ntp_synced: bool, boot_output: str | None = None,
+                    probe: dict | None = None) -> dict:
     """Structured inventory from build_inventory_script() output (+ boot banner)."""
     nor = {k[len("UBOOT_NOR_"):].lower(): v for k, v in kv.items() if k.startswith("UBOOT_NOR_") and v}
     inv = {
@@ -111,17 +110,17 @@ def _idx(key: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def nor_uboot(inv: Optional[dict]) -> str:
+def nor_uboot(inv: dict | None) -> str:
     """The NOR U-Boot version string of an inventory ('' if unknown)."""
     versions = list(((inv or {}).get("uboot") or {}).get("nor", {}).values())
     return versions[0] if versions else ""
 
 
-def emmc_uboot(inv: Optional[dict]) -> str:
+def emmc_uboot(inv: dict | None) -> str:
     return ((inv or {}).get("uboot") or {}).get("emmc", "") or ""
 
 
-def uboot_date(version: str) -> Optional[_dt.datetime]:
+def uboot_date(version: str) -> _dt.datetime | None:
     """Build time of a U-Boot version string; release (YYYY.MM) when no date is in it."""
     if not version:
         return None
@@ -145,8 +144,8 @@ def compare_uboot(target: str, snapshot: str) -> str:
     return "older" if a < b else "newer"
 
 
-def format_inventory(inv: dict, *, label: str, nor_env: Optional[dict],
-                     emmc_env: Optional[dict], tool_version: str) -> str:
+def format_inventory(inv: dict, *, label: str, nor_env: dict | None,
+                     emmc_env: dict | None, tool_version: str) -> str:
     """inventory.txt — readable, one fact per line."""
     rec, ub, em = inv.get("recovery", {}), inv.get("uboot", {}), inv.get("emmc", {})
     board = inv.get("board", {})

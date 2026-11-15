@@ -18,7 +18,7 @@ class TuiFlashMixin:
 
     if TYPE_CHECKING:  # attributes this mixin reads from MonoImager / sibling mixins
         MIN_FIRMWARE_SIZE_BYTES: int
-        serial_port: Optional[str]
+        serial_port: str | None
         def safe_input(self, prompt: str) -> str | None: ...
         def print_screen_divider(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -115,7 +115,7 @@ class TuiFlashMixin:
         allow_enter_last: bool = False,
         save_on_select: bool = False,
         quiet: bool = False,
-    ) -> T.Optional[str]:
+    ) -> Optional[str]:
         """
         Detect serial ports, list them, and prompt for a selection.
         Returns the chosen device string, or None if detection failed,
@@ -212,7 +212,7 @@ class TuiFlashMixin:
         flash_target: str,
         host_ip: str,
         device_ip: str,
-    ) -> T.Optional[bool]:
+    ) -> Optional[bool]:
         """
         Delegate rendering to console; map its ESCAPE sentinel to the
         None-plus-state-transition contract the callers here expect.

@@ -8,19 +8,23 @@ License: GPLv3
 """
 
 from mono_imager import __version__  # single source of truth: mono_imager/__init__.py
+
 __author__ = "H.A. Hermsen"
 
+import logging
 import sys
 import time  # noqa: F401  (read via T.time by the mixins; kept for patch points)
-import logging
 from enum import Enum
 from pathlib import Path
-from typing import Optional
-from mono_imager.spinner import with_spinner  # noqa: F401  (tests patch T.with_spinner)
+
 from mono_imager import console
-from mono_imager.device_net import RecoveryNetwork
-from mono_imager.uboot_parse import parse_uboot_identity, parse_uboot_self_test  # noqa: F401  (patch points)
 from mono_imager import constants as C
+from mono_imager.device_net import RecoveryNetwork
+from mono_imager.spinner import with_spinner  # noqa: F401  (tests patch T.with_spinner)
+from mono_imager.uboot_parse import (  # noqa: F401  (patch points)
+    parse_uboot_identity,
+    parse_uboot_self_test,
+)
 
 # --- Tuning (seconds) ---------------------------------------------------------
 SOFT_REBOOT_READ_TIMEOUT = 2         # best-effort `reboot` over serial
@@ -42,7 +46,7 @@ def verbose(msg: str, level: str = "info"):
     logger.log(_LOG_LEVELS.get(level, logging.INFO), msg)
 
 
-def _netmask_to_prefix(value: str) -> Optional[str]:
+def _netmask_to_prefix(value: str) -> str | None:
     # Moved to mono_imager.device_net.netmask_to_prefix; kept as a
     # re-export so any external caller importing it from here still works.
     from mono_imager.device_net import netmask_to_prefix
@@ -73,11 +77,11 @@ from mono_imager.tui_snapshot import TuiSnapshotMixin
 class MonoImager(TuiFlashMixin, TuiMenusMixin, TuiSnapshotMixin, TuiConsoleMixin):
     """Main application controller"""
 
-    def __init__(self, log_file: Optional[Path] = None):
+    def __init__(self, log_file: Path | None = None):
         self.current_state   = MenuState.MAIN
         self.device          = None
         self.custom_fw_path  = None
-        self.serial_port: Optional[str] = None
+        self.serial_port: str | None = None
         self.flash_success   = False
         self.log_file        = log_file
         self.transfer_method = None
@@ -111,7 +115,7 @@ class MonoImager(TuiFlashMixin, TuiMenusMixin, TuiSnapshotMixin, TuiConsoleMixin
     def clear_screen(self):
         console.clear_screen()
 
-    def safe_input(self, prompt: str) -> Optional[str]:
+    def safe_input(self, prompt: str) -> str | None:
         """
         Wrapper around console.read_line() that owns the escape-to-menu
         state transition. Rendering/reading lives in console; the

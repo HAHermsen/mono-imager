@@ -43,7 +43,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from mono_imager import constants as C
 from mono_imager import inventory as I
@@ -189,7 +188,7 @@ def _boot(d, medium: str, message: str) -> bool:
     return bool(booted) and not err
 
 
-def _boot_recovery_in_ram(d) -> Optional[str]:
+def _boot_recovery_in_ram(d) -> str | None:
     """
     Start recovery Linux (it runs from RAM) from whatever U-Boot is at the
     prompt, without touching the DIP switch. Returns the boot medium of
@@ -238,7 +237,7 @@ def _capture_env(d) -> dict:
     return env
 
 
-def reach_recovery(port: str, dip_now: str, soft_reboot: Optional[Callable] = None,
+def reach_recovery(port: str, dip_now: str, soft_reboot: Callable | None = None,
                    ask: Callable = _ask):
     """
     -> (device at root shell, info) or (None, info).
@@ -289,7 +288,7 @@ def reach_recovery(port: str, dip_now: str, soft_reboot: Optional[Callable] = No
     return d, info
 
 
-def probe_device(d) -> Optional[dict]:
+def probe_device(d) -> dict | None:
     for attempt in range(1, PROBE_ATTEMPTS + 1):
         try:
             out = d.run_script(S.build_probe_script(), marker=f"snap_probe{attempt}", exec_timeout=PROBE_TIMEOUT)
@@ -344,10 +343,10 @@ class Capture:
     os_label: str                     # display-only OS guess
     boot_dip: str                     # DIP position the captured OS boots with
     nor_dump: bool = False            # also keep a read-only full NOR dump
-    nor_env: Optional[bytes] = None   # raw NOR U-Boot env region (8 KiB)
-    health: Optional[dict] = None     # pre-snapshot GPT / filesystem check
-    inventory: Optional[dict] = None  # platform inventory (inventory.py)
-    emmc_env: Optional[bytes] = None  # raw eMMC U-Boot env region (info; it is in the image)
+    nor_env: bytes | None = None   # raw NOR U-Boot env region (8 KiB)
+    health: dict | None = None     # pre-snapshot GPT / filesystem check
+    inventory: dict | None = None  # platform inventory (inventory.py)
+    emmc_env: bytes | None = None  # raw eMMC U-Boot env region (info; it is in the image)
     auto: bool = False                # taken automatically before a restore
     thorough: bool = False            # LAN: re-read every chunk from the eMMC (2nd media read, ~2x slower)
 
@@ -367,7 +366,7 @@ def _text_files(cap: Capture) -> dict:
     return {k: v for k, v in files.items() if v}
 
 
-def _nor_env_record(cap: Capture) -> Optional[dict]:
+def _nor_env_record(cap: Capture) -> dict | None:
     if not cap.nor_env:
         return None
     return {"file": S.NOR_ENV_FILE, "sha256": hashlib.sha256(cap.nor_env).hexdigest(),
@@ -375,7 +374,7 @@ def _nor_env_record(cap: Capture) -> Optional[dict]:
 
 
 def _manifest(cap: Capture, *, chunks: list, fw_sha: str, boot_sha: str, transfer: str,
-              nor_rec: Optional[dict]) -> dict:
+              nor_rec: dict | None) -> dict:
     from mono_imager import __version__
     return S.build_manifest(label=cap.label, identity=cap.identity,
                             emmc_bytes=cap.probe["emmc_bytes"], chunks=chunks,
@@ -386,7 +385,7 @@ def _manifest(cap: Capture, *, chunks: list, fw_sha: str, boot_sha: str, transfe
                             inventory=cap.inventory)
 
 
-def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional[dict]:
+def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> dict | None:
     """Whole eMMC -> <folder>/<label>. Returns the manifest, or None (nothing kept)."""
     label, probe, nor = cap.label, cap.probe, cap.nor_dump
     partial = folder / f"{label}.partial"
@@ -459,7 +458,7 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> Optional
     return _publish_host(partial, folder / label, m, cap)
 
 
-def _publish_host(partial: Path, final: Path, m: dict, cap: Capture) -> Optional[dict]:
+def _publish_host(partial: Path, final: Path, m: dict, cap: Capture) -> dict | None:
     (partial / "manifest.json").write_text(S.manifest_json(m))
     for name, text in _text_files(cap).items():
         (partial / name).write_text(text)
@@ -500,7 +499,7 @@ def _poll_log(d, done_key: str, progress_prefix: str, total: int, label: str,
     return kv
 
 
-def usb_mount(d, mode: str) -> Optional[dict]:
+def usb_mount(d, mode: str) -> dict | None:
     try:
         out = d.run_script(S.build_usb_mount_script(mode=mode), marker="snap_mount", exec_timeout=MOUNT_TIMEOUT)
     except Exception as e:
@@ -510,7 +509,7 @@ def usb_mount(d, mode: str) -> Optional[dict]:
     return m if m["ok"] and m["part"] else None
 
 
-def snapshot_usb(d, cap: Capture) -> Optional[dict]:
+def snapshot_usb(d, cap: Capture) -> dict | None:
     """Whole eMMC -> mono-snapshots/<label> on the stick. Returns the manifest, or None."""
     label, probe, nor = cap.label, cap.probe, cap.nor_dump
     have = probe["have"]
@@ -656,7 +655,7 @@ def restore_usb(d, label: str, manifest: dict, ranges: list) -> tuple:
     return True, ""
 
 
-def _device_fw_sha_usb(d) -> Optional[str]:
+def _device_fw_sha_usb(d) -> str | None:
     script = f"DEV={S.EMMC_DEV}\n{S._RD_FN}\necho \"CURFW=$(rd {S.FW_START} {S.FW_END - S.FW_START} | sha)\"\n"
     try:
         v = S.parse_kv(d.run_script(script, marker="snap_curfw", exec_timeout=FW_REGION_HASH_TIMEOUT)).get("CURFW", "")
@@ -665,7 +664,7 @@ def _device_fw_sha_usb(d) -> Optional[str]:
     return v if len(v) == S.SHA256_HEX_LEN else None
 
 
-def _device_fw_sha_lan(d, sess, base_url) -> Optional[str]:
+def _device_fw_sha_lan(d, sess, base_url) -> str | None:
     try:
         d.launch_script(S.build_lan_hash_script(base_url=base_url, token=sess.token, start=S.FW_START,
                                                 length=S.FW_END - S.FW_START, tag="curfw"),
@@ -689,7 +688,7 @@ def _device_fw_sha_lan(d, sess, base_url) -> Optional[str]:
 
 def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
                  setup_network: Callable, store: Path,
-                 soft_reboot: Optional[Callable] = None, ask: Callable = _ask) -> bool:
+                 soft_reboot: Callable | None = None, ask: Callable = _ask) -> bool:
     """Snapshot journey. Returns print_report()'s verdict."""
     from mono_imager.flash_orchestrator import reset_results
     from mono_imager.snapshot_server import SnapshotSession, start_snapshot_server

@@ -12,12 +12,11 @@ License: GPLv3
 
 import hashlib
 from collections.abc import Callable
-from typing import Optional
 
 from mono_imager import snapshot_orchestrator as SO
 
 
-def firmware_gate(target_inv: dict, snap_inv: Optional[dict], *, clone: bool, ask: Callable) -> bool:
+def firmware_gate(target_inv: dict, snap_inv: dict | None, *, clone: bool, ask: Callable) -> bool:
     """
     Compare this board's U-Boot versions with the snapshot's. NOR is never
     written by a restore, so an older NOR is worth updating FIRST (menu 3).

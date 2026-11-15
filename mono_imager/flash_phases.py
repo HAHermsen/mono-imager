@@ -10,13 +10,12 @@ License: GPLv3
 """
 
 
-from typing import Optional
 
 from mono_imager import flash_orchestrator as F
 
 
-def phase1_uboot(port: str, baud: int = F.C.SERIAL_BAUD, wait_message: Optional[str] = None,
-                 autoboot_timeout: float = F.C.AUTOBOOT_TIMEOUT) -> Optional[F.SerialDevice]:
+def phase1_uboot(port: str, baud: int = F.C.SERIAL_BAUD, wait_message: str | None = None,
+                 autoboot_timeout: float = F.C.AUTOBOOT_TIMEOUT) -> F.SerialDevice | None:
     """
     Phase 1a: Serial bootstrap up to the U-Boot prompt.
 
@@ -103,7 +102,7 @@ def phase1_uboot(port: str, baud: int = F.C.SERIAL_BAUD, wait_message: Optional[
 def phase1_recovery(d: F.SerialDevice,
                      boot_method: str = "boot_recovery",
                      login_method: str = "login_recovery",
-                     boot_medium: Optional[str] = None) -> Optional[F.SerialDevice]:
+                     boot_medium: str | None = None) -> F.SerialDevice | None:
     """
     Phase 1b: Boot staging Linux and log in.
 
@@ -154,7 +153,7 @@ def phase1_recovery(d: F.SerialDevice,
 
 
 def phase1_bootstrap(port: str, baud: int = F.C.SERIAL_BAUD,
-                     boot_medium: Optional[str] = None) -> Optional[F.SerialDevice]:
+                     boot_medium: str | None = None) -> F.SerialDevice | None:
     """
     Phase 1: Full bootstrap — U-Boot interrupt + recovery boot + login.
 

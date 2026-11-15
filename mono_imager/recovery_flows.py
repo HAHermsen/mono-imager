@@ -11,7 +11,6 @@ License: GPLv3
 
 
 from collections.abc import Callable
-from typing import Optional
 
 from mono_imager import recovery_orchestrator as R
 
@@ -85,7 +84,7 @@ def _run_medium_update(
     medium: str,
     port: str,
     setup_network: Callable[[R.SerialDevice], bool],
-    on_output: Optional[Callable[[str], None]] = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> bool:
     """
     Shared flow behind run_emmc_update()/run_nor_update(): bootstrap
@@ -179,7 +178,7 @@ def run_emmc_update(
     port: str,
     soft_reboot: Callable[[str], None],
     setup_network: Callable[[R.SerialDevice], bool],
-    on_output: Optional[Callable[[str], None]] = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> bool:
     """
     Flash eMMC firmware only. Device must be in NOR recovery (DIP RIGHT)
@@ -198,7 +197,7 @@ def run_nor_update(
     port: str,
     soft_reboot: Callable[[str], None],
     setup_network: Callable[[R.SerialDevice], bool],
-    on_output: Optional[Callable[[str], None]] = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> bool:
     """
     Flash NOR firmware only. Device must be in eMMC recovery (DIP LEFT)

@@ -24,12 +24,13 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-import sys
 import os
-import time
+import sys
 import threading
+import time
+from collections.abc import Callable
 from itertools import cycle
-from typing import Any, Callable, Tuple, Optional
+from typing import Any, Tuple
 
 FRAME_INTERVAL = 0.15        # seconds between spinner frames
 JOIN_TIMEOUT = 1             # seconds to wait for the spinner thread on exit
@@ -163,7 +164,7 @@ class Spinner:
             time.sleep(FRAME_INTERVAL)
 
 
-def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tuple[Any, Optional[Exception]]:
+def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tuple[Any, Exception | None]:
     """
     Run any blocking callable on a worker thread while a Spinner
     animates on the main thread. The wrapped call's actual execution

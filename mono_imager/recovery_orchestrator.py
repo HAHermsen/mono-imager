@@ -37,15 +37,15 @@ License: GPLv3
 
 __author__  = "H.A. Hermsen"
 
+import logging
 import re
 import time  # noqa: F401  (used as R.time by the split-out modules)
-import logging
-from typing import Optional, Callable  # noqa: F401  (used in the split-out modules' annotations)
+from collections.abc import Callable  # noqa: F401  (used in the split-out modules' annotations)
 
-from mono_imager.serial_device import SerialDevice  # noqa: F401  (used as R.SerialDevice)
 from mono_imager.spinner import with_spinner  # noqa: F401  (used as R.with_spinner; tests patch it here)
-from mono_imager.step_tracker import StepTracker
 from mono_imager import constants as C
+from mono_imager.serial_device import SerialDevice  # noqa: F401  (used as R.SerialDevice)
+from mono_imager.step_tracker import StepTracker
 
 # --- Tuning (seconds unless noted) ----------------------------------------------
 CMDLINE_TIMEOUT = 5                  # cat /proc/cmdline

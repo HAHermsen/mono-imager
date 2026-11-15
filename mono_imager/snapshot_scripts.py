@@ -9,7 +9,6 @@ License: GPLv3
 """
 
 import re
-from typing import Optional
 
 from mono_imager import snapshot as S
 from mono_imager import uboot_env
@@ -58,7 +57,7 @@ fsha() {
 """
 
 
-def build_probe_script(dev: Optional[str] = None, usb_dev: Optional[str] = None) -> str:
+def build_probe_script(dev: str | None = None, usb_dev: str | None = None) -> str:
     """Identity + capabilities of the device, as KEY=VALUE lines."""
     dev = dev or S.EMMC_DEV
     usb_dev = usb_dev or S.USB_DEV
@@ -197,7 +196,7 @@ rep() {{
 
 
 def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
-                              have_sha: bool, nor: bool, dev: Optional[str] = None,
+                              have_sha: bool, nor: bool, dev: str | None = None,
                               single_pass: bool = False) -> str:
     """
     Stream every chunk RAW to the PC (the PC compresses + hashes), then
@@ -238,7 +237,7 @@ def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
 
 
 def build_lan_hash_script(*, base_url: str, token: str, start: int, length: int,
-                          tag: str, dev: Optional[str] = None) -> str:
+                          tag: str, dev: str | None = None) -> str:
     """Hash one eMMC range on the PC (e.g. the firmware region)."""
     dev = dev or S.EMMC_DEV
     return "\n".join([
@@ -251,7 +250,7 @@ def build_lan_hash_script(*, base_url: str, token: str, start: int, length: int,
 
 
 def build_lan_restore_script(*, base_url: str, token: str, ranges: list,
-                             have_sha: bool, dev: Optional[str] = None) -> str:
+                             have_sha: bool, dev: str | None = None) -> str:
     """
     Write each range from the PC (served decompressed), then drop the page
     cache and re-read it from the eMMC to hash it (on the device, or on the
@@ -280,8 +279,8 @@ def build_lan_restore_script(*, base_url: str, token: str, ranges: list,
 
 # -- USB ------------------------------------------------------------------------------
 
-def build_usb_mount_script(*, mode: str, usb_dev: Optional[str] = None,
-                           mount: Optional[str] = None) -> str:
+def build_usb_mount_script(*, mode: str, usb_dev: str | None = None,
+                           mount: str | None = None) -> str:
     """
     Mount a partition of the stick at `mount`. mode='restore': the first
     one holding mono-snapshots/; mode='snapshot': that one too if present,
@@ -353,8 +352,8 @@ def _bg(body: list, done_key: str) -> str:
 
 
 def build_usb_snapshot_script(*, label: str, chunks: list, compression: str,
-                              have: set, nor: bool, dev: Optional[str] = None,
-                              mount: Optional[str] = None) -> str:
+                              have: set, nor: bool, dev: str | None = None,
+                              mount: str | None = None) -> str:
     """
     Background job: per chunk, eMMC -> compressor -> file on the stick,
     then (page cache dropped) hash the decompressed file AND a fresh eMMC
@@ -382,7 +381,7 @@ def build_usb_snapshot_script(*, label: str, chunks: list, compression: str,
 
 
 def build_usb_finalize_script(*, label: str, manifest_text: str, text_files: dict,
-                              mount: Optional[str] = None) -> str:
+                              mount: str | None = None) -> str:
     """Write manifest + env text files, build SHA256SUMS over every file on
     the device, publish the folder."""
     mount = mount or S.USB_MOUNT
@@ -403,7 +402,7 @@ def build_usb_finalize_script(*, label: str, manifest_text: str, text_files: dic
     return "\n".join(s) + "\n"
 
 
-def build_usb_nor_env_save_script(*, label: str, mount: Optional[str] = None) -> str:
+def build_usb_nor_env_save_script(*, label: str, mount: str | None = None) -> str:
     """Copy the NOR env region (read-only) into the snapshot folder on the stick."""
     mount = mount or S.USB_MOUNT
     dst = f"{mount}/{S.USB_ROOT}/{label}.partial/{S.NOR_ENV_FILE}"
@@ -419,12 +418,12 @@ def build_usb_nor_env_save_script(*, label: str, mount: Optional[str] = None) ->
     ]) + "\n"
 
 
-def build_usb_discard_script(*, label: str, mount: Optional[str] = None) -> str:
+def build_usb_discard_script(*, label: str, mount: str | None = None) -> str:
     mount = mount or S.USB_MOUNT
     return f"rm -rf {_q(f'{mount}/{S.USB_ROOT}/{label}.partial')}; sync; echo DISCARDED=1\n"
 
 
-def build_usb_cat_script(*, label: str, name: str, mount: Optional[str] = None) -> str:
+def build_usb_cat_script(*, label: str, name: str, mount: str | None = None) -> str:
     """Print one small text file of a USB snapshot, one KEY=VALUE line per
     source line (L<n>=...) so run_script()'s duplicate-line filter can't
     merge identical lines."""
@@ -444,7 +443,7 @@ def parse_cat(text: str) -> str:
 
 
 def build_usb_restore_script(*, label: str, manifest: dict, ranges: list,
-                             dev: Optional[str] = None, mount: Optional[str] = None) -> str:
+                             dev: str | None = None, mount: str | None = None) -> str:
     """
     Background job: sha256sum -c the snapshot on the stick first (nothing is
     written if any file is off), then per range decompress -> cut -> dd, drop
@@ -497,7 +496,7 @@ def parse_usb_chunk_results(kv: dict, prefix: str) -> dict:
     return out
 
 
-def build_gpt_fix_script(dev: Optional[str] = None) -> str:
+def build_gpt_fix_script(dev: str | None = None) -> str:
     """After a clone to a bigger eMMC: move the backup GPT to the real end."""
     dev = dev or S.EMMC_DEV
     return "\n".join([
@@ -525,7 +524,7 @@ def build_dump_script(src: str, skip: int, count: int, bs: int = 512) -> str:  #
             "echo DUMP_DONE=1\n")
 
 
-def parse_od(text: str) -> Optional[bytes]:
+def parse_od(text: str) -> bytes | None:
     """Bytes from `od -v -b` output (octal), or None if it is not contiguous."""
     rows = {}
     for line in (text or "").splitlines():
@@ -557,13 +556,13 @@ def build_nor_env_dump_script() -> str:
     ]) + "\n"
 
 
-def parse_uboot_env_blob(blob: Optional[bytes]) -> Optional[dict]:
+def parse_uboot_env_blob(blob: bytes | None) -> dict | None:
     """Variables of a raw U-Boot env region, or None when its CRC does not match."""
     region = uboot_env.parse(blob)
     return region.vars if region else None
 
 
-def build_emmc_env_dump_script(dev: Optional[str] = None) -> str:
+def build_emmc_env_dump_script(dev: str | None = None) -> str:
     """Hex dump of the eMMC U-Boot env region (inside the firmware region)."""
     return build_dump_script(dev or S.EMMC_DEV, S.EMMC_ENV_SECTOR, S.EMMC_ENV_SECTORS)
 
@@ -588,7 +587,7 @@ def build_upload_blob_scripts(data: bytes, dst: str) -> list:
     return scripts
 
 
-def build_emmc_env_write_script(src: str, want_sha: str, dev: Optional[str] = None) -> str:
+def build_emmc_env_write_script(src: str, want_sha: str, dev: str | None = None) -> str:
     """Write a rebuilt env region to the eMMC env location, read back, compare."""
     dev = dev or S.EMMC_DEV
     return "\n".join([

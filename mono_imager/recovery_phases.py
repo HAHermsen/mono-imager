@@ -12,12 +12,11 @@ License: GPLv3
 
 import re
 from collections.abc import Callable
-from typing import Optional
 
 from mono_imager import recovery_orchestrator as R
 
 
-def stash_uboot_env(d: R.SerialDevice, target: str) -> Optional[str]:
+def stash_uboot_env(d: R.SerialDevice, target: str) -> str | None:
     """
     Copy the target medium's raw U-Boot env region to UBOOT_ENV_STASH
     before a legacy curl+dd / curl+flashcp rewrite, using the same
@@ -237,8 +236,8 @@ def legacy_flash_nor(d: R.SerialDevice, mac: str) -> bool:
 # caller (tui.py) is responsible for any additional pacing/messaging
 # around these calls, not for driving the wait itself.
 
-def phase_modern_flash_emmc(d: R.SerialDevice, on_output: Optional[Callable[[str], None]] = None,
-                            preserve_env: Optional[bool] = None) -> bool:
+def phase_modern_flash_emmc(d: R.SerialDevice, on_output: Callable[[str], None] | None = None,
+                            preserve_env: bool | None = None) -> bool:
     """
     Modern path, step 1: from NOR-booted recovery, run `firmware
     update` to flash eMMC. Returns True on confirmed success.
@@ -262,8 +261,8 @@ def phase_modern_verify_emmc_boot(d: R.SerialDevice, timeout: float = R.VERIFY_B
     return ok
 
 
-def phase_modern_flash_nor(d: R.SerialDevice, on_output: Optional[Callable[[str], None]] = None,
-                           preserve_env: Optional[bool] = None) -> bool:
+def phase_modern_flash_nor(d: R.SerialDevice, on_output: Callable[[str], None] | None = None,
+                           preserve_env: bool | None = None) -> bool:
     """
     Modern path, step 3: from eMMC-booted recovery, run `firmware
     update` again — it auto-targets NOR this time since eMMC is now
@@ -284,7 +283,7 @@ def phase_modern_verify_nor_boot(d: R.SerialDevice, timeout: float = R.VERIFY_BO
     return ok
 
 
-def _legacy_flash_with_env(d: R.SerialDevice, target: str, flash_fn, env_dev: Optional[str]) -> bool:
+def _legacy_flash_with_env(d: R.SerialDevice, target: str, flash_fn, env_dev: str | None) -> bool:
     """
     Run a legacy flash (curl+dd / curl+flashcp — both rewrite the env
     region) and, if env_dev is set (stash_uboot_env() succeeded
@@ -300,7 +299,7 @@ def _legacy_flash_with_env(d: R.SerialDevice, target: str, flash_fn, env_dev: Op
     return ok
 
 
-def phase_legacy_flash_emmc(d: R.SerialDevice, env_dev: Optional[str] = None) -> bool:
+def phase_legacy_flash_emmc(d: R.SerialDevice, env_dev: str | None = None) -> bool:
     """
     Legacy path, step 1: get the device's real MAC, then flash eMMC
     via curl+dd per the documented legacy procedure. env_dev: see
@@ -316,7 +315,7 @@ def phase_legacy_flash_emmc(d: R.SerialDevice, env_dev: Optional[str] = None) ->
     return ok
 
 
-def phase_legacy_flash_nor(d: R.SerialDevice, env_dev: Optional[str] = None) -> bool:
+def phase_legacy_flash_nor(d: R.SerialDevice, env_dev: str | None = None) -> bool:
     """
     Legacy path, step 2: same MAC, flash NOR via curl+flashcp. env_dev:
     see _legacy_flash_with_env().

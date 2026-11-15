@@ -24,13 +24,12 @@ License: GPLv3
 """
 
 import hashlib
-from http import HTTPStatus
 import secrets
 import threading
 import time
+from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from mono_imager import snapshot as S
@@ -50,14 +49,14 @@ class SnapshotSession:
     def __init__(self):
         self.token = secrets.token_hex(TOKEN_BYTES)
         self.lock = threading.Lock()
-        self.target_dir: Optional[Path] = None     # snapshot being written
+        self.target_dir: Path | None = None     # snapshot being written
         self.compression = S.host_compression()
-        self.source_dir: Optional[Path] = None     # snapshot being restored
-        self.source_manifest: Optional[dict] = None
+        self.source_dir: Path | None = None     # snapshot being restored
+        self.source_manifest: dict | None = None
         self.uploads, self.verify, self.sent = {}, {}, {}
         self.nor = None
 
-    def begin_snapshot(self, target_dir: Path, compression: Optional[str] = None):
+    def begin_snapshot(self, target_dir: Path, compression: str | None = None):
         with self.lock:
             self.target_dir = Path(target_dir)
             self.compression = compression or S.host_compression()
@@ -68,7 +67,7 @@ class SnapshotSession:
             self.source_dir, self.source_manifest = Path(source_dir), manifest
             self.sent, self.verify = {}, {}
 
-    def wait(self, kind: str, key, timeout: float) -> Optional[dict]:
+    def wait(self, kind: str, key, timeout: float) -> dict | None:
         """Wait until a result for kind/key exists (uploads/verify/sent/nor)."""
         end = time.time() + timeout
         while time.time() < end:
@@ -111,7 +110,7 @@ def _iter_body(rfile, headers):
 
 
 class _SnapshotHandler(_FirmwareHandler):
-    session: Optional[SnapshotSession] = None
+    session: SnapshotSession | None = None
 
     def _params(self):
         parsed = urlparse(self.path)

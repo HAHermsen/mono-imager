@@ -38,8 +38,9 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
+from mono_imager.journeys import _common, _vyos
+from mono_imager.journeys import _vyos_steps as S
 from mono_imager.step_registry import register_step
-from mono_imager.journeys import _common, _vyos, _vyos_steps as S
 
 OS       = _vyos.OS
 TRANSFER = "netemmc"

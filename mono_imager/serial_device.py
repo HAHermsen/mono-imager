@@ -15,12 +15,12 @@ from typing import Any
 
 import serial
 
+from mono_imager.logging_setup import debug_enabled as _debug_enabled  # noqa: F401  (kept for callers/tests)
+from mono_imager.serial_timing import logger  # noqa: F401  (re-export: tests patch SDM.logger)
 from mono_imager import constants as C
 from mono_imager import serial_timing as T
 from mono_imager.serial_boot import BootMixin
 from mono_imager.serial_scripts import ScriptMixin
-from mono_imager.logging_setup import debug_enabled as _debug_enabled  # noqa: F401
-from mono_imager.serial_timing import logger  # noqa: F401  (re-export: tests patch SDM.logger)
 from mono_imager.serial_timing import verbose
 
 

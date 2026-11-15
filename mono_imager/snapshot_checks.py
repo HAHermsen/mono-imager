@@ -11,13 +11,12 @@ License: GPLv3
 import re
 import struct
 import zlib
-from typing import Optional
 
 from mono_imager import snapshot as S
 
 # --- Health check before a snapshot: GPT + filesystems (warnings only) -----------------
 
-def _gpt_header(raw: bytes) -> Optional[dict]:
+def _gpt_header(raw: bytes) -> dict | None:
     if len(raw) < S.GPT_HEADER_MIN_SIZE or raw[:len(S.GPT_SIGNATURE)] != S.GPT_SIGNATURE:
         return None
     f = struct.unpack_from(S.GPT_HEADER_FMT, raw, 0)
@@ -113,7 +112,7 @@ def check_gpt(head: bytes, tail: bytes, disk_bytes: int) -> dict:
     return out
 
 
-def build_fs_check_script(dev: Optional[str] = None, partitions: str = "/proc/partitions",
+def build_fs_check_script(dev: str | None = None, partitions: str = "/proc/partitions",
                           dev_dir: str = "/dev") -> str:
     """
     Read-only filesystem check of every eMMC partition: ext2/3/4 with

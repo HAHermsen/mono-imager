@@ -8,7 +8,7 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from mono_imager import tui as T
 
@@ -17,7 +17,7 @@ class TuiSnapshotMixin:
     """TUI snapshot screens: take, restore, USB mount test and the done screen."""
 
     if TYPE_CHECKING:  # attributes this mixin reads from MonoImager / sibling mixins
-        serial_port: Optional[str]
+        serial_port: str | None
         def print_screen_divider(self, *args: Any, **kwargs: Any) -> Any: ...
         def _select_port(self, *args: Any, **kwargs: Any) -> Any: ...
 
@@ -140,7 +140,7 @@ class TuiSnapshotMixin:
         if self.flash_success:
             # Journey-specific (#25): OPNsense stays on NOR — telling every
             # OS to flip to eMMC sent OPNsense users into recovery Linux.
-            from mono_imager.journeys import final_dip, DIP_LABELS
+            from mono_imager.journeys import DIP_LABELS, final_dip
             dip = final_dip(self.os_name)
             print("✅ Flashing complete!")
             print()

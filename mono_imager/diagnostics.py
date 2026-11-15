@@ -19,11 +19,11 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-import time
-import tempfile
 import pathlib
+import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 from mono_imager import console
 from mono_imager import constants as C
@@ -34,7 +34,7 @@ RUN_RECOVERY_SEND_TIMEOUT = 3
 RECOVERY_BOOT_WAIT = 60              # Test Serial: wait for login / shell
 LOGIN_SETTLE = 1
 SHELL_SETTLE = 0.5
-from mono_imager.spinner import with_spinner, Spinner
+from mono_imager.spinner import Spinner, with_spinner
 
 
 def test_serial(port: str) -> bool:
@@ -174,11 +174,11 @@ def _check_device_reaches_host(d, results: list, host_ip: str, start_http_server
 
 def test_lan(
     port: str,
-    host_ip: Optional[str],
+    host_ip: str | None,
     soft_reboot: Callable[[str], None],
     setup_network: Callable[[object], bool],
-    get_device_net: Callable[[], Optional[dict]],
-) -> Optional[dict]:
+    get_device_net: Callable[[], dict | None],
+) -> dict | None:
     """
     Full end-to-end LAN test — boots device into recovery, sets up
     networking, and confirms the device can reach the host HTTP server.
@@ -195,8 +195,10 @@ def test_lan(
     working port/network).
     """
     from mono_imager.flash_orchestrator import (
-        phase1_bootstrap, detect_host_ip,
-        start_http_server, wait_for_report,
+        detect_host_ip,
+        phase1_bootstrap,
+        start_http_server,
+        wait_for_report,
     )
 
     print("  Test LAN Connection")
@@ -257,6 +259,7 @@ def test_usb(port: str) -> bool:
     actually found on the stick (mirrors the original behaviour).
     """
     import logging
+
     from mono_imager.flash_orchestrator import phase1_bootstrap
     from mono_imager.journeys.usb_utils import check_usb_size, find_image_on_usb, mount_usb_stick
 

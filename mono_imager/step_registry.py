@@ -27,9 +27,10 @@ License: GPLv3
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
 from pathlib import Path
+from typing import Any
 
 from mono_imager import constants as C
 
@@ -68,10 +69,10 @@ class StepContext:
     # detection and forwarded to every journey regardless of OS/transfer.
     # {"ip", "prefix", "gateway", "dns", "source"} or None if unresolved.
     # Whether a given journey actually uses this is up to that journey.
-    device_net:    Optional[dict] = None
+    device_net:    dict | None = None
 
     # Firmware source
-    firmware_path: Optional[Path] = None   # local path (network: served; usb: on stick)
+    firmware_path: Path | None = None   # local path (network: served; usb: on stick)
     flash_target:  str            = C.EMMC_DEV
 
     # USB (used by usb journeys)
@@ -261,7 +262,7 @@ class FlowRunner:
             return False
 
     def run(self) -> bool:
-        from mono_imager.flash_orchestrator import verbose, reset_results
+        from mono_imager.flash_orchestrator import reset_results, verbose
         reset_results()
 
         verbose(f"Journey: {self.os_name} via {self.transfer} — {len(self._steps)} steps")

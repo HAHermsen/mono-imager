@@ -16,11 +16,11 @@ get_log_file() to find the path for its report footer.
 """
 
 
+import logging
 import os
 import sys
-import logging
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 _log_file: Path = None
 

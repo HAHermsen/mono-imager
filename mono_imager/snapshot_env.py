@@ -13,12 +13,11 @@ License: GPLv3
 import hashlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
 
 from mono_imager import snapshot_orchestrator as SO
 
 
-def read_nor_env(d) -> Optional[bytes]:
+def read_nor_env(d) -> bytes | None:
     """Raw NOR env region via `od` over serial (read-only), or None."""
     try:
         out = d.run_script(SO.S.build_nor_env_dump_script(), marker="snap_norenv_dump",
@@ -30,13 +29,13 @@ def read_nor_env(d) -> Optional[bytes]:
     return blob if blob and len(blob) == SO.S.NOR_ENV_SIZE else None
 
 
-def _env_bootcmd_line(env: Optional[dict]) -> str:
+def _env_bootcmd_line(env: dict | None) -> str:
     return (env or {}).get("bootcmd", "(none)")
 
 
-def offer_nor_env_restore(d, *, transfer: str, sess, base_url: Optional[str],
-                          folder: Optional[Path], label: Optional[str], manifest: dict,
-                          snap_vars: Optional[dict], current_blob: Optional[bytes],
+def offer_nor_env_restore(d, *, transfer: str, sess, base_url: str | None,
+                          folder: Path | None, label: str | None, manifest: dict,
+                          snap_vars: dict | None, current_blob: bytes | None,
                           have: set, ask: Callable) -> bool:
     """
     Opt-in: write the NOR env region saved with the snapshot back to NOR.
@@ -100,7 +99,7 @@ def nor_env_advice(manifest: dict, snap_env: dict, current_env: dict, current_fr
 
 # --- eMMC env, inventory -------------------------------------------------------------------
 
-def read_emmc_env(d) -> Optional[bytes]:
+def read_emmc_env(d) -> bytes | None:
     """Raw eMMC U-Boot env region (inside the firmware region) via `od`, or None."""
     try:
         blob = SO.S.parse_od(d.run_script(SO.S.build_emmc_env_dump_script(), marker="snap_emmc_env",

@@ -9,10 +9,10 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-from mono_imager.step_registry import register_step, StepContext, ALL_OS
-from mono_imager.flash_orchestrator import step, verbose, start_http_server, wait_for_report
-from mono_imager.spinner import with_spinner
 from mono_imager import constants as C
+from mono_imager.flash_orchestrator import start_http_server, step, verbose, wait_for_report
+from mono_imager.spinner import with_spinner
+from mono_imager.step_registry import ALL_OS, StepContext, register_step
 
 
 def _step_network_ready(ctx: StepContext) -> bool:

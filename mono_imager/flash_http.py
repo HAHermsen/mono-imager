@@ -16,7 +16,6 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from mono_imager import flash_orchestrator as F
@@ -45,7 +44,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
     only ever used to LAUNCH a script on the device from this point
     on, never to receive its result.
     """
-    firmware_path: Optional[Path] = None
+    firmware_path: Path | None = None
 
     # Class-level, thread-safe store of reports received from the
     # device. The HTTP server runs its own background thread per
@@ -154,7 +153,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     @classmethod
-    def wait_for_report(cls, step_id: str, timeout: float = F.C.REPORT_TIMEOUT) -> Optional[str]:
+    def wait_for_report(cls, step_id: str, timeout: float = F.C.REPORT_TIMEOUT) -> str | None:
         """
         Poll the thread-safe reports store for a result reported by
         the device for the given step_id, blocking up to timeout
@@ -179,7 +178,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         return None
 
     @classmethod
-    def peek_report(cls, step_id: str) -> Optional[str]:
+    def peek_report(cls, step_id: str) -> str | None:
         """
         Non-destructive read of the reports store — returns the
         current value for step_id without removing it, or None if
@@ -199,7 +198,7 @@ class _FirmwareHandler(BaseHTTPRequestHandler):
         F.verbose(f"HTTP: {fmt % args}", "debug")
 
 
-def wait_for_report(step_id: str, timeout: float = F.C.REPORT_TIMEOUT) -> Optional[str]:
+def wait_for_report(step_id: str, timeout: float = F.C.REPORT_TIMEOUT) -> str | None:
     """
     Module-level convenience wrapper around
     _FirmwareHandler.wait_for_report() — see that method's docstring
@@ -211,7 +210,7 @@ def wait_for_report(step_id: str, timeout: float = F.C.REPORT_TIMEOUT) -> Option
     return F._FirmwareHandler.wait_for_report(step_id, timeout=timeout)
 
 
-def peek_report(step_id: str) -> Optional[str]:
+def peek_report(step_id: str) -> str | None:
     """
     Module-level convenience wrapper around
     _FirmwareHandler.peek_report() — non-destructive read for polling
@@ -221,7 +220,7 @@ def peek_report(step_id: str) -> Optional[str]:
     return F._FirmwareHandler.peek_report(step_id)
 
 
-def start_http_server(host_ip: str, port: int, firmware_path: Path) -> Optional[F.HTTPServer]:
+def start_http_server(host_ip: str, port: int, firmware_path: Path) -> F.HTTPServer | None:
     """Start HTTP server in a daemon thread. Returns server or None on failure."""
     try:
         with F._FirmwareHandler._reports_lock:
@@ -273,7 +272,7 @@ def parse_active_eth_ifaces(ip_link_output: str) -> list:
     return ifaces
 
 
-def parse_active_eth_iface(ip_link_output: str) -> Optional[str]:
+def parse_active_eth_iface(ip_link_output: str) -> str | None:
     """
     Backwards-compatible single-port helper: the FIRST eth* interface
     with LOWER_UP, or None. See parse_active_eth_ifaces() for the full

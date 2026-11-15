@@ -16,8 +16,9 @@ class TuiConsoleMixin:
 
     def menu_cli_console(self):
         """Serial console session — raw pass-through"""
-        from mono_imager.serial_device import SerialDevice
         import threading
+
+        from mono_imager.serial_device import SerialDevice
 
         self.print_screen_divider()
         print("  CLI Console — Serial")
@@ -76,8 +77,8 @@ class TuiConsoleMixin:
         reader_thread.start()
 
         try:
-            import tty
             import termios
+            import tty
             fd = T.sys.stdin.fileno()
             old_settings = termios.tcgetattr(fd)
             tty.setraw(fd)

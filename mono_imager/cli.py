@@ -3,11 +3,11 @@
 mono-imager CLI entry point
 """
 
-import sys
-import os
 import argparse
+import os
+import sys
 
-from mono_imager import __version__, __author__, __license__
+from mono_imager import __author__, __license__, __version__
 
 
 class _VersionAction(argparse.Action):
@@ -59,9 +59,10 @@ def main():
         # some later point in main().
         os.environ["MONO_DEBUG"] = "1"
 
-    from mono_imager.tui import MonoImager
-    from mono_imager.logging_setup import configure_logging
     from pathlib import Path
+
+    from mono_imager.logging_setup import configure_logging
+    from mono_imager.tui import MonoImager
 
     log_file = configure_logging(Path(__file__).parent.parent / "logs")
 

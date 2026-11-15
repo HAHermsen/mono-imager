@@ -12,10 +12,9 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
+import logging
 import re
 import sys
-import logging
-from typing import Optional
 
 from mono_imager import constants as C
 
@@ -45,7 +44,7 @@ def read_line(prompt: str, escape_word: str = "exit!"):
     return value
 
 
-def print_header(version: str, author: str, device_net: Optional[dict]) -> None:
+def print_header(version: str, author: str, device_net: dict | None) -> None:
     """
     Application header. Box width is computed from actual content, so it
     stays aligned regardless of version-string length.
@@ -84,7 +83,7 @@ def print_header(version: str, author: str, device_net: Optional[dict]) -> None:
     print()
 
 
-def print_status_line(version: str, device_net: Optional[dict]) -> None:
+def print_status_line(version: str, device_net: dict | None) -> None:
     """
     Compact one-line stand-in for print_header(), for screens that scroll
     rather than clear-and-redraw (see menu_main() for the first use of

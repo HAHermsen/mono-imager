@@ -41,7 +41,6 @@ import io
 import json
 import re
 from pathlib import Path
-from typing import Optional
 
 from mono_imager import constants as C
 
@@ -209,7 +208,7 @@ def sha256_file(path) -> str:
 
 # --- Chunk / range planning --------------------------------------------------------
 
-def plan_chunks(emmc_bytes: int, chunk_bytes: Optional[int] = None) -> list:
+def plan_chunks(emmc_bytes: int, chunk_bytes: int | None = None) -> list:
     """[(index, offset, length)] covering the whole eMMC."""
     chunk_bytes = chunk_bytes or CHUNK_BYTES
     if emmc_bytes <= 0 or emmc_bytes % SECTOR:
@@ -251,7 +250,7 @@ def plan_restore(manifest: dict, skip_fw: bool) -> list:
 
 # --- Manifest / SHA256SUMS ---------------------------------------------------------
 
-def default_label(os_label: str, now: Optional[_dt.datetime] = None) -> str:
+def default_label(os_label: str, now: _dt.datetime | None = None) -> str:
     now = now or _dt.datetime.now()
     base = re.sub(r"[^a-z0-9]+", "-", (os_label or "emmc").lower()).strip("-") or "emmc"
     return f"{base}-{now:%Y%m%d-%H%M}"
@@ -261,7 +260,7 @@ def valid_label(label: str) -> bool:
     return bool(_LABEL_RE.match(label or "")) and not label.endswith(".partial")
 
 
-def detect_os_label(env: Optional[dict]) -> str:
+def detect_os_label(env: dict | None) -> str:
     """Display-only OS guess from the U-Boot env (bootcmd and friends)."""
     if not env:
         return "emmc"
@@ -278,7 +277,7 @@ def detect_os_label(env: Optional[dict]) -> str:
     return "emmc"
 
 
-def normalize_mac(mac: Optional[str]) -> str:
+def normalize_mac(mac: str | None) -> str:
     return (mac or "").strip().lower()
 
 
@@ -288,7 +287,7 @@ def same_board(manifest: dict, identity: dict) -> bool:
     return bool(a) and a == b
 
 
-def mac_match(manifest: dict, identity: dict, target_macs: Optional[dict]) -> tuple:
+def mac_match(manifest: dict, identity: dict, target_macs: dict | None) -> tuple:
     """
     ("same" | "partial" | "other", snapshot MACs, this board's MACs).
     Compares every port's MAC recorded in the snapshot's inventory with the
@@ -313,10 +312,10 @@ def mac_match(manifest: dict, identity: dict, target_macs: Optional[dict]) -> tu
 def build_manifest(*, label: str, identity: dict, emmc_bytes: int, chunks: list,
                    fw_sha256: str, boot_sha256: str, os_label: str, boot_dip: str,
                    transfer: str, tool_version: str, auto: bool = False,
-                   nor: Optional[dict] = None, has_env: bool = False,
-                   nor_env: Optional[dict] = None, health: Optional[dict] = None,
-                   inventory: Optional[dict] = None,
-                   now: Optional[_dt.datetime] = None) -> dict:
+                   nor: dict | None = None, has_env: bool = False,
+                   nor_env: dict | None = None, health: dict | None = None,
+                   inventory: dict | None = None,
+                   now: _dt.datetime | None = None) -> dict:
     """
     nor_env: {"file", "sha256", "bytes", "vars_file"} of the NOR U-Boot env
     region saved with the snapshot (None if it could not be read).
@@ -386,7 +385,7 @@ def manifest_json(m: dict) -> str:
     return json.dumps(m, indent=1, sort_keys=False) + "\n"
 
 
-def format_env(env: Optional[dict]) -> str:
+def format_env(env: dict | None) -> str:
     return "".join(f"{k}={v}\n" for k, v in sorted((env or {}).items()))
 
 

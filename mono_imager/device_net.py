@@ -13,12 +13,11 @@ Author:  H.A. Hermsen
 License: GPLv3
 """
 
-import sys
 import logging
-from typing import Optional
+import sys
 
-from mono_imager.spinner import with_spinner
 from mono_imager import constants as C
+from mono_imager.spinner import with_spinner
 
 # --- Limits / tuning (seconds) --------------------------------------------------
 MAX_PREFIX_LEN = 32                  # IPv4 prefix length
@@ -31,7 +30,7 @@ NET_APPLY_TIMEOUT = 20               # ip addr/route + resolv.conf
 logger = logging.getLogger(__name__)
 
 
-def netmask_to_prefix(value: str) -> Optional[str]:
+def netmask_to_prefix(value: str) -> str | None:
     """
     Accept either a dotted subnet mask (255.255.255.0) or a bare CIDR
     prefix length (24) from manual entry, and return the CIDR prefix
@@ -90,7 +89,7 @@ class RecoveryNetwork:
     """
 
     def __init__(self):
-        self.config: Optional[dict] = None
+        self.config: dict | None = None
         self.verified: bool = False
 
     def resolve(self, d) -> bool:
@@ -100,8 +99,8 @@ class RecoveryNetwork:
         entry (with a retry loop). Returns True once the device can
         reach the internet, False on give-up.
         """
-        from mono_imager import recovery_orchestrator as rec
         from mono_imager import flash_orchestrator as core
+        from mono_imager import recovery_orchestrator as rec
 
         print()
         print("  Network setup — REQUIRED before 'firmware update' will work.")
@@ -376,7 +375,7 @@ class RecoveryNetwork:
         print(f"  Using {chosen}; the other Ethernet ports were set down.")
         return chosen
 
-    def _prompt_manual(self) -> Optional[dict]:
+    def _prompt_manual(self) -> dict | None:
         """
         Prompt for Device IP, subnet mask, gateway, and DNS. Returns
         None (caller should abort) if the user leaves a required field

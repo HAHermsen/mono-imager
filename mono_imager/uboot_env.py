@@ -16,7 +16,6 @@ import re
 import struct
 import zlib
 from dataclasses import dataclass, field
-from typing import Optional
 
 CRC_BYTES = 4
 FLAG_BYTES = 1                  # redundant env: one "active" flag byte after the CRC
@@ -32,11 +31,11 @@ _VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 class EnvRegion:
     vars: dict = field(default_factory=dict)   # insertion order = order in the region
     redundant: bool = False
-    flag: Optional[int] = None
+    flag: int | None = None
     size: int = 0
 
 
-def parse(blob: Optional[bytes]) -> Optional[EnvRegion]:
+def parse(blob: bytes | None) -> EnvRegion | None:
     """EnvRegion of a raw env region, or None when no layout's CRC matches."""
     if not blob or len(blob) <= CRC_BYTES + FLAG_BYTES:
         return None
