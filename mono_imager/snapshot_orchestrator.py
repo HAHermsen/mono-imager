@@ -49,7 +49,12 @@ from mono_imager import inventory as I
 from mono_imager import snapshot as S
 from mono_imager import uboot_env as E
 from mono_imager.flash_orchestrator import (
-    capture_uboot_env, console_logger, phase1_uboot, print_report, step, verbose,
+    capture_uboot_env,
+    console_logger,
+    phase1_uboot,
+    print_report,
+    step,
+    verbose,
     wait_for_report,
 )
 from mono_imager.spinner import with_spinner
@@ -997,8 +1002,8 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
                  setup_network: Callable, store: Path,
                  soft_reboot: Optional[Callable] = None, ask: Callable = _ask) -> bool:
     """Snapshot journey. Returns print_report()'s verdict."""
-    from mono_imager.snapshot_server import SnapshotSession, start_snapshot_server
     from mono_imager.flash_orchestrator import reset_results
+    from mono_imager.snapshot_server import SnapshotSession, start_snapshot_server
     reset_results()
     dip_now = ask_dip(ask)
     d, info = reach_recovery(port, dip_now, soft_reboot, ask)
