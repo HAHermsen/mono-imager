@@ -398,8 +398,9 @@ def build_write_script(*, url: str, dev: str, iso_bytes: int, iso_sha256: str,
       6. (v2) re-reads the partition table and checks `expect_p2` exists,
       7. POSTs its KEY=VALUE log to the PC (TCP/IP report-back, see
          flash_orchestrator._FirmwareHandler for why not serial).
-    conv=notrunc is a no-op on block devices; it makes the script behave
-    the same against plain files (the unit tests run it for real).
+    No `conv=notrunc` (or any conv=/iflag=/oflag=): the recovery BusyBox dd
+    is built without them and refuses the whole command (seen on hardware,
+    2026-11-21). On a block device dd never truncates anyway.
     """
     if iso_bytes % SECTOR:
         raise ValueError("ISO size is not a whole number of 512-byte sectors")
@@ -427,10 +428,10 @@ def build_write_script(*, url: str, dev: str, iso_bytes: int, iso_sha256: str,
     ]
     if partition_table:
         s += [
-            f'  dd if=/dev/zero of={dev} bs={SECTOR} count={C.EMMC_FW_START // SECTOR} conv=notrunc >>"$l" 2>&1',
+            f'  dd if=/dev/zero of={dev} bs={SECTOR} count={C.EMMC_FW_START // SECTOR} >>"$l" 2>&1',
             '  echo "PT_ZERO_RC=$?" >>"$l"',
             f"  printf '{printf_octal(partition_table)}' | "
-            f'dd of={dev} bs=1 seek={MBR_TABLE_OFFSET} conv=notrunc >>"$l" 2>&1',
+            f'dd of={dev} bs=1 seek={MBR_TABLE_OFFSET} >>"$l" 2>&1',
             '  echo "PT_RC=$?" >>"$l"',
         ]
     seek_mib = seek_lba * SECTOR // C.MIB
@@ -438,7 +439,7 @@ def build_write_script(*, url: str, dev: str, iso_bytes: int, iso_sha256: str,
         raise ValueError("seek_lba must be a whole number of MiB")
     seek = f" seek={seek_mib}" if seek_mib else ""
     s += [
-        f'  dd if="$f" of={dev} bs=1M{seek} conv=notrunc >>"$l" 2>&1',
+        f'  dd if="$f" of={dev} bs=1M{seek} >>"$l" 2>&1',
         '  echo "DD_RC=$?" >>"$l"',
         '  sync',
         f'  if dd if={dev} bs={SECTOR} skip={seek_lba} count={sectors} 2>/dev/null | cmp -s - "$f"; then',

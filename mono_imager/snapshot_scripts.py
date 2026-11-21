@@ -176,6 +176,9 @@ def _plan(rows: list) -> list:
 
 
 # wr START: dd parameters (bs, seek) for a write starting at START (aligned 1 MiB or 512 B)
+# Never `conv=` / `iflag=` / `oflag=` on dd: CONFIRMED ON HARDWARE (2026-11-21), the
+# recovery BusyBox 1.37.0 dd is built without them (usage error, rc 1, nothing written).
+# On a block device dd never truncates, so conv=notrunc was not needed anyway.
 _WR_FN = r"""wr() {
   if [ $(($1 % 1048576)) -eq 0 ]; then echo "bs=1048576 seek=$(($1 / 1048576))"
   else echo "bs=512 seek=$(($1 / 512))"; fi
@@ -263,7 +266,7 @@ def build_lan_restore_script(*, base_url: str, token: str, ranges: list,
     s += ["while read -r k c o n a; do",
           '  q="image?$T&k=$k&chunk=$c&off=$o&len=$n"',
           f'  {{ curl -s -S "$U/$q" 2>>{S.LOG}; echo $? > /tmp/mi_crc; }} |',
-          f'    dd of="$DEV" $(wr $a) conv=notrunc 2>>{S.LOG}',
+          f'    dd of="$DEV" $(wr $a) 2>>{S.LOG}',
           "  drc=$?; crc=$(cat /tmp/mi_crc)",
           "  dropc"]
     if have_sha:
@@ -468,7 +471,7 @@ def build_usb_restore_script(*, label: str, manifest: dict, ranges: list,
          "src() { if [ \"$w\" = - ]; then dec $z < \"$f\" | tail -c +$((o + 1)) | head -c $n; "
          "else dec $z < \"$f\"; fi; }",
          "while read -r k f z o n a w; do",
-         '  src | dd of="$DEV" $(wr $a) conv=notrunc 2>/dev/null; drc=$?',
+         '  src | dd of="$DEV" $(wr $a) 2>/dev/null; drc=$?',
          "  dropc",
          '  if [ "$w" = - ]; then want=$(src | sha); else want=$w; fi',
          "  got=$(rd $a $n | sha)",
@@ -593,7 +596,7 @@ def build_emmc_env_write_script(src: str, want_sha: str, dev: str | None = None)
         f'[ "$(sha256sum < {src} | cut -d" " -f1)" = "{want_sha}" ] || '
         '{ echo "EMMC_ENV_WRITE=badsource"; exit 0; }',
         f"dd if={src} of={dev} bs={S.SECTOR} seek={S.EMMC_ENV_SECTOR} count={S.EMMC_ENV_SECTORS} "
-        "conv=notrunc 2>/dev/null && sync || { echo \"EMMC_ENV_WRITE=dd\"; exit 0; }",
+        "2>/dev/null && sync || { echo \"EMMC_ENV_WRITE=dd\"; exit 0; }",
         f'got=$(dd if={dev} bs={S.SECTOR} skip={S.EMMC_ENV_SECTOR} count={S.EMMC_ENV_SECTORS} 2>/dev/null '
         '| sha256sum | cut -d" " -f1)',
         f'if [ "$got" = "{want_sha}" ]; then echo "EMMC_ENV_WRITE=ok"; else echo "EMMC_ENV_WRITE=readback"; fi',

@@ -70,7 +70,7 @@ MI_PLAN_EOF
 while read -r k c o n a; do
   q="image?$T&k=$k&chunk=$c&off=$o&len=$n"
   { curl -s -S "$U/$q" 2>>/tmp/mono_imager_snap.log; echo $? > /tmp/mi_crc; } |
-    dd of="$DEV" $(wr $a) conv=notrunc 2>>/tmp/mono_imager_snap.log
+    dd of="$DEV" $(wr $a) 2>>/tmp/mono_imager_snap.log
   drc=$?; crc=$(cat /tmp/mi_crc)
   dropc
   rd $a $n | put "verify?$T&tag=r$k"; vs=host

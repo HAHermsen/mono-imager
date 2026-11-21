@@ -65,7 +65,7 @@ cd '/mnt/usb/mono-snapshots/armbian-20261114-2010' || { echo 'SUMS=missing' >> /
 if sha256sum -c SHA256SUMS >/dev/null 2>&1; then echo SUMS=ok >> /tmp/mono_imager_snap.log; else echo SUMS=bad >> /tmp/mono_imager_snap.log; exit 1; fi
 src() { if [ "$w" = - ]; then dec $z < "$f" | tail -c +$((o + 1)) | head -c $n; else dec $z < "$f"; fi; }
 while read -r k f z o n a w; do
-  src | dd of="$DEV" $(wr $a) conv=notrunc 2>/dev/null; drc=$?
+  src | dd of="$DEV" $(wr $a) 2>/dev/null; drc=$?
   dropc
   if [ "$w" = - ]; then want=$(src | sha); else want=$w; fi
   got=$(rd $a $n | sha)

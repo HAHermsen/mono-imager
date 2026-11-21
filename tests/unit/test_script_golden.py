@@ -18,6 +18,7 @@ Update:  python tests/unit/test_script_golden.py --update
 """
 
 import json
+import re
 import sys
 from collections.abc import Callable
 from functools import partial
@@ -218,6 +219,12 @@ for name, data in scripts.items():
     # git may check text files out with CRLF on Windows: compare with LF line endings
     check(f"{name} matches", ref.read_bytes().replace(CRLF, LF) == data)
     check(f"{name}: no carriage return in the script", CR not in data)
+
+section("no dd option the recovery BusyBox lacks (conv= iflag= oflag= ibs= obs=)")
+# CONFIRMED ON HARDWARE 2026-11-21: BusyBox 1.37.0 dd in recovery refuses them (rc 1, nothing written)
+DD_UNSUPPORTED = re.compile(rb"\bdd\b[^\n|;&]*\b(conv|iflag|oflag|ibs|obs)=")
+bad_dd = sorted(n for n, data in scripts.items() if DD_UNSUPPORTED.search(data))
+check(f"no device script uses them (found in: {bad_dd})", not bad_dd)
 
 section("no stale golden files")
 stale = sorted({p.name for p in GOLDEN_DIR.glob("*" + GOLDEN_SUFFIX)} - set(scripts))

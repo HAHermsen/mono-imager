@@ -48,6 +48,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import strict_dd  # noqa: E402  (tests/unit helper)
 from mono_imager import constants as C
 from mono_imager import snapshot as S
 from mono_imager import snapshot_orchestrator as SO
@@ -124,7 +125,13 @@ class FakeDev:
 
 
 def shells():
-    out = [("sh", ["/bin/sh"], dict(os.environ))]
+    """(name, shell, env). Both use strict_dd: a dd like the recovery BusyBox one
+    (no conv=/iflag=/oflag=); on the fake (file) eMMC it never truncates."""
+    shim = work / "ddshim"
+    if not shim.exists():
+        shim.mkdir()
+        strict_dd.install(shim)
+    out = [("sh", ["/bin/sh"], dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}"))]
     if BUSYBOX:
         bb = work / "bbbin"
         if not bb.exists():
@@ -134,6 +141,8 @@ def shells():
             for t in ("curl", "zstd"):
                 if shutil.which(t):
                     (bb / t).symlink_to(shutil.which(t))
+            strict_dd.install(bb, BUSYBOX)          # dd run from other tools (stubs)
+            strict_dd.install_ash_wrapper(bb, BUSYBOX)   # dd inside the ash script itself
         out.append(("busybox", [str(bb / "sh")], {"PATH": str(bb), "HOME": str(work)}))
     return out
 
@@ -642,7 +651,7 @@ for name, shell_, envv_ in shells():
 # Whole journeys (run_snapshot / run_restore) on /bin/sh: prompts, auto-
 # snapshot, firmware-region skip, clone mode, rollback after a bad write.
 section("[sh] journeys end to end (LAN + USB)")
-shell, envv = ["/bin/sh"], dict(os.environ)
+_, shell, envv = shells()[0]   # /bin/sh with the strict dd (see shells())
 size = 40 * S.MIB + 1536
 
 # fake NOR env MTD partition (sysfs name + device file) and a flashcp stub

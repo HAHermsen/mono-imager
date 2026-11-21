@@ -16,7 +16,7 @@ else
   echo "SHA=unavailable" >>"$l"
 fi
 if [ "$ok" = 1 ]; then
-  dd if="$f" of=/dev/sda bs=1M conv=notrunc >>"$l" 2>&1
+  dd if="$f" of=/dev/sda bs=1M >>"$l" 2>&1
   echo "DD_RC=$?" >>"$l"
   sync
   if dd if=/dev/sda bs=512 skip=0 count=1048576 2>/dev/null | cmp -s - "$f"; then

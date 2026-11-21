@@ -459,7 +459,7 @@ check("journey passes", ok)
 check("all steps passed", results and all(p for _, _, p, _ in results))
 writes = [b for m, b in dev.launched if m == "vyos_write"]
 check("one write script launched, to /dev/sda",
-      len(writes) == 1 and "of=/dev/sda bs=1M conv=notrunc" in writes[0])
+      len(writes) == 1 and "of=/dev/sda bs=1M " in writes[0] and "conv=" not in writes[0])
 check("v1 writes no partition table", writes and "seek=446" not in writes[0])
 check("documented INSTALL.md boot line typed at U-Boot",
       "usb start; fatload usb 0:2 ${load_addr} boot.scr; source ${load_addr}" in ser.typed)
@@ -497,7 +497,8 @@ ok, runner, ser, dev = run_journey("netemmc", inputs=["y"])
 check("journey passes", ok)
 writes = [b for m, b in dev.launched if m == "vyos_write"]
 body = writes[0] if writes else ""
-check("write targets /dev/mmcblk0 at 64 MiB", "of=/dev/mmcblk0 bs=1M seek=64 conv=notrunc" in body)
+check("write targets /dev/mmcblk0 at 64 MiB, no conv= (recovery dd lacks it)",
+      "of=/dev/mmcblk0 bs=1M seek=64 " in body and "conv=" not in body)
 check("partition table written first", body.find("seek=446") < body.find("bs=1M seek=64") and "seek=446" in body)
 check("p2 checked after re-reading the table", "/dev/mmcblk0p2" in body)
 check("U-Boot got the ISO's commands, adapted",

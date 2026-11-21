@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import strict_dd  # noqa: E402  (tests/unit helper)
 from mono_imager.journeys import _vyos as V
 
 passed = 0
@@ -60,8 +61,8 @@ CURL_STUB = """#!/bin/sh
 # report:   curl -sk -X POST --data-binary @FILE URL -> copy FILE to $REPORT_OUT
 if [ "$2" = "-o" ]; then
   cp "$SRC_FILE" "$3"
-  [ -n "$TRUNC_TO" ] && dd if="$SRC_FILE" of="$3" bs=512 count="$TRUNC_TO" 2>/dev/null
-  [ -n "$FLIP_BYTE" ] && printf 'Z' | dd of="$3" bs=1 seek="$FLIP_BYTE" conv=notrunc 2>/dev/null
+  [ -n "$TRUNC_TO" ] && head -c $((TRUNC_TO * 512)) "$SRC_FILE" > "$3"
+  [ -n "$FLIP_BYTE" ] && printf 'Z' | dd of="$3" bs=1 seek="$FLIP_BYTE" 2>/dev/null
   exit 0
 fi
 if [ "$3" = "POST" ]; then
@@ -71,7 +72,7 @@ fi
 exit 2
 """
 BLOCKDEV_STUB = "#!/bin/sh\nexit 0\n"
-BB_APPLETS = ["dd", "cmp", "cut", "tr", "wc", "rm", "sync", "sleep", "cat", "grep",
+BB_APPLETS = ["dd", "head", "cmp", "cut", "tr", "wc", "rm", "sync", "sleep", "cat", "grep",
               "cp", "printf", "basename", "mkdir"]
 
 BUSYBOX = shutil.which("busybox")
@@ -95,6 +96,8 @@ def make_bin(variant: str, with_sha: bool = True) -> Path:
     if variant == "busybox":
         for a in BB_APPLETS + (["sha256sum"] if with_sha else []):
             os.symlink(BUSYBOX, b / a)
+    # a dd like the recovery BusyBox one (no conv=/iflag=/oflag=); never truncates the fake eMMC file
+    strict_dd.install(b, BUSYBOX if variant == "busybox" else None)
     return b
 
 
@@ -105,7 +108,7 @@ def run(script: str, variant: str = "sh", with_sha: bool = True, env_extra=None)
     b = make_bin(variant, with_sha)
     if variant == "busybox":
         env["PATH"] = str(b)
-        cmd = [BUSYBOX, "sh", "-c", script]
+        cmd = [BUSYBOX, "sh", "-c", strict_dd.ash_prelude(BUSYBOX) + script]
     else:
         env["PATH"] = f"{b}:/usr/bin:/bin"
         if not with_sha:
