@@ -124,11 +124,15 @@ class Spinner:
 
     FRAMES = BRAILLE_FRAMES if _BRAILLE_SUPPORTED else ASCII_FRAMES
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, status: Callable[[], str] | None = None):
+        """status: optional callable whose text is shown after the timer and
+        re-read every frame (e.g. a live "upload 47%")."""
         self.message = message
+        self.status = status
         self._stop = threading.Event()
         self._thread = None
         self._started = None
+        self._widest = 0          # longest line written, so __exit__ wipes all of it
 
     def __enter__(self):
         self._started = time.monotonic()
@@ -143,7 +147,8 @@ class Spinner:
         if self._thread:
             self._thread.join(timeout=JOIN_TIMEOUT)
         elapsed = self._elapsed_str()
-        sys.stdout.write("\r" + " " * (len(self.message) + len(elapsed) + CLEAR_PADDING) + "\r")
+        width = max(self._widest, len(self.message) + len(elapsed))
+        sys.stdout.write("\r" + " " * (width + CLEAR_PADDING) + "\r")
         sys.stdout.write(_SHOW_CURSOR)
         sys.stdout.flush()
 
@@ -159,12 +164,18 @@ class Spinner:
             if self._stop.is_set():
                 break
             elapsed = self._elapsed_str()
-            sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}  {elapsed}")
+            extra = f"  {self.status()}" if self.status else ""
+            visible = f"{self.message} {frame}  {elapsed}{extra}"
+            # pad over the previous, longer line (a status text can shrink)
+            pad = " " * max(0, self._widest - len(visible))
+            self._widest = max(self._widest, len(visible))
+            sys.stdout.write(f"\r{self.message} {_GREEN}{frame}{_RESET}  {elapsed}{extra}{pad}")
             sys.stdout.flush()
             time.sleep(FRAME_INTERVAL)
 
 
-def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tuple[Any, Exception | None]:
+def with_spinner(fn: Callable, *args, message: str = "Working",
+                 status: Callable[[], str] | None = None, **kwargs) -> Tuple[Any, Exception | None]:
     """
     Run any blocking callable on a worker thread while a Spinner
     animates on the main thread. The wrapped call's actual execution
@@ -180,6 +191,8 @@ def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tup
         fn: The blocking callable to run (e.g. a SerialDevice method).
         *args: Positional arguments to pass to fn.
         message: Text shown next to the spinner.
+        status: Optional callable, re-read every frame; its text is shown
+            after the timer (live progress such as "upload 47%").
         **kwargs: Keyword arguments to pass to fn.
 
     Returns:
@@ -208,7 +221,7 @@ def with_spinner(fn: Callable, *args, message: str = "Working", **kwargs) -> Tup
             box["error"] = e
 
     t = threading.Thread(target=worker, daemon=True)
-    with Spinner(message):
+    with Spinner(message, status):
         t.start()
         t.join()
 

@@ -11,6 +11,8 @@ License: GPLv3
 
 
 
+from typing import Any
+
 from mono_imager import flash_orchestrator as F
 
 
@@ -132,7 +134,8 @@ def phase1_recovery(d: F.SerialDevice,
 
     # Step 4: Boot
     boot_msg = "Booting recovery Linux..." if boot_method == "boot_recovery" else "Booting staging Linux..."
-    boot_args = {"boot_medium": boot_medium} if (boot_method == "boot_recovery" and boot_medium) else {}
+    boot_args: dict[str, Any] = ({"boot_medium": boot_medium}
+                                 if (boot_method == "boot_recovery" and boot_medium) else {})
     booted, _boot_err = F.with_spinner(boot_fn, message=boot_msg, **boot_args)
     if _boot_err:
         booted = False

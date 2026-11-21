@@ -47,6 +47,7 @@ from pathlib import Path
 from mono_imager import constants as C
 from mono_imager import inventory as I
 from mono_imager import snapshot as S
+from mono_imager import snapshot_progress as P
 from mono_imager import uboot_env as E  # noqa: F401  (used as SO.E by the split-out modules)
 from mono_imager.flash_orchestrator import (
     capture_uboot_env,
@@ -421,8 +422,9 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> dict | N
 
     out = []
     for i, off, n in chunks:
+        progress = P.ChunkProgress(sess, i, n, single_pass=single, have_sha=have_sha)
         raw, err = with_spinner(wait_for_report, f"snap_{i}", timeout=CHUNK_TIMEOUT,
-                                message=f"Chunk {i + 1}/{len(chunks)}: {spin}")
+                                message=f"Chunk {i + 1}/{len(chunks)}: {spin}", status=progress)
         kv = S.parse_kv(raw or "")
         up = sess.wait("uploads", i, UPLOAD_SETTLE_TIMEOUT)
         if err or raw is None:

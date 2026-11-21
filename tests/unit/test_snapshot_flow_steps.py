@@ -83,8 +83,8 @@ def recorded(**patches):
         yield rec
 
 
-def run_spinner(fn, *args, message="", **kwargs):
-    """with_spinner() without the thread: (result, error) like the real one."""
+def run_spinner(fn, *args, message="", status=None, **kwargs):
+    """with_spinner() without the thread: (result, error) like the real one (status is not passed on)."""
     try:
         return fn(*args, **kwargs), None
     except Exception as e:  # noqa: BLE001 - mirrors with_spinner(), which captures any error

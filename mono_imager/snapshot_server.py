@@ -55,12 +55,23 @@ class SnapshotSession:
         self.source_manifest: dict | None = None
         self.uploads, self.verify, self.sent = {}, {}, {}
         self.nor = None
+        self.live: dict = {}    # (kind, key) -> bytes received so far, while a PUT streams in
+
+    def received(self, kind: str, key) -> int:
+        """Bytes of the PUT for kind/key ("uploads" chunk i, "verify" tag) received so far."""
+        with self.lock:
+            return self.live.get((kind, key), 0)
+
+    def _count(self, kind: str, key, n: int):
+        with self.lock:
+            self.live[(kind, key)] = n
 
     def begin_snapshot(self, target_dir: Path, compression: str | None = None):
         with self.lock:
             self.target_dir = Path(target_dir)
             self.compression = compression or S.host_compression()
             self.uploads, self.verify, self.nor = {}, {}, None
+            self.live = {}
 
     def begin_restore(self, source_dir: Path, manifest: dict):
         with self.lock:
@@ -149,6 +160,7 @@ class _SnapshotHandler(_FirmwareHandler):
                         h.update(piece)
                         n += len(piece)
                         f.write(piece)
+                        sess._count("uploads", i, n)
                 rec = {"bytes": n, "sha256": h.hexdigest(), "file": name,
                        "compression": sess.compression}
                 with sess.lock:
@@ -168,6 +180,7 @@ class _SnapshotHandler(_FirmwareHandler):
                 for piece in _iter_body(self.rfile, self.headers):
                     h.update(piece)
                     n += len(piece)
+                    sess._count("verify", tag, n)
                 with sess.lock:
                     sess.verify[tag] = {"bytes": n, "sha256": h.hexdigest()}
         except Exception as e:  # recorded, the orchestrator decides
