@@ -341,7 +341,6 @@ class Capture:
     probe: dict                       # probe_device() result (size, tools, identity)
     identity: dict                    # mac / serial / model / U-Boot version
     env: dict                         # env of the U-Boot that was interrupted (info)
-    os_label: str                     # display-only OS guess
     boot_dip: str                     # DIP position the captured OS boots with
     nor_dump: bool = False            # also keep a read-only full NOR dump
     nor_env: bytes | None = None   # raw NOR U-Boot env region (8 KiB)
@@ -350,6 +349,7 @@ class Capture:
     emmc_env: bytes | None = None  # raw eMMC U-Boot env region (info; it is in the image)
     auto: bool = False                # taken automatically before a restore
     thorough: bool = False            # LAN: re-read every chunk from the eMMC (2nd media read, ~2x slower)
+    os_label: str = ""                # OS name typed by the user ("" = none, never guessed)
 
 
 def _text_files(cap: Capture) -> dict:
@@ -379,11 +379,11 @@ def _manifest(cap: Capture, *, chunks: list, fw_sha: str, boot_sha: str, transfe
     from mono_imager import __version__
     return S.build_manifest(label=cap.label, identity=cap.identity,
                             emmc_bytes=cap.probe["emmc_bytes"], chunks=chunks,
-                            fw_sha256=fw_sha, boot_sha256=boot_sha, os_label=cap.os_label,
+                            fw_sha256=fw_sha, boot_sha256=boot_sha,
                             boot_dip=cap.boot_dip, transfer=transfer, tool_version=__version__,
                             auto=cap.auto, nor=nor_rec, has_env=bool(cap.env),
                             nor_env=_nor_env_record(cap), health=cap.health,
-                            inventory=cap.inventory)
+                            inventory=cap.inventory, os_label=cap.os_label)
 
 
 def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> dict | None:
@@ -713,7 +713,6 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
             step(0, "eMMC not mounted by recovery Linux", False, "unmount it first")
             return print_report()
 
-        os_label = S.detect_os_label(env)
         ntp = False
         if transfer == "lan":
             if not setup_network(d):
@@ -752,8 +751,6 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
             step(0, "NOR U-Boot env read (kept with the snapshot)", True)
         else:
             _say("  ⚠ NOR U-Boot env not readable — the snapshot continues without it.")
-        if dip_now == DIP_NOR and nor_env:
-            os_label = S.detect_os_label(S.parse_uboot_env_blob(nor_env)) or os_label
 
         health = health_check(d, probe)
         if not review_health(health, ask):
@@ -762,15 +759,16 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
         label = _ask_label(ask, existing=(mnt["snapshots"] if mnt else
                                           [n for n, _ in S.list_snapshots(store)]
                                           + [p.name for p in store.iterdir()]))
+        os_label = _ask_os(ask)
         nor = False
         if probe["nor_present"]:
             nor = ask("  Also keep a read-only NOR dump for forensics (never restored)? [y/N]: ").lower() == "y"
         thorough = False
         if transfer == "lan":
             thorough = ask("  Thorough verify: re-read every chunk from the eMMC (~2x slower)? [y/N]: ").lower() == "y"
-        cap = Capture(label=label, probe=probe, identity=identity, env=env, os_label=os_label,
-                      boot_dip=dip_now, nor_dump=nor, nor_env=nor_env, health=health,
-                      inventory=inventory, emmc_env=emmc_env, thorough=thorough)
+        cap = Capture(label=label, probe=probe, identity=identity, env=env, boot_dip=dip_now,
+                      nor_dump=nor, nor_env=nor_env, health=health,
+                      inventory=inventory, emmc_env=emmc_env, thorough=thorough, os_label=os_label)
 
         if transfer == "usb":
             m = snapshot_usb(d, cap)
@@ -802,7 +800,6 @@ from mono_imager.snapshot_env import (  # noqa: F401  (re-export; that module im
     read_nor_env,
 )
 from mono_imager.snapshot_gates import (  # noqa: F401  (re-export; that module imports this one)
-    _CLONE_HINTS,
     _upload,
     clone_warning,
     firmware_gate,
@@ -813,6 +810,7 @@ from mono_imager.snapshot_gates import (  # noqa: F401  (re-export; that module 
 from mono_imager.snapshot_restore import (  # noqa: F401  (re-export; that module imports this one)
     _after_restore,
     _ask_label,
+    _ask_os,
     _auto_snapshot_label,
     _fix_backup_gpt,
     _pick_usb_snapshot,

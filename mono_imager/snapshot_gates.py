@@ -51,18 +51,8 @@ def firmware_gate(target_inv: dict, snap_inv: dict | None, *, clone: bool, ask: 
 
 # --- Clone warning (read-only: the OS config is never edited) ------------------------------
 
-# Where each OS keeps settings that are tied to the original board.
-_CLONE_HINTS = {
-    "openwrt":  "OpenWRT: `option macaddr` in /etc/config/network, DHCP static leases",
-    "armbian":  "Armbian/Debian: /etc/udev/rules.d/*persistent-net*, /etc/machine-id, netplan/NetworkManager MAC matches",
-    "opnsense": "OPNsense: interface assignments and spoofed MACs (Interfaces > Assignments)",
-    "vyos":     "VyOS: `hw-id` under `interfaces ethernet`",
-}
-
-
 def clone_warning(manifest: dict, snap_macs: set, here_macs: set) -> list:
     """Lines shown before a clone: what comes along from the other board."""
-    os_label = manifest.get("os_label", "")
     lines = [
         "  ⚠ This is ANOTHER board's snapshot.",
         f"    Snapshot MACs:   {', '.join(sorted(snap_macs)) or manifest.get('device', {}).get('mac') or '?'}",
@@ -72,9 +62,7 @@ def clone_warning(manifest: dict, snap_macs: set, here_macs: set) -> list:
         "    Two boxes with the same identity on one LAN will clash — change it before",
         "    connecting both.",
     ]
-    hint = SO._CLONE_HINTS.get(os_label)
-    lines.append(f"    Check: {hint}" if hint else
-                 "    Check the OS's network config for settings pinned to MAC addresses.")
+    lines.append("    Check the OS's network config for settings pinned to MAC addresses.")
     return lines
 
 
@@ -217,7 +205,6 @@ def review_health(health: dict, ask: Callable) -> bool:
 
 
 __all__ = [
-    "_CLONE_HINTS",
     "_upload",
     "clone_warning",
     "firmware_gate",

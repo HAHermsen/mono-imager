@@ -99,7 +99,7 @@ def probe(have=("sha256sum", "gzip")):
 def capture(**kw):
     return SO.Capture(label=LABEL, probe=probe(), identity={"mac": MAC, "serial": "MT-1", "model": "Mono",
                                                             "uboot_version": "U-Boot"},
-                      env={"bootcmd": "run x"}, os_label="armbian", boot_dip="EMMC", **kw)
+                      env={"bootcmd": "run x"}, boot_dip="EMMC", **kw)
 
 
 # ----------------------------------------------------------------------------

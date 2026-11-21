@@ -170,7 +170,7 @@ def env_blob(vars_):
 
 
 def cap(label, probe, **kw):
-    return SO.Capture(label=label, probe=probe, identity=ident, env=env, os_label="openwrt",
+    return SO.Capture(label=label, probe=probe, identity=ident, env=env,
                       boot_dip="EMMC", **kw)
 
 
@@ -703,11 +703,13 @@ emmc = work / "j_emmc.img"
 disk = make_disk(emmc, size)
 store = work / "j_store"
 ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df",
-                    ["1", "prod", ""], transfer="lan", store=store)
+                    ["1", "prod", "  Debian GNU/Linux 12\t ", ""], transfer="lan", store=store)
 check("run_snapshot (LAN) succeeds", ok and (store / "prod" / "manifest.json").is_file())
 check("LAN snapshot asks 'Thorough verify'", any("Thorough verify" in q for q in asked))
 mprod = json.loads((store / "prod" / "manifest.json").read_text())
-check("manifest records DIP and OS", mprod["boot_dip"] == "EMMC" and mprod["os_label"] == "openwrt")
+check("LAN snapshot asks for the OS (optional)", any("OS on this eMMC" in q for q in asked))
+check("manifest records the DIP and the typed OS name (trimmed, printable only)",
+      mprod["boot_dip"] == "EMMC" and mprod["os_label"] == "Debian GNU/Linux 12")
 check("NOR U-Boot env saved with the snapshot (raw + readable)",
       (store / "prod" / "nor_env.bin").read_bytes() == ENV_A
       and mprod["nor_env"]["sha256"] == hashlib.sha256(ENV_A).hexdigest()
@@ -818,8 +820,9 @@ ENV_NOR = env_blob({"bootcmd": "run opnsense || run recovery", "recovery": "NOR-
                     "ethaddr": "e8:f6:d7:00:17:df", "kernel_addr_r": "0x82000000"})
 dual = bytearray(disk); dual[C.UBOOT_ENV_EMMC_OFFSET:C.UBOOT_ENV_EMMC_OFFSET + len(ENV_EMMC)] = ENV_EMMC
 emmc.write_bytes(bytes(dual)); nor_env_dev.write_bytes(ENV_NOR)
-ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", "dual", ""], transfer="lan", store=store)
+ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", "dual", "", ""], transfer="lan", store=store)
 mdual = json.loads((store / "dual" / "manifest.json").read_text())
+check("OS left empty -> no os_label stored (never guessed)", "os_label" not in mdual)
 check("snapshot keeps both env sets + inventory.txt",
       ok and (store / "dual" / "emmc_env.txt").is_file() and (store / "dual" / "inventory.txt").is_file()
       and "bootcmd=run openwrt" in (store / "dual" / "emmc_env.txt").read_text()
@@ -840,9 +843,12 @@ stick = work / "j_stick"
 emmc.write_bytes(disk)
 mount_out = {"part": "/dev/sda1", "fs": "vfat", "free_kb": 10 ** 9, "snapshots": [], "ok": True}
 with patch.object(S, "USB_MOUNT", str(stick)), patch.object(SO, "usb_mount", lambda d, mode: dict(mount_out)):
-    ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["2", "usbprod", ""],
+    ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["2", "usbprod", "OpenWrt 24.10", ""],
                         transfer="usb", store=store)
     check("run_snapshot (USB) succeeds", ok and (stick / S.USB_ROOT / "usbprod" / "SHA256SUMS").is_file())
+    check("USB manifest records the typed OS name",
+          json.loads((stick / S.USB_ROOT / "usbprod" / "manifest.json").read_text()).get("os_label")
+          == "OpenWrt 24.10")
     check("USB snapshot does not ask 'Thorough verify' (LAN only)", not any("Thorough" in q for q in asked))
     check("USB: NOR env saved on the stick and in SHA256SUMS",
           (stick / S.USB_ROOT / "usbprod" / "nor_env.bin").read_bytes() == nor_env_dev.read_bytes()
@@ -874,7 +880,7 @@ for ans, single in (("", True), ("y", False), ("Y", False)):
     seen.clear()
     lab = f"j_sp_{'thorough' if ans else 'fast'}_{len(S.list_snapshots(store))}"
     with patch.object(S, "build_lan_snapshot_script", rec_lan):
-        ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", lab, ans], transfer="lan",
+        ok, _ = run_journey(SO.run_snapshot, emmc, "e8:f6:d7:00:17:df", ["1", lab, "", ans], transfer="lan",
                             store=store, have_extra=("openssl",))
     ok_v, _, mj = S.verify_store_snapshot(store / lab)
     check(f"answer {ans!r}: single pass {single}, snapshot OK and verified",

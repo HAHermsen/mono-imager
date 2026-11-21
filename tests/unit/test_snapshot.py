@@ -10,7 +10,7 @@ No hardware required. Covers:
   - host compression round trip (zst when available, gz, raw)
   - snapshot server: chunked + Content-Length uploads, token check,
     ranged /image serving with hashes
-  - label rules, OS guess, NOR-env advice
+  - label rules (no OS guess), NOR-env advice
   - reach_recovery(): NOR chainload commands, DIP fallback when the
     U-Boot has no `sf`
 
@@ -98,7 +98,7 @@ check("skip_fw never touches 4 KiB..32 MiB",
 check("range offsets are chunk-relative", skip[1]["off"] == S.FW_END and skip[1]["chunk"] == 0)
 
 # ----------------------------------------------------------------------------
-section("Labels, OS guess, identity")
+section("Labels, identity")
 LABEL_NOW = datetime.datetime(2026, 11, 21, 13, 54)   # fixed "now" for the label checks
 check("default label: dump-<date>-<time>, no OS name",
       S.default_label(now=LABEL_NOW) == "dump-20261121-1354")
@@ -107,10 +107,10 @@ check("auto label: auto-dump-<date>-<time>",
 check("valid label", S.valid_label("vyos-prod"))
 check("label with slash refused", not S.valid_label("../x"))
 check("label .partial refused", not S.valid_label("x.partial"))
-check("OS from bootcmd: openwrt", S.detect_os_label({"bootcmd": "run openwrt || run recovery"}) == "openwrt")
-check("OS from bootcmd: vyos", S.detect_os_label({"bootcmd": "run vyos || run recovery"}) == "vyos")
-check("OS from extlinux: armbian", S.detect_os_label({"bootcmd": "sysboot mmc 0:1 any 0x1 /extlinux/extlinux.conf"}) == "armbian")
-check("OS unknown -> emmc", S.detect_os_label({}) == "emmc")
+check("no OS guess any more", not hasattr(S, "detect_os_label"))
+check("OS name: trimmed, control characters dropped", S.clean_os_label("  Debian\x1b 12\t ") == "Debian 12")
+check(f"OS name: cut at {S.OS_LABEL_MAX} characters", len(S.clean_os_label("x" * (S.OS_LABEL_MAX + 9))) == S.OS_LABEL_MAX)
+check("OS name: empty stays empty", S.clean_os_label("") == "" and S.clean_os_label(None) == "")
 check("same board by MAC (case-insensitive)",
       S.same_board({"device": {"mac": "E8:F6:D7:00:17:DF"}}, {"mac": "e8:f6:d7:00:17:df"}))
 check("other board", not S.same_board({"device": {"mac": "e8:f6:d7:00:17:df"}}, {"mac": "e8:f6:d7:00:17:e0"}))
@@ -158,7 +158,7 @@ def make_snapshot(folder: Path, disk: bytes, comp="gz", chunk=32 * S.MIB, mac="e
                            chunks=chunks,
                            fw_sha256=hashlib.sha256(disk[S.FW_START:S.FW_END]).hexdigest(),
                            boot_sha256=hashlib.sha256(disk[:S.FW_START]).hexdigest(),
-                           os_label="openwrt", boot_dip="EMMC", transfer="lan", tool_version="t",
+                           boot_dip="EMMC", transfer="lan", tool_version="t",
                            has_env=True)
     man["chunk_bytes"] = chunk
     (folder / "manifest.json").write_text(S.manifest_json(man))
@@ -409,8 +409,16 @@ check("some ports match -> partial", S.mac_match(m_inv, {}, {"eth0": "e8:f6:d7:0
 check("no port matches -> other (clone)", S.mac_match(m_inv, {}, {"eth0": "aa:aa:aa:aa:aa:aa"})[0] == "other")
 check("old snapshot without inventory -> primary MAC", S.mac_match({"device": {"mac": "aa"}}, {"mac": "AA"}, None)[0] == "same")
 warn = "\n".join(SO.clone_warning({"os_label": "openwrt", "device": {}}, {"a"}, {"b"}))
-check("clone warning: identity clash + OS-specific hint, no edits",
-      "SSH host keys" in warn and "macaddr" in warn and "does NOT edit" in warn)
+check("clone warning: identity clash + generic MAC hint, no OS guess (old manifest field ignored)",
+      "SSH host keys" in warn and "pinned to MAC addresses" in warn and "does NOT edit" in warn
+      and "OpenWRT" not in warn)
+said = []
+with patch.object(SO, "_say", lambda m="": said.append(m)):
+    picked = SO.pick_snapshot([("typed", {"os_label": "Debian 12", "emmc": {"bytes": S.CHUNK_BYTES}}),
+                               ("old-guess-cleared", {"emmc": {"bytes": S.CHUNK_BYTES}})], ask=lambda p: "3")
+check("restore list: typed OS shown, none shown when there is none",
+      picked is None and any("typed  — Debian 12, " in x for x in said)
+      and any("old-guess-cleared  — 1.0 GiB, " in x for x in said))
 asked = []
 ok = SO.firmware_gate({"uboot": {"nor": {"mtd0": "U-Boot 2025.04 (Jun 01 2025 - 12:00:00 +0000)"}}},
                       {"uboot": {"nor": {"mtd0": "U-Boot 2025.10 (Oct 01 2025 - 12:00:00 +0000)"}}},

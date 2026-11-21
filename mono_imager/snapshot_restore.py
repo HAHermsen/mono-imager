@@ -30,6 +30,11 @@ def _ask_label(ask: Callable, existing) -> str:
             return v
 
 
+def _ask_os(ask: Callable) -> str:
+    """Optional OS name for the snapshot, typed by the user (Enter = none)."""
+    return SO.S.clean_os_label(ask("  OS on this eMMC (optional, Enter = none): "))
+
+
 def pick_snapshot(snaps: list, ask: Callable = SO._ask) -> int | None:
     """snaps: [(label, manifest or None)] -> index or None."""
     if not snaps:
@@ -39,7 +44,8 @@ def pick_snapshot(snaps: list, ask: Callable = SO._ask) -> int | None:
         m = m or {}
         size = SO._gib(m["emmc"]["bytes"]) if m.get("emmc") else "?"
         extra = " (auto)" if m.get("auto") else ""
-        SO._say(f"  {i}) {label}{extra}  — {m.get('os_label', '?')}, {size}, "
+        os_name = f"{m['os_label']}, " if m.get("os_label") else ""
+        SO._say(f"  {i}) {label}{extra}  — {os_name}{size}, "
              f"{m.get('created', '?')}, MAC {m.get('device', {}).get('mac', '?')}")
     SO._say(f"  {len(snaps) + 1}) Back")
     while True:
@@ -157,7 +163,7 @@ def _take_auto_snapshot(d, *, transfer: str, mnt: dict | None, store: Path, sess
     if go:
         SO._say(f"  Auto-snapshot of the current eMMC: {auto_label}")
         cap = SO.Capture(label=auto_label, probe=probe, identity=cap_args["identity"], env=info["env"],
-                      os_label=SO.S.detect_os_label(info["env"]), boot_dip=cap_args["dip_now"],
+                      boot_dip=cap_args["dip_now"],
                       nor_env=cap_args["nor_env"], inventory=cap_args["inventory"],
                       emmc_env=cap_args["emmc_env"], auto=True)
         if transfer == "usb":
@@ -180,7 +186,8 @@ def _restore_summary(*, transfer: str, label, folder, manifest: dict, identity: 
     src = f"{SO.S.USB_ROOT}/{label} on the USB stick" if transfer == "usb" else str(folder)
     SO._banner("  RESTORE SUMMARY",
             f"  Source:  {src}",
-            f"           {manifest.get('os_label', '?')}, taken {manifest.get('created', '?')}",
+            "           " + (f"{manifest['os_label']}, " if manifest.get("os_label") else "")
+            + f"taken {manifest.get('created', '?')}",
             f"  Target:  this board, MAC {identity['mac'] or '?'}, eMMC {SO._gib(probe['emmc_bytes'])}",
             f"  Writes:  {SO._gib(total)} — " + (
                 "everything except the firmware region (4 KiB..32 MiB)" if skip_fw
@@ -421,6 +428,7 @@ def _write(d, transfer, sess, base_url, folder, label, manifest, ranges, have) -
 __all__ = [
     "_after_restore",
     "_ask_label",
+    "_ask_os",
     "_auto_snapshot_label",
     "_fix_backup_gpt",
     "_pick_usb_snapshot",

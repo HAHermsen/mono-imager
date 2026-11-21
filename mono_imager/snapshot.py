@@ -116,6 +116,7 @@ E2FSCK_CLEAN = 0                     # e2fsck -n: 0 clean, 4 = errors found, 8 =
 SNAP_PREFIX = "SNAP_"
 LABEL_BASE = "dump"                  # suggested snapshot name: dump-<YYYYMMDD-HHMM> (no OS name)
 AUTO_LABEL_PREFIX = "auto-"          # automatic snapshot before a restore: auto-dump-<YYYYMMDD-HHMM>
+OS_LABEL_MAX = 64                    # longest OS name the user may type for a snapshot
 
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -253,32 +254,20 @@ def plan_restore(manifest: dict, skip_fw: bool) -> list:
 # --- Manifest / SHA256SUMS ---------------------------------------------------------
 
 def default_label(base: str = LABEL_BASE, now: _dt.datetime | None = None) -> str:
-    """Suggested snapshot name: <base>-<YYYYMMDD-HHMM> (local time). The OS is not
-    part of the name; it is recorded in the manifest (os_label)."""
+    """Suggested snapshot name: <base>-<YYYYMMDD-HHMM> (local time). No OS name:
+    nothing here can tell which OS is on the eMMC."""
     now = now or _dt.datetime.now()
     base = re.sub(r"[^a-z0-9]+", "-", (base or LABEL_BASE).lower()).strip("-") or LABEL_BASE
     return f"{base}-{now:%Y%m%d-%H%M}"
 
 
+def clean_os_label(text: str) -> str:
+    """User-typed OS name: printable characters only, trimmed, at most OS_LABEL_MAX."""
+    return "".join(ch for ch in (text or "") if ch.isprintable()).strip()[:OS_LABEL_MAX]
+
+
 def valid_label(label: str) -> bool:
     return bool(_LABEL_RE.match(label or "")) and not label.endswith(".partial")
-
-
-def detect_os_label(env: dict | None) -> str:
-    """Display-only OS guess from the U-Boot env (bootcmd and friends)."""
-    if not env:
-        return "emmc"
-    text = " ".join(f"{k}={v}" for k, v in env.items()).lower()
-    boot = (env.get("bootcmd") or "").lower()
-    for name in ("vyos", "opnsense", "openwrt", "armbian"):
-        if name in boot:
-            return name
-    if "extlinux" in boot or "armbian" in text:
-        return "armbian"
-    for name in ("vyos", "opnsense", "openwrt"):
-        if name in text:
-            return name
-    return "emmc"
 
 
 def normalize_mac(mac: str | None) -> str:
@@ -314,26 +303,26 @@ def mac_match(manifest: dict, identity: dict, target_macs: dict | None) -> tuple
 
 
 def build_manifest(*, label: str, identity: dict, emmc_bytes: int, chunks: list,
-                   fw_sha256: str, boot_sha256: str, os_label: str, boot_dip: str,
+                   fw_sha256: str, boot_sha256: str, boot_dip: str,
                    transfer: str, tool_version: str, auto: bool = False,
                    nor: dict | None = None, has_env: bool = False,
                    nor_env: dict | None = None, health: dict | None = None,
-                   inventory: dict | None = None,
+                   inventory: dict | None = None, os_label: str = "",
                    now: _dt.datetime | None = None) -> dict:
     """
     nor_env: {"file", "sha256", "bytes", "vars_file"} of the NOR U-Boot env
     region saved with the snapshot (None if it could not be read).
     health: result of the pre-snapshot GPT / filesystem check.
+    os_label: OS name the user typed; stored only when not empty (never guessed).
     """
     now = now or _dt.datetime.now().astimezone()
-    return {
+    m = {
         "format": FORMAT_VERSION,
         "tool": f"mono-imager {tool_version}",
         "label": label,
         "created": now.isoformat(timespec="seconds"),
         "auto": bool(auto),
         "transfer": transfer,
-        "os_label": os_label,
         "boot_dip": boot_dip,
         "device": {
             "mac": normalize_mac(identity.get("mac")),
@@ -354,6 +343,9 @@ def build_manifest(*, label: str, identity: dict, emmc_bytes: int, chunks: list,
         "health": health,
         "inventory": inventory,
     }
+    if os_label:
+        m["os_label"] = os_label
+    return m
 
 
 def validate_manifest(m: dict) -> list:
