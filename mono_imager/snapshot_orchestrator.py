@@ -757,9 +757,9 @@ def run_snapshot(*, port: str, transfer: str, host_ip: str, http_port: int,
         if not review_health(health, ask):
             return step(0, "Snapshot", False, "cancelled after the health check") or print_report()
 
-        label = _ask_label(os_label, ask, existing=(mnt["snapshots"] if mnt else
-                                                    [n for n, _ in S.list_snapshots(store)]
-                                                    + [p.name for p in store.iterdir()]))
+        label = _ask_label(ask, existing=(mnt["snapshots"] if mnt else
+                                          [n for n, _ in S.list_snapshots(store)]
+                                          + [p.name for p in store.iterdir()]))
         nor = False
         if probe["nor_present"]:
             nor = ask("  Also keep a read-only NOR dump for forensics (never restored)? [y/N]: ").lower() == "y"

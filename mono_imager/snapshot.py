@@ -114,6 +114,8 @@ EXT_MAGIC = b"\x53\xef"              # 0xEF53, little endian
 FAT_LABEL_OFFSETS = (54, 82)         # "FAT12/16" / "FAT32" type strings
 E2FSCK_CLEAN = 0                     # e2fsck -n: 0 clean, 4 = errors found, 8 = could not check
 SNAP_PREFIX = "SNAP_"
+LABEL_BASE = "dump"                  # suggested snapshot name: dump-<YYYYMMDD-HHMM> (no OS name)
+AUTO_LABEL_PREFIX = "auto-"          # automatic snapshot before a restore: auto-dump-<YYYYMMDD-HHMM>
 
 _LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -250,9 +252,11 @@ def plan_restore(manifest: dict, skip_fw: bool) -> list:
 
 # --- Manifest / SHA256SUMS ---------------------------------------------------------
 
-def default_label(os_label: str, now: _dt.datetime | None = None) -> str:
+def default_label(base: str = LABEL_BASE, now: _dt.datetime | None = None) -> str:
+    """Suggested snapshot name: <base>-<YYYYMMDD-HHMM> (local time). The OS is not
+    part of the name; it is recorded in the manifest (os_label)."""
     now = now or _dt.datetime.now()
-    base = re.sub(r"[^a-z0-9]+", "-", (os_label or "emmc").lower()).strip("-") or "emmc"
+    base = re.sub(r"[^a-z0-9]+", "-", (base or LABEL_BASE).lower()).strip("-") or LABEL_BASE
     return f"{base}-{now:%Y%m%d-%H%M}"
 
 

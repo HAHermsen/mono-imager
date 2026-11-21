@@ -17,6 +17,7 @@ No hardware required. Covers:
 Run: python tests/unit/test_snapshot.py
 """
 
+import datetime
 import hashlib
 import http.client
 import json
@@ -98,7 +99,11 @@ check("range offsets are chunk-relative", skip[1]["off"] == S.FW_END and skip[1]
 
 # ----------------------------------------------------------------------------
 section("Labels, OS guess, identity")
-check("default label", S.default_label("OpenWRT").startswith("openwrt-"))
+LABEL_NOW = datetime.datetime(2026, 11, 21, 13, 54)   # fixed "now" for the label checks
+check("default label: dump-<date>-<time>, no OS name",
+      S.default_label(now=LABEL_NOW) == "dump-20261121-1354")
+check("auto label: auto-dump-<date>-<time>",
+      S.default_label(S.AUTO_LABEL_PREFIX + S.LABEL_BASE, now=LABEL_NOW) == "auto-dump-20261121-1354")
 check("valid label", S.valid_label("vyos-prod"))
 check("label with slash refused", not S.valid_label("../x"))
 check("label .partial refused", not S.valid_label("x.partial"))

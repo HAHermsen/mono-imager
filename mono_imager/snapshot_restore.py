@@ -17,9 +17,9 @@ from pathlib import Path
 from mono_imager import snapshot_orchestrator as SO
 
 
-def _ask_label(os_label: str, ask: Callable, existing) -> str:
+def _ask_label(ask: Callable, existing) -> str:
     existing = set(existing)
-    default = SO.S.default_label(os_label)
+    default = SO.S.default_label()
     while True:
         v = ask(f"  Snapshot label [{default}]: ") or default
         if not SO.S.valid_label(v):
@@ -128,11 +128,11 @@ def _restore_board_checks(manifest: dict, identity: dict, target_inv: dict, prob
     return clone
 
 
-def _auto_snapshot_label(transfer: str, mnt: dict | None, store: Path, env: dict) -> str:
-    """auto-<os>-<date>, numbered past any snapshot (or .partial) already there."""
+def _auto_snapshot_label(transfer: str, mnt: dict | None, store: Path) -> str:
+    """auto-dump-<date>, numbered past any snapshot (or .partial) already there."""
     taken = set(mnt["snapshots"]) if transfer == "usb" else \
         ({x.name for x in store.iterdir()} if store.is_dir() else set())
-    auto_label = base_auto = SO.S.default_label(f"auto-{SO.S.detect_os_label(env)}")
+    auto_label = base_auto = SO.S.default_label(SO.S.AUTO_LABEL_PREFIX + SO.S.LABEL_BASE)
     n = 2
     while auto_label in taken or f"{auto_label}.partial" in taken:
         auto_label, n = f"{base_auto}-{n}", n + 1
@@ -147,7 +147,7 @@ def _take_auto_snapshot(d, *, transfer: str, mnt: dict | None, store: Path, sess
     """
     probe, info = cap_args["probe"], cap_args["info"]
     auto = None
-    auto_label = SO._auto_snapshot_label(transfer, mnt, store, info["env"])
+    auto_label = SO._auto_snapshot_label(transfer, mnt, store)
     room = (mnt["free_kb"] * SO.C.KIB) if transfer == "usb" else shutil.disk_usage(store).free
     go = True
     if room < probe["emmc_bytes"]:
