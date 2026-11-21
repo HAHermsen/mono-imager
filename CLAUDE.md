@@ -40,7 +40,7 @@ When given a feature or module specification, follow this exact sequence:
    - `python tests/run_tests.py --unit-only` (all files must pass)
    - `ruff check mono_imager` (line length 100)
    - `mypy mono_imager`
-- **Version Control:** No branches: commit on `main`. The user commits with their own git identity; Claude prepares the change and checks it with `git diff` / `git show --stat`.
+- **Version Control:** No branches: commit on `main`. The user commits with their own git identity; Claude prepares the change and checks it with `git diff` / `git show --stat`. Every commit Claude helped with says so: it ends with the trailer `Co-Authored-By: Claude <noreply@anthropic.com>` (model name may be added, e.g. `Claude Opus 5.5`).
 - **Line Endings:** Files are CRLF in the working tree (git stores LF). Keep CRLF, and never leave a lone CR: git then treats the file as binary (happened to `serial_device.py`, fixed in `5f5c014`).
 - **Versioning:** `__version__` in `mono_imager/__init__.py` is the single source; `pyproject.toml` is the only build file. Do not bump the version unless asked.
 
