@@ -394,10 +394,9 @@ def snapshot_lan(d, sess, base_url: str, folder: Path, cap: Capture) -> dict | N
     sess.begin_snapshot(partial)
     chunks = S.plan_chunks(probe["emmc_bytes"])
     have_sha = "sha256sum" in probe["have"]
-    single = not cap.thorough and {"tee", "mkfifo"} <= probe["have"] \
-        and bool({"openssl", "sha256sum"} & probe["have"])
+    single = not cap.thorough and bool({"openssl", "sha256sum"} & probe["have"])
     if not cap.thorough and not single:
-        _say("  ⚠ tee/mkfifo/openssl/sha256sum missing on the device — using the slower read-back verify.")
+        _say("  ⚠ openssl/sha256sum missing on the device — using the slower read-back verify.")
     spin = "eMMC -> PC, hashing" if single else "eMMC -> PC, read back"
     done = "captured and verified" if single else "captured and read-back verified"
 

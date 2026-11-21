@@ -65,10 +65,8 @@ MI_PLAN_EOF
 rd 4096 33550336 | put "verify?$T&tag=fw"
 rd 0 4096 | put "verify?$T&tag=boot"
 while read -r i off n; do
-  dropc; rm -f /tmp/mi_f /tmp/mi_v; mkfifo /tmp/mi_f
-  fsha < /tmp/mi_f > /tmp/mi_v &
-  rd $off $n | tee /tmp/mi_f | put "upload?$T&chunk=$i"; urc=$?
-  wait; vs=$(cat /tmp/mi_v)
+  dropc; rd $off $n | put "upload?$T&chunk=$i"; urc=$?
+  vs=$(rd $off $n | fsha)
   rep snap_$i "CHUNK=$i" "UP_RC=$urc" "VSHA=$vs"
 done < /tmp/mono_imager_plan.txt
 cat /dev/mtd0 | put "nor?$T"; nrc=$?

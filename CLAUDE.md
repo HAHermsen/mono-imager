@@ -52,7 +52,7 @@ When given a feature or module specification, follow this exact sequence:
 - **Shell-Script Tests:** Generated device scripts are run for real under `/bin/sh` and BusyBox `ash` (when installed). On Windows they need `sh` from Git for Windows; without it those parts skip with a message.
 
 ## 6. Project-Specific Context
-- **Done (2026-11-15):** the single-pass literals are named: `HASH_FIFO` / `HASH_OUT` in `snapshot.py`, and the test limits in a named block in `test_snapshot_scripts.py`. Literals elsewhere in the code are handled in refactor phase 4.
+- **Done (2026-11-15):** the test limits are named in a block in `test_snapshot_scripts.py` (`HASH_FIFO` / `HASH_OUT` were removed with the tee/FIFO single pass, 2026-11-21). Literals elsewhere in the code are handled in refactor phase 4.
 - **Known gaps (baseline locked 2026-11-15, after phase 4):** ruff 152 findings (was 355); mypy 79 errors (was 157). Locked by `tests/unit/test_lint_baseline.py`; counts may only go down.
 - **Folder Structure:** Folder /logs contains logging
 - **Language / Runtime:** Python >= 3.10 (`pyproject.toml`). The user runs 3.14 on Windows; Claude tests on Linux with 3.13.
@@ -65,7 +65,7 @@ When given a feature or module specification, follow this exact sequence:
 - **Recovery Linux:** runs from RAM; tools may be BusyBox (`od` has no `-A`/`-t`, `dd` has no `status=progress`). Probe for a tool before relying on it.
 - **Measured in recovery (2026-11-15):** eMMC read ~54 MiB/s; `openssl dgst -sha256` ~740 MiB/s (CPU SHA instructions); `sha256sum`/`sha1sum` ~35 MiB/s; LAN >= 1 Gbit/s.
 - **Device Shell Scripts (sent over serial):** POSIX `sh` that also runs under BusyBox `ash`. Keep the whole script small (a 13 KB one broke on hardware; today ~2.3 KB) and lines short (longest today 89 chars). Loop over a plan file, never one block per chunk. Manual console use: paste one line at a time.
-- **Snapshot:** LAN = 30 chunks of ~1 GiB for 32 GB, each SHA-256-checked against what the PC received. Default single pass (`tee` into a FIFO, hashed with openssl, else `sha256sum`). "Thorough verify" (LAN only) re-reads from the eMMC (~2x slower). Missing tools fall back to the read-back with a warning. NOR dump is read-only, never restored. USB snapshot/restore unchanged.
+- **Snapshot:** LAN = 30 chunks of ~1 GiB for 32 GB, each SHA-256-checked against what the PC received. Default single pass: read once from the eMMC and upload, then hash the chunk again from the page cache (openssl, else `sha256sum`); no `tee`/FIFO (both hardware runs with them stalled in chunk 0). "Thorough verify" (LAN only) re-reads from the eMMC (~2x slower). Missing tools fall back to the read-back with a warning. NOR dump is read-only, never restored. USB snapshot/restore unchanged.
 - **Known cosmetic issues:** a snapshot ends with "Flash completed successfully"; the report's step numbers restart at 01 partway through.
 
 Use code with caution.

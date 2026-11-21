@@ -152,11 +152,10 @@ def _report(url: str, body: str) -> str:
 
 PLAN = "/tmp/mono_imager_plan.txt"   # one line per chunk / range, read by a shell loop
 
-# Single-pass snapshot: each chunk is tee'd into HASH_FIFO while it uploads;
-# fsha reads the FIFO and writes the chunk's SHA-256 to HASH_OUT. The paths are
-# short on purpose: every device-script line must stay short (see below).
-HASH_FIFO = "/tmp/mi_f"
-HASH_OUT = "/tmp/mi_v"
+# Single-pass snapshot: each chunk is read from the eMMC once and uploaded; the
+# hash is then taken from the page cache (no second media read). No tee / FIFO:
+# on hardware (2026-11-15 and 2026-11-21) both runs of `rd | tee FIFO | put`
+# crawled and then stalled in chunk 0; the read-back path never did.
 
 # Short names ON PURPOSE (deliberate exception to CLAUDE.md section 2,
 # "Self-Documenting Naming"): device-script variables ($i, $off, $n, $urc,
@@ -205,9 +204,11 @@ def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
     by streaming it to the PC's hash-only endpoint. Optional read-only
     NOR dump at the end. One report per chunk (step=snap_<i>).
 
-    single_pass: read each chunk once and hash it on the device while it
-    streams (tee into a FIFO) instead of a second media read. Proves the
-    PC got exactly what was read; ~2x faster. Needs tee, mkfifo and
+    single_pass: read each chunk once from the media (page cache dropped
+    first), upload it, then hash it again WITHOUT dropping the cache: that
+    read is served from RAM (1 GiB fits), so there is no second media read.
+    Proves the PC got exactly what was read; ~2x faster. Pages the kernel
+    evicted are re-read from the eMMC: slower, still a correct check. Needs
     openssl or sha256sum on the device (the caller checks).
     """
     dev = dev or S.EMMC_DEV
@@ -217,10 +218,8 @@ def build_lan_snapshot_script(*, base_url: str, token: str, chunks: list,
           f'rd 0 {S.FW_START} | put "verify?$T&tag=boot"',
           "while read -r i off n; do"]
     if single_pass:
-        s += [f"  dropc; rm -f {HASH_FIFO} {HASH_OUT}; mkfifo {HASH_FIFO}",
-              f"  fsha < {HASH_FIFO} > {HASH_OUT} &",
-              f'  rd $off $n | tee {HASH_FIFO} | put "upload?$T&chunk=$i"; urc=$?',
-              f"  wait; vs=$(cat {HASH_OUT})"]
+        s += ['  dropc; rd $off $n | put "upload?$T&chunk=$i"; urc=$?',
+              "  vs=$(rd $off $n | fsha)"]
     else:
         s += ['  rd $off $n | put "upload?$T&chunk=$i"; urc=$?',
               "  dropc"]
@@ -627,8 +626,6 @@ def build_nor_env_write_script(src: str, want_sha: str) -> str:
 
 
 __all__ = [
-    "HASH_FIFO",
-    "HASH_OUT",
     "OD_ARGS",
     "PLAN",
     "UPLOAD_PIECE",
